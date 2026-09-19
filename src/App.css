@@ -16,10 +16,11 @@ body {
   100% { transform: translateX(-100%); }
 }
 
+/* 默认文本循环滚动：周期 10s，对齐原工程 OrderedMonsterWindow 的 InfoText_Animation（TimeSpan 0,0,10） */
 .animate-marquee {
   display: inline-block;
   white-space: nowrap;
-  animation: marquee 16s linear infinite;
+  animation: marquee 10s linear infinite;
 }
 
 .animate-marquee:hover {

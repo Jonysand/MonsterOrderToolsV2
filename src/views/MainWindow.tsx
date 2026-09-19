@@ -1,6 +1,7 @@
 ﻿import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   QueueItem,
   AppConfig,
@@ -39,6 +40,7 @@ import {
   Key,
   Save,
   FileCheck,
+  Upload,
   ScrollText,
   Volume2
 } from "lucide-react";
@@ -111,6 +113,7 @@ export const MainWindow: React.FC = () => {
   const [logSnapshot, setLogSnapshot] = useState<LogsSnapshot | null>(null);
   const [logLevel, setLogLevel] = useState<"DEBUG" | "INFO" | "WARNING" | "ERROR">("INFO");
   const [resourceWarnings, setResourceWarnings] = useState<string[]>([]);
+  const [appVersion, setAppVersion] = useState("");
   const activeTabRef = useRef(activeTab);
 
   // GM 运维面板状态
@@ -264,6 +267,12 @@ export const MainWindow: React.FC = () => {
       setOverlayLocked(event.payload);
     });
 
+    // 配置在别处变更（如退出前落盘、其他窗口修改）时刷新设置面板，
+    // 避免面板持有陈旧副本；top_pos 由后端独占维护，不受此影响
+    const unlistenConfig = listen("config-changed", () => {
+      fetchConfig();
+    });
+
     // D5 资源缺失提示
     const unlistenMissing = listen<string>("resource-missing", (event) => {
       setResourceWarnings((prev) =>
@@ -280,7 +289,15 @@ export const MainWindow: React.FC = () => {
       unlistenCheckin.then((f) => f());
       unlistenLock.then((f) => f());
       unlistenMissing.then((f) => f());
+      unlistenConfig.then((f) => f());
     };
+  }, []);
+
+  // 版本号展示：与 tauri.conf.json 的 version 同源（原工程在标题栏显示 v44）
+  useEffect(() => {
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(""));
   }, []);
 
   useEffect(() => {
@@ -529,13 +546,14 @@ export const MainWindow: React.FC = () => {
   // GM 搜索水友
   const handleSearchUsers = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!searchKeyword.trim()) return;
+    if (!searchKeyword.trim()) {
+      showToast("请输入搜索关键词");
+      return;
+    }
     try {
       const list = await invoke<UserSearchItem[]>("gm_search_users", { keyword: searchKeyword.trim() });
       setSearchedUsers(list);
-      if (list.length === 0) {
-        showToast("未找到匹配的水友");
-      }
+      showToast(list.length === 0 ? "未找到匹配的水友" : `找到 ${list.length} 个匹配用户`);
     } catch (err) {
       showToast(`搜索错误: ${err}`);
     }
@@ -559,8 +577,24 @@ export const MainWindow: React.FC = () => {
     try {
       const count = await invoke<number>("gm_grant_card", { uid, count: grantCardAmount });
       showToast(`已成功为「${username}」发放 ${grantCardAmount} 张补签卡，当前剩余 ${count} 张`);
+      // 发卡后刷新搜索结果，保证列表展示的补签卡数不陈旧（对齐原工程 GMRetroactiveCardDialog 的重新搜索）
+      if (searchKeyword.trim()) {
+        const list = await invoke<UserSearchItem[]>("gm_search_users", { keyword: searchKeyword.trim() });
+        setSearchedUsers(list);
+      }
     } catch (err) {
       showToast(`发卡失败: ${err}`);
+    }
+  };
+
+  // 凭据文件导入（安装包不随包分发 credentials.dat，需用户显式导入原工程的加密凭据文件）
+  const handleImportCredentials = async () => {
+    try {
+      const status = await invoke<CredentialsStatus>("import_credentials_file");
+      setCredStatus(status);
+      showToast("凭据导入成功，已即时生效");
+    } catch (err) {
+      showToast(`凭据导入失败: ${err}`);
     }
   };
 
@@ -695,6 +729,24 @@ export const MainWindow: React.FC = () => {
     }
   };
 
+  // 滑杆类控件：改动静音期（800ms）后自动保存并广播 config-changed，
+  // 使悬浮窗透明度/跑马灯等即时生效，且用户改完直接关窗也不会丢设置
+  // （对齐原工程：每个控件 ConfigChanged → SaveConfig + RefreshWindow）
+  const autoSaveTimerRef = useRef<number | null>(null);
+  const applyConfigPatch = (patch: Partial<AppConfig>) => {
+    setConfig((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev, ...patch };
+      if (autoSaveTimerRef.current !== null) window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = window.setTimeout(() => {
+        invoke("save_app_config", { newCfg: next }).catch((err) =>
+          showToast(`自动保存失败: ${err}`)
+        );
+      }, 800);
+      return next;
+    });
+  };
+
   return (
     <div className="flex h-screen w-screen bg-neutral-950 text-neutral-100 font-sans select-none overflow-hidden">
       {/* 顶部/全局 Toast 通知 */}
@@ -714,7 +766,9 @@ export const MainWindow: React.FC = () => {
             </div>
             <div>
               <div className="text-xs font-bold tracking-wider text-amber-300">MH 荒野弹幕</div>
-              <div className="text-[10px] text-neutral-400 font-mono">Tools V2 旗舰版</div>
+              <div className="text-[10px] text-neutral-400 font-mono">
+                Tools V2 旗舰版{appVersion ? ` (v ${appVersion})` : ""}
+              </div>
             </div>
           </div>
 
@@ -1172,7 +1226,7 @@ export const MainWindow: React.FC = () => {
                   <div className="flex items-center gap-2.5">
                     <div className="relative flex-1">
                       <input
-                        type="text"
+                        type="password"
                         value={config?.id_code || ""}
                         onChange={(e) => config && setConfig({ ...config, id_code: e.target.value })}
                         placeholder="在此输入或粘贴当次开播身份码 (id_code)..."
@@ -1547,6 +1601,7 @@ export const MainWindow: React.FC = () => {
                     <div className="p-3 bg-neutral-950 rounded-lg border border-purple-500/40 text-xs text-purple-200 space-y-1">
                       <div>覆盖总用户: {batchResult.total_users}</div>
                       <div>补签修复用户: {batchResult.patched_users}</div>
+                      <div>跳过用户: {batchResult.skipped_users}（已连续到今天）</div>
                       <div>插入明细记录: {batchResult.total_inserted} 条</div>
                     </div>
                   )}
@@ -1773,7 +1828,22 @@ export const MainWindow: React.FC = () => {
 
                 <p className="text-[11px] text-neutral-400 leading-relaxed">
                   遵循原工程安全规范，APP ID、AccessKey、TTS Key 与 AI Key 均存储于本地加密配置文件 <span className="text-amber-200/80 font-mono">credentials.dat</span> 中，采用 Base64 + HMAC-SHA256 签名双重校验，<strong className="text-neutral-200">不允许手动设置或明文暴露</strong>。
+                  安装包出于安全考虑<strong className="text-neutral-200">不随包分发该文件</strong>，请点击下方按钮导入由原工程生成（或随原始发行包提供）的凭据文件。
                 </p>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={handleImportCredentials}
+                    className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1.5 rounded-lg text-[11px] shadow-lg shadow-emerald-600/30 transition"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>导入凭据文件 (credentials.dat)</span>
+                  </button>
+                  <span className="text-[10px] font-mono text-neutral-500 break-all">
+                    目标路径：{credStatus?.file_path || "—"}
+                  </span>
+                </div>
 
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
                   <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
@@ -1999,13 +2069,13 @@ export const MainWindow: React.FC = () => {
                       step="1"
                       value={config.speech_rate}
                       disabled={isLite}
-                      onChange={(e) => setConfig({ ...config, speech_rate: Number(e.target.value) })}
+                      onChange={(e) => applyConfigPatch({ speech_rate: Number(e.target.value) })}
                       className="w-full accent-amber-500 disabled:opacity-40"
                     />
                   </div>
                   <div>
                     <label className="block text-[11px] text-neutral-400 mb-1">
-                      语音音量 ({config.speech_volume}，SAPI 按 1/2 生效)
+                      语音音量 ({config.speech_volume}，SAPI 按 1/2 生效；其余引擎按 200 为满量程)
                     </label>
                     <input
                       type="range"
@@ -2014,7 +2084,7 @@ export const MainWindow: React.FC = () => {
                       step="1"
                       value={config.speech_volume}
                       disabled={isLite}
-                      onChange={(e) => setConfig({ ...config, speech_volume: Number(e.target.value) })}
+                      onChange={(e) => applyConfigPatch({ speech_volume: Number(e.target.value) })}
                       className="w-full accent-amber-500 disabled:opacity-40"
                     />
                   </div>
@@ -2029,7 +2099,7 @@ export const MainWindow: React.FC = () => {
                       step="1"
                       value={config.speech_pitch}
                       disabled={isLite}
-                      onChange={(e) => setConfig({ ...config, speech_pitch: Number(e.target.value) })}
+                      onChange={(e) => applyConfigPatch({ speech_pitch: Number(e.target.value) })}
                       className="w-full accent-amber-500 disabled:opacity-40"
                     />
                   </div>
@@ -2077,7 +2147,7 @@ export const MainWindow: React.FC = () => {
                       onChange={(e) => setConfig({ ...config, checkin_trigger_words: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     />
-                    <span className="text-[10px] text-neutral-500">默认：打卡,签到</span>
+                    <span className="text-[10px] text-neutral-500">默认：打卡,签到（清空则完全停用打卡指令）</span>
                   </div>
 
                   <div>
@@ -2085,9 +2155,11 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="text"
                       value={config.default_marquee_text}
-                      onChange={(e) => setConfig({ ...config, default_marquee_text: e.target.value })}
+                      onChange={(e) => applyConfigPatch({ default_marquee_text: e.target.value })}
+                      placeholder="发送'点怪 xxx'进行点怪"
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200"
                     />
+                    <span className="text-[10px] text-neutral-500">留空时悬浮窗显示默认提示文案</span>
                   </div>
                 </div>
               </div>
@@ -2109,7 +2181,7 @@ export const MainWindow: React.FC = () => {
                       max="100"
                       step="1"
                       value={config.opacity}
-                      onChange={(e) => setConfig({ ...config, opacity: Number(e.target.value) })}
+                      onChange={(e) => applyConfigPatch({ opacity: Number(e.target.value) })}
                       className="w-full accent-amber-500"
                     />
                   </div>
@@ -2123,9 +2195,7 @@ export const MainWindow: React.FC = () => {
                       max="100"
                       step="1"
                       value={config.penetrating_mode_opacity}
-                      onChange={(e) =>
-                        setConfig({ ...config, penetrating_mode_opacity: Number(e.target.value) })
-                      }
+                      onChange={(e) => applyConfigPatch({ penetrating_mode_opacity: Number(e.target.value) })}
                       className="w-full accent-amber-500"
                     />
                   </div>

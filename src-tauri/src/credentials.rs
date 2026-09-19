@@ -50,17 +50,12 @@ pub struct CredentialsStatus {
 
 impl Credentials {
     pub fn to_status(&self, loaded: bool, path: &str) -> CredentialsStatus {
-        let access_key_masked = if self.access_key_id.len() >= 8 {
-            format!("{}***{}", &self.access_key_id[..4], &self.access_key_id[self.access_key_id.len() - 4..])
-        } else if !self.access_key_id.is_empty() {
-            "******".to_string()
-        } else {
-            "未配置".to_string()
-        };
+        let access_key_masked = mask_access_key(&self.access_key_id);
 
         CredentialsStatus {
             loaded,
             file_path: path.to_string(),
+            // app_id 非密钥，回显供用户核对；AccessKey 走掩码
             app_id: if self.app_id.is_empty() { "未配置".to_string() } else { self.app_id.clone() },
             access_key_masked,
             chat_provider: self.chat_provider.clone(),
@@ -68,6 +63,20 @@ impl Credentials {
             has_mimo_key: !self.mimo_tts_api_key.is_empty(),
             has_vip_tts_key: !self.special_user_tts_api_key.is_empty(),
         }
+    }
+}
+
+/// AccessKey 掩码：仅保留首尾各 4 个**字符**（按字符边界切分，避免多字节 UTF-8 触发 panic）
+pub fn mask_access_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() >= 8 {
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{}***{}", head, tail)
+    } else if !chars.is_empty() {
+        "******".to_string()
+    } else {
+        "未配置".to_string()
     }
 }
 
@@ -80,13 +89,10 @@ pub fn compute_hmac_hex(data: &str, salt: &str) -> Result<String, String> {
     Ok(hex::encode(result.into_bytes()))
 }
 
-/// 获取 credentials.dat 默认路径（统一经 paths::config_dir）
+/// 获取 credentials.dat 的规范路径（统一经 paths::config_dir）。
+/// 注：即使文件尚不存在也返回规范位置，便于前端提示"应放置到哪里"与实际导入目标一致。
 pub fn get_credentials_path() -> PathBuf {
-    let p = crate::paths::config_dir().join("credentials.dat");
-    if p.exists() {
-        return p;
-    }
-    PathBuf::from("credentials.dat")
+    crate::paths::config_dir().join("credentials.dat")
 }
 
 /// 加载并解密 credentials.dat 文件
@@ -155,19 +161,64 @@ mod tests {
 
     #[test]
     fn test_load_real_credentials_dat() {
-        let p = Path::new("MonsterOrderWilds_configs/credentials.dat");
-        if p.exists() {
-            let res = load_credentials(Some(p));
-            assert!(res.is_ok(), "加载真实 credentials.dat 失败: {:?}", res.err());
-            let cred = res.unwrap();
-            // 仅校验解析结构与关键字段非空，禁止在源码中硬编码真实密钥
-            assert!(!cred.app_id.is_empty(), "app_id 不应为空");
-            assert!(!cred.access_key_id.is_empty(), "access_key_id 不应为空");
-            assert!(!cred.access_key_secret.is_empty(), "access_key_secret 不应为空");
-            assert_eq!(cred.chat_provider, "deepseek");
-            assert!(!cred.chat_api_key.is_empty(), "chat_api_key 不应为空");
-            println!("[PASS] test_load_real_credentials_dat passed");
-        }
+        // 按统一资源解析定位真实凭据文件（cwd → cwd/.. → exe 同级 → 随包资源）
+        let Some(p) = crate::paths::find_resource("credentials.dat") else {
+            // 显式跳过并写明原因（避免"测试被静默跳过"导致格式回归无保护）
+            println!("[SKIP] test_load_real_credentials_dat: 未找到 credentials.dat（仅验证格式往返）");
+            return;
+        };
+        let res = load_credentials(Some(&p));
+        assert!(res.is_ok(), "加载真实 credentials.dat 失败: {:?}", res.err());
+        let cred = res.unwrap();
+        // 仅校验解析结构与关键字段非空，禁止在源码中硬编码真实密钥
+        assert!(!cred.app_id.is_empty(), "app_id 不应为空");
+        assert!(!cred.access_key_id.is_empty(), "access_key_id 不应为空");
+        assert!(!cred.access_key_secret.is_empty(), "access_key_secret 不应为空");
+        assert_eq!(cred.chat_provider, "deepseek");
+        assert!(!cred.chat_api_key.is_empty(), "chat_api_key 不应为空");
+        println!("[PASS] test_load_real_credentials_dat passed (source: {:?})", p);
+    }
+
+    /// 格式往返：V2 生成的文件必须能被 V2 读回（原工程算法逐步骤对齐，故亦与原工程互通）
+    #[test]
+    fn test_credentials_roundtrip_and_mask() {
+        let temp_dir = std::env::temp_dir().join("mh_cred_roundtrip");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let path = temp_dir.join("credentials.dat");
+        let _ = std::fs::remove_file(&path);
+
+        let creds = Credentials {
+            app_id: "1751077177719".into(),
+            access_key_id: "AKIDEXAMPLE1234".into(),
+            access_key_secret: "SECRETEXAMPLE".into(),
+            mimo_tts_api_key: "sk-mimo".into(),
+            chat_provider: "deepseek".into(),
+            chat_api_key: "sk-chat".into(),
+            ..Default::default()
+        };
+        save_credentials(&creds, &path).unwrap();
+
+        let loaded = load_credentials(Some(&path)).unwrap();
+        assert_eq!(loaded.access_key_id, creds.access_key_id);
+        assert_eq!(loaded.access_key_secret, creds.access_key_secret);
+        assert_eq!(loaded.chat_api_key, creds.chat_api_key);
+
+        // 篡改一字节 → HMAC 校验必须失败
+        let mut raw = std::fs::read(&path).unwrap();
+        let n = raw.len();
+        raw[n - 4] = if raw[n - 4] == b'A' { b'B' } else { b'A' };
+        std::fs::write(&path, &raw).unwrap();
+        assert!(load_credentials(Some(&path)).is_err(), "篡改后必须校验失败");
+
+        // 掩码不得 panic（含多字节字符的边界用例）
+        assert_eq!(mask_access_key("AKIDEXAMPLE1234"), "AKID***1234");
+        assert_eq!(mask_access_key("短"), "******");
+        assert_eq!(mask_access_key(""), "未配置");
+        assert_eq!(mask_access_key("中文密钥中文密钥中文"), "中文密钥***密钥中文");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&temp_dir);
+        println!("[PASS] test_credentials_roundtrip_and_mask passed");
     }
 
     #[test]

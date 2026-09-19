@@ -39,6 +39,10 @@
 | E | 工程化与一致性 | 6 | 2~3 人日 | P2 | ✅ 已完成（2026-09-19） |
 
 > **总体状态（2026-09-19）：批次 A~E 全部完成、D8 交互已确认、首次提交与标签 v0.1.0 已生成；剩余人工待办为安装产物端到端实测。**
+>
+> ⚠️ **后续进展（2026-09-19）：完成一轮原工程全量交叉审计（8 分域并行 + 独立复验），发现并修复 3 项 P0、12 项 P1
+> 及一批 P2/P3 缺陷，同时更正了本文档中两条错误结论（A2、B7）。详细清单、复验证据与新增回归测试见
+> [AUDIT_FIX_REPORT.md](AUDIT_FIX_REPORT.md)。当前基线：`cargo test` 117 项全绿、无编译警告，`npm run build` 通过。**
 
 **建议里程碑**
 - M1 = 批次 A（可开播的最低可用版本）
@@ -78,6 +82,12 @@
 ---
 
 ### A2 旧版 `captain_profiles.db` 兼容（含修正假通过单测）
+
+> ⚠️ **本节的原始结论已于 2026-09-19 全量审计中更正，见 [AUDIT_FIX_REPORT.md](AUDIT_FIX_REPORT.md) 第四节「更正 1」。**
+> 原结论「真实旧库列名为 `monthly_first_claimed`，V2 不得执行任何 ALTER」只对**仓库内那份 pre-v40 老库**成立：
+> 原工程自 v40 起权威结构为 `weekly_first_claimed`，并对老库执行 `ALTER TABLE ... ADD COLUMN weekly_first_claimed`
+> （`ProfileManager.cpp:178/216-237`）。原实现导致「由原工程 v40+ 新建库」的用户奖卡/补签/GM 发卡全链静默失效。
+> 现已改为对齐原工程列名 + 同款迁移，并新增反向回归测试 `test_v40_plus_schema_weekly_card_chain`。
 
 > **决策记录（2026-09-19）：采用「V2 完全适配旧库格式」方案 —— 不修改旧库结构（无 ALTER、无迁移、无备份文件），V2 建表与读写全部使用旧库格式（列名 `monthly_first_claimed`）。已实施并验证。**
 
@@ -279,6 +289,11 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **Lite**：不支持。
 
 ### B7 TTS 音频留档与清理 ✅
+> ⚠️ **本条的「原实现修正」结论已于 2026-09-19 全量审计中更正，见 [AUDIT_FIX_REPORT.md](AUDIT_FIX_REPORT.md) 第四节「更正 2」。**
+> 原工程 `TTSCacheManager` 的 `SaveCachedAudio` / `SaveCachedAudioWithPrefix` 为**死代码（零调用方）**，
+> 唯一留档入口是受 `isCheckinTTS` 守卫的 `SaveCheckinAudio`（文件名 `打卡_{username}_{tick}.mp3`），
+> 且规格 FR-1 明确「一般弹幕 TTS 不缓存、播完即丢」—— 全量留档正是原工程 v24 已修复的缺陷形态。
+> 现已改为仅签到/补签播报留档。
 - **原实现修正**：`TTSCacheManager` 实为**音频留档 + 启动清理**（`{exe}/TempAudio/YYYYMMDD/{前缀}_{tick}.mp3`，按目录创建时间清理超过 `ttsCacheDaysToKeep` 天的目录），**并非"命中复用缓存"**（原审计描述有误，此处按原工程权威实现落地）。
 - **实施**：`save_cached_audio`（前缀规则对齐 `GetContentPrefix`：含" 说："时取 `用户名_正文前5字`，否则全文前 5 字；非法文件名字符替换为 `_`）、`cleanup_old_cache`（启动时按 `tts_cache_days_to_keep` 清理）；留档目录统一为 `{数据目录}/TempAudio`（跟随 paths.rs 数据目录，见有意差异）。
 - **验收**：`test_content_prefix_and_cache_cleanup`。

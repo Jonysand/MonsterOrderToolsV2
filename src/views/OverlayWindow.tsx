@@ -86,7 +86,8 @@ export const OverlayWindow: React.FC = () => {
           setMarqueeText(cfg.default_marquee_text);
         }
       }
-      setOpacity(cfg.opacity || 95);
+      // 用 ?? 而非 ||：透明度 0（全透明背景）是合法配置，不得被 falsy 判断吞成默认值
+      setOpacity(cfg.opacity ?? 100);
       setPenetratingOpacity(cfg.penetrating_mode_opacity ?? 50);
     } catch (e) {
       console.error(e);
@@ -246,10 +247,10 @@ export const OverlayWindow: React.FC = () => {
       });
     });
 
-    // D4 SC / 上舰气泡
+    // D4 SC / 上舰气泡（载荷为内部标签枚举：kind 字段区分类型）
     const unlistenSc = listen<SuperChatReceivedPayload>("super-chat-received", (event) => {
-      const sc = event.payload.SuperChat;
-      if (!sc) return;
+      const sc = event.payload;
+      if (!sc || sc.kind !== "SuperChat") return;
       pushBubble({
         title: `醒目留言 ¥${sc.rmb}`,
         username: sc.uname,
@@ -258,8 +259,8 @@ export const OverlayWindow: React.FC = () => {
       });
     });
     const unlistenGuard = listen<GuardReceivedPayload>("guard-received", (event) => {
-      const g = event.payload.Guard;
-      if (!g) return;
+      const g = event.payload;
+      if (!g || g.kind !== "Guard") return;
       pushBubble({
         title: "上舰",
         username: g.uname,

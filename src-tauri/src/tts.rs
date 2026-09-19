@@ -89,11 +89,11 @@ impl Default for TTSConfig {
 // 串行音频播放队列（B3 防叠音）
 // ---------------------------------------------------------------------------
 
-/// 播放任务载荷
+/// 播放任务载荷（音量随任务携带：对齐原工程 `AudioPlayer::SetVolume` 在起播前设置 MCI 音量）
 #[derive(Debug)]
 enum AudioJob {
-    Bytes(Vec<u8>),
-    File(PathBuf),
+    Bytes { bytes: Vec<u8>, volume: i32 },
+    File { path: PathBuf, volume: i32 },
     Sapi { text: String, params: SapiParams },
 }
 
@@ -135,12 +135,16 @@ impl AudioQueue {
         AudioQueue { tx }
     }
 
-    pub fn play_bytes(&self, bytes: Vec<u8>) -> Result<(), String> {
-        self.tx.send(AudioJob::Bytes(bytes)).map_err(|e| e.to_string())
+    pub fn play_bytes(&self, bytes: Vec<u8>, volume: i32) -> Result<(), String> {
+        self.tx
+            .send(AudioJob::Bytes { bytes, volume })
+            .map_err(|e| e.to_string())
     }
 
-    pub fn play_file(&self, path: PathBuf) -> Result<(), String> {
-        self.tx.send(AudioJob::File(path)).map_err(|e| e.to_string())
+    pub fn play_file(&self, path: PathBuf, volume: i32) -> Result<(), String> {
+        self.tx
+            .send(AudioJob::File { path, volume })
+            .map_err(|e| e.to_string())
     }
 
     pub fn speak_sapi(&self, text: String, params: SapiParams) -> Result<(), String> {
@@ -155,22 +159,22 @@ impl AudioQueue {
         #[cfg(test)]
         {
             let _ = match job {
-                AudioJob::Bytes(b) => b.len(),
-                AudioJob::File(p) => p.as_os_str().len(),
+                AudioJob::Bytes { bytes, volume } => bytes.len() + *volume as usize,
+                AudioJob::File { path, volume } => path.as_os_str().len() + *volume as usize,
                 AudioJob::Sapi { text, params } => text.len() + params.rate.unsigned_abs() as usize,
             };
         }
         #[cfg(not(test))]
         match job {
-            AudioJob::Bytes(bytes) => {
+            AudioJob::Bytes { bytes, volume } => {
                 if let Ok(decoder) = Decoder::new(Cursor::new(bytes.clone())) {
-                    play_decoder_sync(decoder);
+                    play_decoder_sync(decoder, *volume);
                 }
             }
-            AudioJob::File(path) => {
+            AudioJob::File { path, volume } => {
                 if let Ok(file) = File::open(path) {
                     if let Ok(decoder) = Decoder::new(file) {
-                        play_decoder_sync(decoder);
+                        play_decoder_sync(decoder, *volume);
                     }
                 }
             }
@@ -181,14 +185,21 @@ impl AudioQueue {
     }
 }
 
+/// 配置音量（原工程 0~200，MCI 0~1000 即 `volume × 5`）换算为 rodio 的 0.0~1.0 增益
+pub fn volume_gain(speech_volume: i32) -> f32 {
+    (speech_volume.clamp(0, 200) as f32) / 200.0
+}
+
 /// rodio 同步播放（带 60s 播放超时保护，防止异常流卡死播放线程）
 #[cfg(not(test))]
-fn play_decoder_sync<R>(decoder: Decoder<R>) -> bool
+fn play_decoder_sync<R>(decoder: Decoder<R>, speech_volume: i32) -> bool
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
     if let Ok((_stream, handle)) = OutputStream::try_default() {
         if let Ok(sink) = Sink::try_new(&handle) {
+            // 对齐原工程：起播前按配置设置音量（Manbo/MiMo/本地音效同样生效）
+            sink.set_volume(volume_gain(speech_volume));
             sink.append(decoder);
             let deadline = Instant::now() + PLAYBACK_TIMEOUT;
             while !sink.empty() {
@@ -296,16 +307,17 @@ pub fn content_prefix(text: &str) -> String {
     }
 }
 
-/// 将播放成功的音频落盘留档，返回文件路径
-pub fn save_cached_audio(text: &str, bytes: &[u8]) -> Option<PathBuf> {
-    let safe_prefix: String = content_prefix(text)
+/// 将播放成功的签到/补签音频留档（对齐原工程 `TTSCacheManager::SaveCheckinAudio`：`打卡_{用户名}_{时间戳}.mp3`）。
+/// 原工程仅对签到 AI 回复音频留档，一般弹幕 TTS 播完即丢（v24 决策）。
+pub fn save_checkin_audio(username: &str, bytes: &[u8]) -> Option<PathBuf> {
+    let safe_name: String = username
         .chars()
         .map(|c| if matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
         .collect();
     let dir = cache_base_dir().join(chrono::Local::now().format("%Y%m%d").to_string());
     std::fs::create_dir_all(&dir).ok()?;
     let ts = chrono::Local::now().timestamp_millis();
-    let path = dir.join(format!("{}_{}.mp3", safe_prefix, ts));
+    let path = dir.join(format!("打卡_{}_{}.mp3", safe_name, ts));
     std::fs::write(&path, bytes).ok()?;
     Some(path)
 }
@@ -413,7 +425,8 @@ pub struct GiftEvent {
 
 pub const GIFT_COOLDOWN: Duration = Duration::from_secs(5);
 pub const DYNAMIC_COMBO_WINDOW: Duration = Duration::from_secs(10);
-pub const COOLDOWN_CLEANUP: Duration = Duration::from_secs(60);
+/// 冷却表清理阈值：对齐原工程 `TextToSpeech.cpp:1418`（`cooldownMs * 2` = 5s × 2）
+pub const COOLDOWN_CLEANUP: Duration = GIFT_COOLDOWN;
 
 #[derive(Debug, Clone)]
 struct DynamicCombo {
@@ -604,10 +617,19 @@ pub const SPECIAL_COOLDOWN_SECS: u64 = 30;
 pub struct SpeakTask {
     pub text: String,
     pub user_id: String,
+    /// 是否为签到/补签播报（决定是否留档为 `打卡_{用户名}_{ts}.mp3`）
+    pub is_checkin: bool,
+    /// 签到用户名（仅 is_checkin 时有效）
+    pub checkin_username: String,
+    /// 是否来自高优先队列（回滚入队时还原到原队列）
+    pub priority: bool,
 }
 
 /// 单队列容量上限（防止异常刷屏导致内存膨胀）
 pub const MAX_SPEAK_QUEUE: usize = 200;
+
+/// 并发合成上限（对齐原工程 `MAX_CONCURRENT_TTS = 2`）
+pub const MAX_CONCURRENT_TTS: usize = 2;
 
 /// 多引擎 TTS 状态机与音频管理器
 pub struct TTSManager {
@@ -620,6 +642,8 @@ pub struct TTSManager {
     normal_queue: Mutex<VecDeque<SpeakTask>>,
     /// 高优先播报队列（礼物/SC/上舰/打卡，原工程 GiftMsgQueue）
     priority_queue: Mutex<VecDeque<SpeakTask>>,
+    /// 在途合成任务数（对齐原工程 activeRequestCount_ 的并发闸门）
+    inflight: std::sync::atomic::AtomicUsize,
     /// 最近一次实际使用的引擎（对齐原工程「当前引擎」显示，None = 尚未播报过）
     active_engine: Mutex<Option<TTSEngineType>>,
 }
@@ -646,13 +670,44 @@ impl TTSManager {
             gift_tracker: Mutex::new(GiftComboTracker::new()),
             normal_queue: Mutex::new(VecDeque::new()),
             priority_queue: Mutex::new(VecDeque::new()),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
             active_engine: Mutex::new(None),
         }
     }
 
     /// 入队待播报文本（`priority=true` 进入高优先队列；返回是否入队成功）
     pub fn enqueue_speak(&self, text: &str, user_id: &str, priority: bool) -> bool {
-        if text.trim().is_empty() {
+        self.enqueue_task(SpeakTask {
+            text: text.to_string(),
+            user_id: user_id.to_string(),
+            is_checkin: false,
+            checkin_username: String::new(),
+            priority,
+        }, priority)
+    }
+
+    /// 入队签到/补签播报（音频将按 `打卡_{用户名}_{ts}.mp3` 留档）
+    pub fn enqueue_checkin_speak(&self, text: &str, user_id: &str, username: &str) -> bool {
+        self.enqueue_task(SpeakTask {
+            text: text.to_string(),
+            user_id: user_id.to_string(),
+            is_checkin: true,
+            checkin_username: username.to_string(),
+            priority: true,
+        }, true)
+    }
+
+    /// 并发名额不足时把任务放回原队首，等待下一周期（不丢播报）
+    pub fn requeue_speak(&self, task: SpeakTask) {
+        if task.priority {
+            self.priority_queue.lock().unwrap().push_front(task);
+        } else {
+            self.normal_queue.lock().unwrap().push_front(task);
+        }
+    }
+
+    fn enqueue_task(&self, task: SpeakTask, priority: bool) -> bool {
+        if task.text.trim().is_empty() {
             return false;
         }
         let mut q = if priority {
@@ -661,12 +716,15 @@ impl TTSManager {
             self.normal_queue.lock().unwrap()
         };
         if q.len() >= MAX_SPEAK_QUEUE {
+            // 队满丢弃不再静默：写日志便于排查刷屏导致的丢播报
+            crate::log_warn!(
+                "[TTS] 播报队列已满（{} 条），丢弃：{}",
+                MAX_SPEAK_QUEUE,
+                task.text.chars().take(20).collect::<String>()
+            );
             return false;
         }
-        q.push_back(SpeakTask {
-            text: text.to_string(),
-            user_id: user_id.to_string(),
-        });
+        q.push_back(task);
         true
     }
 
@@ -676,6 +734,50 @@ impl TTSManager {
             return Some(t);
         }
         self.normal_queue.lock().unwrap().pop_front()
+    }
+
+    /// 按原工程 Tick 语义各取一条：礼物/优先队列与普通队列每周期各推进一条，避免普通播报被饿死
+    pub fn dequeue_one_each(&self, max_total: usize) -> Vec<SpeakTask> {
+        let mut out = Vec::new();
+        if max_total == 0 {
+            return out;
+        }
+        if let Some(t) = self.priority_queue.lock().unwrap().pop_front() {
+            out.push(t);
+        }
+        if out.len() < max_total {
+            if let Some(t) = self.normal_queue.lock().unwrap().pop_front() {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    /// 占用一个并发合成名额（对齐原工程 MAX_CONCURRENT_TTS）
+    pub fn try_acquire_slot(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut cur = self.inflight.load(Ordering::SeqCst);
+        while cur < MAX_CONCURRENT_TTS {
+            match self.inflight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+        false
+    }
+
+    pub fn release_slot(&self) {
+        self.inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 当前待播报任务总数（普通 + 优先）
@@ -717,6 +819,16 @@ impl TTSManager {
                 }
             }
             TTSEngineType::MiMo => {
+                // 未配置 API Key 时视为不可用（对齐原工程 TTSProvider.h IsAvailable：
+                // `!apiKey_.empty() && available_`），避免发送空 Bearer 的无效请求
+                if self
+                    .config
+                    .lock()
+                    .map(|c| c.mimo_api_key.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    return false;
+                }
                 let mut h = self.mimo_health.lock().unwrap();
                 match *h {
                     EngineHealth::Healthy => true,
@@ -837,23 +949,37 @@ impl TTSManager {
     }
 
     /// 匹配本地特殊语音关键字（对齐原工程 LocalVoiceManager voiceMap，路径含 manbo/、mho/ 前缀）
+    /// 本地音效映射（对齐原工程 `LocalVoiceManager` 的 9 个键，忽略大小写精确匹配）
     pub fn match_special_sound(name: &str) -> Option<&'static str> {
         let lower = name.trim().to_lowercase();
         match lower.as_str() {
             "曼波" => Some("manbo/manbo.mp3"),
             "曼波曼波" => Some("manbo/manbo_3x.mp3"),
             "duang" => Some("manbo/duang.mp3"),
-            "噢耶" | "哦耶" | "欧耶" | "ohyeah" => Some("manbo/ohyeah.mp3"),
+            "噢耶" | "哦耶" | "欧耶" => Some("manbo/ohyeah.mp3"),
             "wow" => Some("manbo/wow.mp3"),
-            "痛快！！" | "痛快!!" | "痛快" | "tongkuai" => Some("mho/tongkuai.mp3"),
+            "痛快！！" | "痛快!!" => Some("mho/tongkuai.mp3"),
             _ => None,
         }
     }
 
-    /// 将播放成功的音频留档并送入串行播放队列
-    pub fn play_audio_bytes(&self, bytes: &[u8], text: &str) -> Result<(), String> {
-        let _ = save_cached_audio(text, bytes);
-        AudioQueue::global().play_bytes(bytes.to_vec())
+    /// 当前配置的播报音量（0~200），用于非 SAPI 播放路径
+    fn current_volume(&self) -> i32 {
+        self.config.lock().map(|c| c.speech_volume).unwrap_or(100)
+    }
+
+    /// 播放云端合成音频；`checkin_username` 非空时按签到音频留档（对齐原工程仅留档签到 TTS）
+    pub fn play_audio_bytes(
+        &self,
+        bytes: &[u8],
+        checkin_username: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(name) = checkin_username {
+            if save_checkin_audio(name, bytes).is_none() {
+                crate::log_warn!("[TTS] 签到音频留档失败（不影响播放）");
+            }
+        }
+        AudioQueue::global().play_bytes(bytes.to_vec(), self.current_volume())
     }
 
     /// 查找并播放本地特殊音效（zip 优先、散装目录回退）
@@ -867,7 +993,7 @@ impl TTSManager {
         };
 
         match load_local_voice(&file_name) {
-            Some(bytes) => AudioQueue::global().play_bytes(bytes),
+            Some(bytes) => AudioQueue::global().play_bytes(bytes, self.current_volume()),
             None => Err(format!("Special sound effect not found: {}", file_name)),
         }
     }
@@ -934,17 +1060,32 @@ impl TTSManager {
         Ok(bytes.to_vec())
     }
 
-    /// 多引擎智能文本语音播报（特殊音效拦截、特殊用户引擎、三级降级、3s 超时与故障熔断）。
+    /// 多引擎智能文本语音播报（特殊用户引擎、三级降级、3s 超时与故障熔断）。
     /// `user_id` 为空表示无用户上下文（如连击结算/模拟通道）；命中特殊用户时走专属引擎。
+    /// 注意：本地特殊音效不在本入口拦截（对齐原工程仅在弹幕文本路径 `HandleSpeekDm` 匹配）。
     pub async fn speak_text(&self, text: &str, user_id: &str) -> Result<(), String> {
+        self.speak_text_inner(text, user_id, None).await
+    }
+
+    /// 播报队列任务入口：按任务类型决定是否留档签到音频
+    pub async fn speak_task(&self, task: &SpeakTask) -> Result<(), String> {
+        let checkin = if task.is_checkin && !task.checkin_username.is_empty() {
+            Some(task.checkin_username.as_str())
+        } else {
+            None
+        };
+        self.speak_text_inner(&task.text, &task.user_id, checkin).await
+    }
+
+    async fn speak_text_inner(
+        &self,
+        text: &str,
+        user_id: &str,
+        checkin_username: Option<&str>,
+    ) -> Result<(), String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(());
-        }
-
-        // 1. 本地特殊音效精准命中拦截（如“曼波”、“痛快！！”）
-        if Self::match_special_sound(trimmed).is_some() {
-            return self.play_special_sound(trimmed);
         }
 
         let cfg = self.config.lock().unwrap().clone();
@@ -964,7 +1105,7 @@ impl TTSManager {
             match Self::request_audio_bytes(&client, &url, None).await {
                 Ok(bytes) => {
                     self.special_mark_success();
-                    return self.play_audio_bytes(&bytes, trimmed);
+                    return self.play_audio_bytes(&bytes, checkin_username);
                 }
                 Err(_) => {
                     self.special_mark_failure();
@@ -980,7 +1121,7 @@ impl TTSManager {
             match Self::request_audio_bytes(&client, &url, Some(&cfg.manbo_api_key)).await {
                 Ok(bytes) => {
                     self.mark_active_engine(TTSEngineType::Manbo);
-                    return self.play_audio_bytes(&bytes, trimmed);
+                    return self.play_audio_bytes(&bytes, checkin_username);
                 }
                 Err(_) => {
                     self.mark_engine_degraded(TTSEngineType::Manbo);
@@ -1019,7 +1160,7 @@ impl TTSManager {
                         {
                             if let Ok(bytes) = base64_decode(b64) {
                                 self.mark_active_engine(TTSEngineType::MiMo);
-                                return self.play_audio_bytes(&bytes, trimmed);
+                                return self.play_audio_bytes(&bytes, checkin_username);
                             }
                         }
                     }
@@ -1143,6 +1284,7 @@ mod tests {
         // D1：引擎「自动」对齐原工程 TTSProviderFactory 的 AUTO 模式（manbo -> mimo -> sapi）
         let mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Auto,
+            mimo_api_key: "test-mimo-key".into(),
             ..Default::default()
         });
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Manbo);
@@ -1155,6 +1297,18 @@ mod tests {
         mgr.mark_engine_degraded(TTSEngineType::MiMo);
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
         assert_eq!(mgr.current_engine_name(), "sapi");
+
+        // 未配置 MiMo API Key 时跳过 MiMo 直接落到 SAPI（对齐原工程 IsAvailable 的 Key 非空判定）
+        let no_key = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Auto,
+            ..Default::default()
+        });
+        no_key.mark_engine_degraded(TTSEngineType::Manbo);
+        assert!(
+            !no_key.is_engine_available(TTSEngineType::MiMo),
+            "无 MiMo Key 时该引擎不可用"
+        );
+        assert_eq!(no_key.select_active_engine(), TTSEngineType::Sapi);
 
         // 显式指定引擎时以其为准（故障时才降级），「自动」自身不参与降级判定
         let explicit = TTSManager::new(TTSConfig {
@@ -1178,6 +1332,7 @@ mod tests {
     fn test_tts_circuit_breaker_and_cooldown_recovery() {
         let mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Manbo,
+            mimo_api_key: "test-mimo-key".into(),
             ..Default::default()
         });
 
@@ -1252,6 +1407,71 @@ mod tests {
     }
 
     #[test]
+    fn test_volume_gain_mapping() {
+        // 原工程 MCI 音量 = speechVolume × 5（0~1000），故 200 → 满量程、100 → 半量程、0 → 静音
+        assert_eq!(volume_gain(200), 1.0);
+        assert_eq!(volume_gain(100), 0.5);
+        assert_eq!(volume_gain(0), 0.0);
+        assert_eq!(volume_gain(50), 0.25);
+        // 越界钳制（对齐 AudioPlayer::SetVolume 的 0~200）
+        assert_eq!(volume_gain(-10), 0.0);
+        assert_eq!(volume_gain(999), 1.0);
+        println!("[PASS] test_volume_gain_mapping passed");
+    }
+
+    #[test]
+    fn test_special_sound_keys_match_legacy_voice_map() {
+        // 对齐原工程 LocalVoiceManager::voiceMap_ 的 9 个键（忽略大小写精确匹配）
+        for (k, v) in [
+            ("曼波", "manbo/manbo.mp3"),
+            ("曼波曼波", "manbo/manbo_3x.mp3"),
+            ("duang", "manbo/duang.mp3"),
+            ("噢耶", "manbo/ohyeah.mp3"),
+            ("哦耶", "manbo/ohyeah.mp3"),
+            ("欧耶", "manbo/ohyeah.mp3"),
+            ("wow", "manbo/wow.mp3"),
+            ("痛快！！", "mho/tongkuai.mp3"),
+            ("痛快!!", "mho/tongkuai.mp3"),
+        ] {
+            assert_eq!(TTSManager::match_special_sound(k), Some(v), "键 {} 应映射 {}", k, v);
+        }
+        // 原工程未定义的键不得命中（避免吞掉正常播报文本）
+        assert_eq!(TTSManager::match_special_sound("痛快"), None);
+        assert_eq!(TTSManager::match_special_sound("ohyeah"), None);
+        assert_eq!(TTSManager::match_special_sound("tongkuai"), None);
+        println!("[PASS] test_special_sound_keys_match_legacy_voice_map passed");
+    }
+
+    #[test]
+    fn test_speak_queue_capacity_logs_and_requeue() {
+        let mgr = TTSManager::new(TTSConfig::default());
+        assert!(mgr.enqueue_speak("普通一条", "u1", false));
+        assert!(mgr.enqueue_checkin_speak("打卡回复", "u2", "舰长A"));
+
+        // 各队列每周期各推进一条
+        let batch = mgr.dequeue_one_each(2);
+        assert_eq!(batch.len(), 2);
+        assert!(batch[0].priority && batch[0].is_checkin && batch[0].checkin_username == "舰长A");
+        assert!(!batch[1].priority);
+
+        // 名额不足时回滚入队不丢播报
+        mgr.requeue_speak(batch[1].clone());
+        assert_eq!(mgr.dequeue_one_each(2).len(), 1);
+
+        // 并发闸门上限为 MAX_CONCURRENT_TTS
+        assert_eq!(MAX_CONCURRENT_TTS, 2);
+        assert!(mgr.try_acquire_slot());
+        assert!(mgr.try_acquire_slot());
+        assert!(!mgr.try_acquire_slot(), "超出并发上限应拒绝");
+        mgr.release_slot();
+        assert!(mgr.try_acquire_slot());
+        mgr.release_slot();
+        mgr.release_slot();
+        assert_eq!(mgr.inflight_count(), 0);
+        println!("[PASS] test_speak_queue_capacity_logs_and_requeue passed");
+    }
+
+    #[test]
     fn test_audio_queue_serializes_jobs() {
         let inflight = Arc::new(AtomicUsize::new(0));
         let max_inflight = Arc::new(AtomicUsize::new(0));
@@ -1271,7 +1491,7 @@ mod tests {
         };
 
         for i in 0..3u8 {
-            q.play_bytes(vec![i]).unwrap();
+            q.play_bytes(vec![i], 100).unwrap();
         }
 
         let start = Instant::now();
@@ -1456,12 +1676,17 @@ mod tests {
         assert_eq!(content_prefix("水友A 说：你好世界一二三"), "水友A_你好世界一");
         assert_eq!(content_prefix("短文本"), "短文本");
 
-        // 留档写入与超期清理
-        let saved = save_cached_audio("水友A 说：测试留档", b"fake-mp3-bytes");
-        assert!(saved.is_some(), "音频应成功留档");
+        // 签到音频留档写入（命名对齐原工程 SaveCheckinAudio：打卡_{用户名}_{时间戳}.mp3）与超期清理
+        let saved = save_checkin_audio("水友A", b"fake-mp3-bytes");
+        assert!(saved.is_some(), "签到音频应成功留档");
         let path = saved.unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), b"fake-mp3-bytes");
+        assert!(
+            path.file_name().unwrap().to_string_lossy().starts_with("打卡_水友A_"),
+            "留档文件名应为 打卡_{{用户名}}_{{时间戳}}.mp3，实际: {:?}",
+            path.file_name()
+        );
 
         // 保留天数内的今日目录不得被清理
         let today_dir = path.parent().unwrap().to_path_buf();

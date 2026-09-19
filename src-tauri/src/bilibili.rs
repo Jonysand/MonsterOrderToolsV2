@@ -169,7 +169,9 @@ impl BiliCredentials {
     }
 
     /// 发送应用心跳 POST /v2/app/heartbeat
-    pub async fn heartbeat_app(&self, game_id: &str) -> Result<(), String> {
+    /// 返回响应体的业务 code（对齐原工程 BliveManager::OnReceiveHeartbeatResponse 的判定：
+    /// 0 / 4004 视为正常，其它 code 说明会话已失效需重连）
+    pub async fn heartbeat_app(&self, game_id: &str) -> Result<i32, String> {
         let body = serde_json::json!({ "game_id": game_id }).to_string();
         let headers_map = self.generate_signed_headers(&body);
         let client = reqwest::Client::builder()
@@ -192,7 +194,11 @@ impl BiliCredentials {
             return Err(format!("心跳 HTTP 状态异常: {}", resp.status()));
         }
 
-        Ok(())
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("心跳响应解析失败: {}", e))?;
+        Ok(val.get("code").and_then(|c| c.as_i64()).unwrap_or(0) as i32)
     }
 
     /// 停止并关闭互动应用 POST /v2/app/end
@@ -253,7 +259,8 @@ impl Packet {
             header_len,
             ver: 0,
             op,
-            seq: 1,
+            // 原工程 ProtoUtils::Packet 的出站 seq 恒为 0（鉴权包/心跳包均如此）
+            seq: 0,
             body,
         }
     }
@@ -442,6 +449,8 @@ pub fn parse_like_event(data: &serde_json::Value) -> Option<LikeEvent> {
 
     let uid = pick_user_id(data);
     if uid.is_empty() {
+        // 缺 uid（open_id/uid 皆无）时记录告警后丢弃（对齐 like-event-tracking spec 的可观测要求）
+        crate::log_warn!("[BiliLive] 点赞事件缺少 uid/open_id，已丢弃: {}", data);
         return None;
     }
 
@@ -450,6 +459,10 @@ pub fn parse_like_event(data: &serde_json::Value) -> Option<LikeEvent> {
         .and_then(|v| v.as_i64())
         .or_else(|| data.get("click_count").and_then(|v| v.as_i64()))
         .unwrap_or(0) as i32;
+    if like_count <= 0 {
+        crate::log_warn!("[BiliLive] 点赞事件 like_count<=0，已丢弃（uid={}）", uid);
+        return None;
+    }
     if like_count > MAX_LIKE_COUNT {
         like_count = MAX_LIKE_COUNT;
     }
@@ -732,14 +745,21 @@ impl DanmuProcessor {
 
         let user_name = data.get("uname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let message = data.get("msg").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        // 时间戳缺失时取 0（对齐原工程 DanmuData.timestamp 默认值 0：同秒入队时稳定排在队首，
+        // 而不是被伪造成"当前时间"排到队尾）
         let timestamp = data
             .get("timestamp")
             .or_else(|| data.get("send_time"))
             .and_then(|v| v.as_i64())
-            .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64);
+            .unwrap_or(0);
 
         let has_medal = data.get("fans_medal_wearing_status").and_then(|v| v.as_bool()).unwrap_or(false);
-        let medal_level = data.get("fans_medal_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        // 仅在佩戴粉丝牌时记录等级（对齐原工程 DanmuProcessor.cpp:274-279 的赋值条件）
+        let medal_level = if has_medal {
+            data.get("fans_medal_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32
+        } else {
+            0
+        };
         let mut guard_level = data.get("guard_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         // 特殊管理员 OpenID 永远判定为总督 (guard_level = 1)
         if user_id == SPECIAL_OPEN_ID {
@@ -783,7 +803,7 @@ impl DanmuProcessor {
 
         // 2. 检查两段式“优先”置前逻辑（已在队列中的舰长水友追加“优先”）
         if self.is_priority_only_message(&danmu.message) {
-            if queue_mgr.items.iter().any(|i| i.user_id == danmu.user_id) {
+            if queue_mgr.contains(&danmu.user_id) {
                 let updated = queue_mgr.update_priority(&danmu.user_id, danmu.guard_level);
                 if updated {
                     result.priority_updated = true;
@@ -806,7 +826,7 @@ impl DanmuProcessor {
         // 4. 用户若已在队中：直接拦截重复点单（对齐原工程 DanmuProcessor.cpp:116-125）
         // 注：二次优先置前已在步骤 2 严格按整条精确匹配（is_priority_only_message）处理；
         // 句中包含“优先”等字样的常态聊天不再误提权（对齐原工程 v43 缺陷修复）
-        if queue_mgr.items.iter().any(|i| i.user_id == danmu.user_id) {
+        if queue_mgr.contains(&danmu.user_id) {
             return result;
         }
 
@@ -1037,7 +1057,8 @@ impl ExponentialBackoff {
 
     /// 获取本次重试延迟并步进
     pub fn next_delay(&mut self) -> u64 {
-        let delay = self.base_delay_ms.saturating_mul(1u64 << self.attempt.min(10));
+        // 对齐原工程 BliveManager.cpp:102-107：base × 2^min(attempt, 6)
+        let delay = self.base_delay_ms.saturating_mul(1u64 << self.attempt.min(6));
         let capped = delay.min(self.max_delay_ms);
         self.attempt = self.attempt.saturating_add(1);
         capped
@@ -1112,7 +1133,8 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
     FEvent: Fn(LiveEvent) + Send + Sync + 'static,
     FState: Fn(ConnectionState, DisconnectReason, u32) + Send + Sync + 'static,
 {
-    let mut backoff = ExponentialBackoff::new(1000, 30000);
+    // 对齐原工程 BliveManager.h:50-51：基数 1s、上限 60s
+    let mut backoff = ExponentialBackoff::new(1000, 60000);
     let processor = DanmuProcessor::new();
     // 已重连次数（仅重连路径递增，成功后清零）
     let mut attempt: u32 = 0;
@@ -1121,6 +1143,19 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
     on_state_change(ConnectionState::Connecting, DisconnectReason::None, 0);
 
     while running.load(Ordering::SeqCst) {
+        // 0. 重连/重开前先关闭上一场互动应用（对齐原工程 BliveManager.cpp:146-148：
+        //    若仍有 currentGameId 则先 End(gameId, restart=true)，否则会命中服务端 7001 请求冷却期）
+        {
+            let stale = current_game_id.lock().ok().and_then(|mut g| g.take());
+            if let Some(old_gid) = stale {
+                if let Err(e) = creds.end_app(&old_gid).await {
+                    crate::log_warn!("[BiliLive] 重连前关闭上一场互动应用失败（忽略并继续）: {}", e);
+                } else {
+                    crate::log_info!("[BiliLive] 重连前已关闭上一场互动应用: {}", old_gid);
+                }
+            }
+        }
+
         // 1. 调用 start_app 开启互动应用
         let start_res = creds.start_app().await;
         let (game_id, wss_links, auth_body) = match start_res {
@@ -1184,8 +1219,11 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                     }
 
                     // 3. 启动定时心跳与数据接收循环
-                    let mut ws_heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(25));
+                    //    WS 心跳间隔 20s（对齐原工程 HEARTBEAT_INTERVAL_MINISECONDS=20000）
+                    let mut ws_heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
                     let mut app_heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
+                    // 首个 WS 心跳延后 2s 发出（对齐原工程收到 OP_AUTH_REPLY 后排 2s 心跳）
+                    ws_heartbeat_interval.reset();
 
                     'ws_loop: loop {
                         if !running.load(Ordering::SeqCst) {
@@ -1202,8 +1240,24 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                                 }
                             }
                             _ = app_heartbeat_interval.tick() => {
-                                if let Err(e) = creds.heartbeat_app(&game_id).await {
-                                    crate::log_warn!("[BiliLive] 发送开放平台应用心跳失败: {}", e);
+                                // 应用层心跳需判定响应 code（对齐原工程 OnReceiveHeartbeatResponse）：
+                                // 0 / 4004 正常且复位重连计数；其它 code 视为会话失效，触发重连；
+                                // HTTP/网络失败按网络错误重连。
+                                match creds.heartbeat_app(&game_id).await {
+                                    Ok(code) if code == 0 || code == 4004 => {
+                                        attempt = 0;
+                                        backoff.reset();
+                                    }
+                                    Ok(code) => {
+                                        crate::log_warn!("[BiliLive] 应用心跳返回异常 code={}，触发重连", code);
+                                        last_reason = DisconnectReason::HeartbeatTimeout;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        crate::log_warn!("[BiliLive] 应用心跳失败，触发重连: {}", e);
+                                        last_reason = DisconnectReason::NetworkError;
+                                        break;
+                                    }
                                 }
                             }
                             msg_opt = read.next() => {
@@ -1211,55 +1265,93 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                                     Some(Ok(Message::Binary(bytes))) => {
                                         let packets = Packet::unpack_all(&bytes);
                                         for pkt in packets {
-                                            if pkt.op == Packet::OP_MESSAGE {
-                                                if let Ok(text) = std::str::from_utf8(&pkt.body) {
-                                                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-                                                        let cmd = val.get("cmd").and_then(|c| c.as_str()).unwrap_or_default();
-                                                        if cmd == "LIVE_OPEN_PLATFORM_DM" {
-                                                            if let Some(danmu) = processor.parse_danmu_json(text) {
-                                                                on_danmu(danmu);
-                                                            }
-                                                        } else if cmd == "LIVE_OPEN_PLATFORM_LIKE" {
-                                                            if let Some(data) = val.get("data") {
-                                                                if let Some(ev) = parse_like_event(data) {
-                                                                    if ev.like_count > 0 {
-                                                                        on_like(ev);
-                                                                    }
-                                                                }
-                                                            }
-                                                        } else if cmd == "LIVE_OPEN_PLATFORM_SEND_GIFT" {
-                                                            if let Some(data) = val.get("data") {
-                                                                if let Some(ev) = parse_gift_event(data) {
-                                                                    if ev.gift_num > 0 {
-                                                                        on_gift(ev);
-                                                                    }
-                                                                }
-                                                            }
-                                                        } else if cmd == "LIVE_OPEN_PLATFORM_SUPER_CHAT" {
-                                                            if let Some(data) = val.get("data") {
-                                                                if let Some(ev) = parse_super_chat(data) {
-                                                                    on_event(ev);
-                                                                }
-                                                            }
-                                                        } else if cmd == "LIVE_OPEN_PLATFORM_GUARD" {
-                                                            if let Some(data) = val.get("data") {
-                                                                if let Some(ev) = parse_guard(data) {
-                                                                    on_event(ev);
-                                                                }
-                                                            }
-                                                        } else if cmd == "LIVE_OPEN_PLATFORM_LIVE_ROOM_ENTER" {
-                                                            if let Some(data) = val.get("data") {
-                                                                if let Some(ev) = parse_room_enter(data) {
-                                                                    on_event(ev);
-                                                                }
-                                                            }
-                                                        } else if cmd == "LIVE_OPEN_PLATFORM_INTERACTION_END" {
-                                                            crate::log_warn!("[BiliLive] 接收到服务端开播终止包");
-                                                            last_reason = DisconnectReason::ServerClose;
-                                                            break 'ws_loop;
+                                            if pkt.op == Packet::OP_HEARTBEAT_REPLY {
+                                                // 收到心跳回复即证明链路存活：复位重连计数（对齐原工程
+                                                // BliveManager.cpp:513-518 的 reconnectAttemptCount.store(0)）
+                                                attempt = 0;
+                                                backoff.reset();
+                                                continue;
+                                            }
+                                            if pkt.op != Packet::OP_MESSAGE {
+                                                // 未知操作码：原工程按网络错误触发重连（BliveManager.cpp:533-537）
+                                                crate::log_warn!("[BiliLive] 收到未知操作码 {}，触发重连", pkt.op);
+                                                last_reason = DisconnectReason::NetworkError;
+                                                break 'ws_loop;
+                                            }
+                                            let text = match std::str::from_utf8(&pkt.body) {
+                                                Ok(t) => t,
+                                                Err(e) => {
+                                                    crate::log_warn!("[BiliLive] 弹幕包体非 UTF-8，已跳过: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let val = match serde_json::from_str::<serde_json::Value>(text) {
+                                                Ok(v) => v,
+                                                Err(e) => {
+                                                    crate::log_warn!("[BiliLive] 弹幕 JSON 解析失败，已跳过: {}", e);
+                                                    continue;
+                                                }
+                                            };
+                                            let cmd = val.get("cmd").and_then(|c| c.as_str()).unwrap_or_default();
+                                            if cmd == "LIVE_OPEN_PLATFORM_DM" {
+                                                if let Some(danmu) = processor.parse_danmu_json(text) {
+                                                    on_danmu(danmu);
+                                                }
+                                            } else if cmd == "LIVE_OPEN_PLATFORM_LIKE" {
+                                                if let Some(data) = val.get("data") {
+                                                    if let Some(ev) = parse_like_event(data) {
+                                                        if ev.like_count > 0 {
+                                                            on_like(ev);
                                                         }
                                                     }
                                                 }
+                                            } else if cmd == "LIVE_OPEN_PLATFORM_SEND_GIFT" {
+                                                if let Some(data) = val.get("data") {
+                                                    if let Some(ev) = parse_gift_event(data) {
+                                                        if ev.gift_num > 0 {
+                                                            on_gift(ev);
+                                                        }
+                                                    }
+                                                }
+                                            } else if cmd == "LIVE_OPEN_PLATFORM_SUPER_CHAT" {
+                                                if let Some(data) = val.get("data") {
+                                                    if let Some(ev) = parse_super_chat(data) {
+                                                        on_event(ev);
+                                                    }
+                                                }
+                                            } else if cmd == "LIVE_OPEN_PLATFORM_GUARD" {
+                                                if let Some(data) = val.get("data") {
+                                                    if let Some(ev) = parse_guard(data) {
+                                                        on_event(ev);
+                                                    }
+                                                }
+                                            } else if cmd == "LIVE_OPEN_PLATFORM_LIVE_ROOM_ENTER" {
+                                                if let Some(data) = val.get("data") {
+                                                    if let Some(ev) = parse_room_enter(data) {
+                                                        on_event(ev);
+                                                    }
+                                                }
+                                            } else if cmd == "LIVE_OPEN_PLATFORM_INTERACTION_END" {
+                                                // 仅当终止的 game_id 与本场一致时才断线重连（对齐原工程
+                                                // BliveManager.cpp:579-595 的 gameId 比对与清理）
+                                                let ended_gid = val
+                                                    .get("data")
+                                                    .and_then(|d| d.get("game_id"))
+                                                    .and_then(|g| g.as_str())
+                                                    .unwrap_or_default();
+                                                if !ended_gid.is_empty() && ended_gid != game_id {
+                                                    crate::log_warn!(
+                                                        "[BiliLive] 收到其它会话的终止包（{}），忽略",
+                                                        ended_gid
+                                                    );
+                                                    continue;
+                                                }
+                                                crate::log_warn!("[BiliLive] 接收到服务端开播终止包");
+                                                if let Ok(mut g) = current_game_id.lock() {
+                                                    g.take();
+                                                }
+                                                last_reason = DisconnectReason::ServerClose;
+                                                break 'ws_loop;
                                             }
                                         }
                                     }

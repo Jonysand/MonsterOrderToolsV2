@@ -31,21 +31,21 @@ pub fn resource_root() -> Option<PathBuf> {
 }
 
 /// 可写数据目录（MonsterOrderWilds_configs）解析顺序：
-/// 1. cwd 下（在仓库根目录运行 / 绿色版双击启动）
-/// 2. cwd/.. 下（`tauri dev` / `cargo test` 时 cwd = src-tauri）
-/// 3. exe 同级（安装版随包资源目录，用户可编辑）
+/// 1. exe 同级（安装版：用户可编辑的随包数据目录；对齐原工程「恒定取 exe 同级」语义）
+/// 2. cwd 下（绿色版 / 在仓库根目录直接运行）
+/// 3. cwd/.. 下（`tauri dev` / `cargo test` 时 cwd = src-tauri）
 /// 4. 兜底：创建 exe 同级目录
 ///
-/// 注意：exe 同级优先会让开发态误用 `target/debug` 下的资源副本（缺失 credentials.dat 与历史库），
-/// 故运行目录优先、安装目录兜底
+/// 关键点：按「是否已存在」逐级判定，故开发态 exe 同级不存在时会正确回退到仓库根目录，
+/// 而安装版则恒定使用 exe 同级 —— 避免以不同工作目录启动同一 exe 时读写到不同数据。
 pub fn config_dir() -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = exe_dir() {
+        candidates.push(dir.join(CONFIG_DIR_NAME));
+    }
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join(CONFIG_DIR_NAME));
         candidates.push(cwd.join("..").join(CONFIG_DIR_NAME));
-    }
-    if let Some(dir) = exe_dir() {
-        candidates.push(dir.join(CONFIG_DIR_NAME));
     }
 
     for c in &candidates {

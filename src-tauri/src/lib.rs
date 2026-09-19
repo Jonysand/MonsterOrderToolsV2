@@ -19,7 +19,7 @@ use checkin::CheckinManager;
 use config::AppConfig;
 use credentials::{Credentials, CredentialsStatus};
 use monster::MonsterDataManager;
-use queue::{get_order_list_path, QueueItem, QueueManager};
+use queue::{QueueItem, QueueManager};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tts::{TTSConfig, TTSEngineType, TTSManager};
@@ -63,8 +63,9 @@ impl Default for AppState {
         }
 
         // 2. 初始化排队管理器并自动加载持久化列表
+        //    读取优先 V2 的 order_list.json，其次原工程 OrderList.list（首次迁移，只读不改写）
         let mut queue_mgr = QueueManager::new();
-        let order_path = get_order_list_path();
+        let order_path = queue::resolve_queue_read_path();
         if let Err(e) = queue_mgr.load_from_file(&order_path) {
             crate::log_warn!("[Init] 历史队列加载失败，从空队列启动: {}", e);
         }
@@ -80,11 +81,10 @@ impl Default for AppState {
         } else {
             app_cfg.mimo_api_key.clone()
         };
-        let manbo_key = if !creds.special_user_tts_api_key.is_empty() {
-            creds.special_user_tts_api_key.clone()
-        } else {
-            app_cfg.manbo_api_key.clone()
-        };
+        // Manbo API Key 的权威来源是注册表（HKCU\Software\MonsterOrderWilds\ManboApiKey）与配置值，
+        // 不由 credentials.dat 承载 —— 原工程 C++/C# 全仓无 special_user_tts_api_key 引用，
+        // 该凭据不得覆盖用户手填的 Manbo Key。
+        let manbo_key = app_cfg.manbo_api_key.clone();
 
         let tts_mgr = TTSManager::new(TTSConfig {
             engine: parse_tts_engine(&app_cfg.tts_engine),
@@ -146,14 +146,45 @@ fn get_queue(state: State<'_, AppState>) -> Result<Vec<QueueItem>, String> {
 }
 
 /// 队列落盘（E2：失败记录告警而非静默吞错；内存队列保持可用）。
+/// 关键点：序列化在锁内完成，**磁盘写入在锁外执行**，避免持锁做 I/O 阻塞弹幕处理与 UI 命令。
 /// 单测构建不落盘 —— 避免 `cargo test` 污染真实 order_list.json（内存队列照常运作）
-fn save_queue_or_warn(q: &mut QueueManager, path: &std::path::Path) {
+fn flush_queue(state: &AppState, force: bool) {
     if cfg!(test) {
         return;
     }
-    if let Err(e) = q.save_to_file(path) {
+    let path = queue::get_order_list_path();
+    // 锁内：仅在需要时序列化并清除脏标记
+    let json = {
+        let mut q = match state.queue_mgr.lock() {
+            Ok(q) => q,
+            Err(e) => {
+                crate::log_warn!("[Queue] 队列锁异常，跳过落盘: {}", e);
+                return;
+            }
+        };
+        if !q.dirty && !force {
+            return;
+        }
+        match q.to_json() {
+            Ok(j) => {
+                q.dirty = false;
+                j
+            }
+            Err(e) => {
+                crate::log_warn!("[Queue] 队列序列化失败: {}", e);
+                return;
+            }
+        }
+    };
+    // 锁外：磁盘 I/O
+    if let Err(e) = QueueManager::write_json(&path, &json) {
         crate::log_warn!("[Queue] 队列落盘失败: {}（路径: {}）", e, path.display());
     }
+}
+
+/// 变更后立即落盘（用于用户命令与退出链路；弹幕热路径改由 500ms 节流任务落盘）
+fn save_queue_now(state: &AppState) {
+    flush_queue(state, true);
 }
 
 /// 新增点怪
@@ -194,12 +225,11 @@ fn add_order(
     };
 
     q.add_or_update(item);
-
-    // 定时保存
-    let path = get_order_list_path();
-    save_queue_or_warn(&mut q, &path);
-
     let items = q.items.clone();
+    drop(q);
+
+    // 用户命令路径保持"变更即落盘"语义（弹幕热路径改由 500ms 节流任务负责）
+    save_queue_now(&state);
     let _ = app_handle.emit("queue-updated", &items);
     Ok(items)
 }
@@ -213,11 +243,10 @@ fn dequeue_by_user_id(
 ) -> Result<Vec<QueueItem>, String> {
     let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
     q.dequeue_by_user_id(&user_id);
-
-    let path = get_order_list_path();
-    save_queue_or_warn(&mut q, &path);
-
     let items = q.items.clone();
+    drop(q);
+
+    save_queue_now(&state);
     let _ = app_handle.emit("queue-updated", &items);
     Ok(items)
 }
@@ -227,10 +256,10 @@ fn dequeue_by_user_id(
 fn clear_queue(state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
     let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
     q.clear();
+    drop(q);
 
-    let path = get_order_list_path();
-    save_queue_or_warn(&mut q, &path);
-
+    // 清空属破坏性操作：立即落盘（对齐原工程 Clear() 立即 SaveList）
+    save_queue_now(&state);
     let _ = app_handle.emit("queue-updated", &Vec::<QueueItem>::new());
     Ok(())
 }
@@ -244,11 +273,10 @@ fn reorder_queue(
 ) -> Result<Vec<QueueItem>, String> {
     let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
     q.reorder(items);
-
-    let path = get_order_list_path();
-    save_queue_or_warn(&mut q, &path);
-
     let current_items = q.items.clone();
+    drop(q);
+
+    save_queue_now(&state);
     let _ = app_handle.emit("queue-updated", &current_items);
     Ok(current_items)
 }
@@ -260,13 +288,6 @@ fn match_monster_name(
     state: State<'_, AppState>,
 ) -> Result<Option<monster::MonsterMatchResult>, String> {
     Ok(state.monster_mgr.match_monster(&input_text))
-}
-
-/// 查询是否处于 Lite 模式 (ONLY_ORDER_MONSTER)
-#[tauri::command]
-fn get_lite_mode(state: State<'_, AppState>) -> Result<bool, String> {
-    let cfg = state.config.lock().map_err(|e| e.to_string())?;
-    Ok(cfg.is_lite_mode)
 }
 
 /// 设置 Lite 模式开关并持久化
@@ -348,7 +369,16 @@ fn save_app_config(
     keep_cred!(access_key_secret, access_key_secret);
     keep_cred!(deepseek_api_key, chat_api_key);
     keep_cred!(mimo_api_key, mimo_tts_api_key);
-    keep_cred!(manbo_api_key, special_user_tts_api_key);
+    // Manbo Key 不走 credentials.dat（原工程零引用 special_user_tts_api_key）：
+    // credentials.dat 有值时以注册表/配置为准，仅在两者皆空时沿用现有内存值
+    if new_cfg.manbo_api_key.trim().is_empty() {
+        new_cfg.manbo_api_key = prev.manbo_api_key.clone();
+    }
+
+    // 悬浮窗位置由拖动链路（pending_pos + 3s 防抖）独占维护，前端设置面板不提供该字段，
+    // 故此处忽略前端回传的 top_pos，避免用陈旧副本覆盖真实位置（P1-6）
+    new_cfg.top_pos_x = prev.top_pos_x;
+    new_cfg.top_pos_y = prev.top_pos_y;
 
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     *cfg = new_cfg.clone();
@@ -407,7 +437,9 @@ fn apply_connection_status(
 /// 播报任务入队（由后台泵逐条取出执行，避免弹幕密集时并发请求堆积）。
 /// `priority=true` 进入高优先队列（礼物/SC/上舰/打卡/点餐），否则为普通弹幕朗读队列。
 fn queue_tts(state: &AppState, text: String, user_id: &str, priority: bool) {
-    state.tts_mgr.enqueue_speak(&text, user_id, priority);
+    if !state.tts_mgr.enqueue_speak(&text, user_id, priority) {
+        crate::log_warn!("[TTS] 播报入队失败（空文本或队列已满），已丢弃");
+    }
 }
 
 /// 点餐指令：以「点餐」开头且后续非空时返回接单文案（对齐原工程 HandleDmOrderFood）
@@ -510,7 +542,8 @@ fn schedule_checkin_reply(
             );
         }
         if enable_voice {
-            tts.enqueue_speak(&text, &user_id, true);
+            // 签到/补签播报：音频按 `打卡_{用户名}_{ts}.mp3` 留档（对齐原工程仅留档签到 TTS）
+            tts.enqueue_checkin_speak(&text, &user_id, &user_name);
         }
     });
 }
@@ -569,19 +602,18 @@ pub fn handle_incoming_danmu(
             let danmu_date = bilibili::server_date(danmu.timestamp)
                 .unwrap_or_else(|| chrono::Local::now().date_naive());
 
-            // 2.3 判定打卡
+            // 2.3 判定打卡：仅以配置的触发词为准（对齐原工程 CaptainCheckInModule::IsCheckinMessage）。
+            // 触发词清空后打卡功能即完全停用，不得内置兜底词，否则用户无法通过配置关闭打卡。
             let checkin_triggers: Vec<String> = cfg
                 .checkin_trigger_words
-                .split(&[',', '，'][..])
+                .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
             let is_checkin = checkin_module_enabled
-                && (checkin_triggers.iter().any(|t| msg_trim.eq_ignore_ascii_case(t))
-                    || msg_trim == "打卡"
-                    || msg_trim == "签到"
-                    || msg_trim == "打卡！"
-                    || msg_trim == "签到！");
+                && checkin_triggers
+                    .iter()
+                    .any(|t| msg_trim.eq_ignore_ascii_case(t));
 
             if is_checkin {
                 // 原工程触发条件：舰长 或 佩戴粉丝牌的用户均可打卡
@@ -701,22 +733,28 @@ pub fn handle_incoming_danmu(
     }
 
     // 3. 核心排队与怪物点单处理
-    let mut q = state.queue_mgr.lock().unwrap();
-    let res = state.danmu_processor.process_danmu(&danmu, &state.monster_mgr, &mut q);
+    let (res, queued_items) = {
+        let mut q = state.queue_mgr.lock().unwrap();
+        let res = state
+            .danmu_processor
+            .process_danmu(&danmu, &state.monster_mgr, &mut q);
+        let items = q.items.clone();
+        (res, items)
+        // 锁在此处释放：后续日志/事件广播/落盘均不持锁
+    };
 
     if res.added_to_queue || res.priority_updated {
-        let path = queue::get_order_list_path();
-        save_queue_or_warn(&mut q, &path);
-        let items = q.items.clone();
+        // 弹幕热路径不在此落盘（脏标记已置位，由 500ms 节流任务在锁外写盘，
+        // 对齐原工程 PriorityQueueManager::Tick 的 SAVE_INTERVAL_MS=500 语义）
         crate::log_info!(
             "[Queue] {} {} 成功（优先={}），当前排队 {} 位",
             danmu.user_name,
             if res.priority_updated { "优先置前" } else { "点怪" },
             res.priority_updated,
-            items.len()
+            queued_items.len()
         );
         if let Some(handle) = app_handle {
-            let _ = handle.emit("queue-updated", &items);
+            let _ = handle.emit("queue-updated", &queued_items);
             // D3 跑马灯：点怪成功提示（优先置前 / 新增入队，对齐原工程 DataBridgeExports 回调）
             let _ = handle.emit(
                 "order-placed",
@@ -741,9 +779,12 @@ pub fn handle_incoming_danmu(
         // 该开关仅作用于礼物播报（见 handle_incoming_gift 与连击结算）。
 
         if passes_medal && passes_guard {
+            // 4.1 点餐指令（"点餐xxx"）：接单文案进普通队列，且原工程 HandleSpeekDm 之后
+            //     不会 return，仍会继续朗读原文 —— 二者都要播（对齐 TextToSpeech.cpp:217-267）
             if let Some(food_text) = build_food_order_text(msg_trim, &danmu.user_name) {
-                // 4.1 点餐指令（"点餐xxx"）
-                queue_tts(state, food_text, &danmu.user_id, true);
+                queue_tts(state, food_text, &danmu.user_id, false);
+                let read_text = format!("{} 说：{}", danmu.user_name, danmu.message);
+                queue_tts(state, read_text, &danmu.user_id, false);
             } else if TTSManager::match_special_sound(msg_trim).is_some() {
                 // 4.2 本地特殊语音命中：直接播放（不依赖 TTS 引擎与 API）
                 let _ = state.tts_mgr.play_special_sound(msg_trim);
@@ -878,6 +919,13 @@ pub fn handle_incoming_live_event(
         .map(|c| c.is_lite_mode)
         .unwrap_or(false);
     if is_lite {
+        return;
+    }
+
+    // 进场事件仅做历史留档（对齐原工程 HandleSpeekEnter 只写 History、不播报）：
+    // 该事件前端无消费方，故不广播，避免高频 IPC 空转
+    if let bilibili::LiveEvent::RoomEnter { uname, .. } = &ev {
+        logging::record_history(&format!("{} 进入直播间", uname));
         return;
     }
 
@@ -1097,59 +1145,6 @@ fn simulate_live_event(
     Ok(())
 }
 
-/// 舰长常规打卡（受 Lite 模式控制）
-#[tauri::command]
-fn record_checkin(
-    uid: String,
-    username: String,
-    state: State<'_, AppState>,
-) -> Result<checkin::UserProfile, String> {
-    ensure_not_lite(&state, "打卡模块")?;
-
-    let today = chrono::Local::now().date_naive();
-    state.checkin_mgr.record_checkin(&uid, &username, today)
-}
-
-/// 查询打卡档案（受 Lite 模式控制）
-#[tauri::command]
-fn get_checkin_profile(
-    uid: String,
-    state: State<'_, AppState>,
-) -> Result<checkin::UserProfile, String> {
-    ensure_not_lite(&state, "打卡模块")?;
-    state.checkin_mgr.get_profile(&uid)
-}
-
-/// 查询补签卡（受 Lite 模式控制）
-#[tauri::command]
-fn get_retroactive_cards(
-    uid: String,
-    state: State<'_, AppState>,
-) -> Result<checkin::RetroactiveCardData, String> {
-    ensure_not_lite(&state, "补签卡模块")?;
-    Ok(state.checkin_mgr.get_cards(&uid))
-}
-
-/// 执行补签（受 Lite 模式控制）
-#[tauri::command]
-fn execute_retroactive_checkin(
-    uid: String,
-    username: String,
-    state: State<'_, AppState>,
-) -> Result<i32, String> {
-    ensure_not_lite(&state, "补签模块")?;
-
-    let today = chrono::Local::now().date_naive();
-    let target_date = state
-        .checkin_mgr
-        .find_last_missing_checkin_date(&uid, today)
-        .ok_or_else(|| "未找到可补签的缺卡日期".to_string())?;
-
-    state
-        .checkin_mgr
-        .execute_retroactive_checkin(&uid, &username, target_date)
-}
-
 /// 模拟点赞事件（与真实长连同一管道：msg_id 去重 + 奖卡 + 播报）
 #[tauri::command]
 fn simulate_like(
@@ -1268,6 +1263,103 @@ fn confirm_action(title: String, message: String, app_handle: AppHandle) -> Resu
     confirm_with_dialog(&app_handle, &title, &message)
 }
 
+/// 校验凭据文件并复制到规范位置，返回加载后的凭据（纯逻辑，便于单测覆盖）
+pub fn import_credentials_from_path(path: &std::path::Path) -> Result<credentials::Credentials, String> {
+    if !path.exists() {
+        return Err(format!("凭据文件不存在: {}", path.display()));
+    }
+    // 先按原工程格式严格校验（魔数 + HMAC-SHA256 签名），校验通过才复制
+    let creds = credentials::load_credentials(Some(path))
+        .map_err(|e| format!("凭据文件校验失败（{}）: {}", path.display(), e))?;
+
+    let target = credentials::get_credentials_path();
+    if path != target {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建数据目录失败: {}", e))?;
+        }
+        std::fs::copy(path, &target)
+            .map_err(|e| format!("复制凭据到 {} 失败: {}", target.display(), e))?;
+    }
+    Ok(creds)
+}
+
+/// 将导入的凭据注入运行状态（无需重启即生效）：配置镜像字段 + TTS 引擎 + AI Provider
+fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) {
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.app_id = creds.app_id.clone();
+        cfg.access_key_id = creds.access_key_id.clone();
+        cfg.access_key_secret = creds.access_key_secret.clone();
+        cfg.mimo_api_key = creds.mimo_tts_api_key.clone();
+        cfg.deepseek_api_key = creds.chat_api_key.clone();
+    }
+    state.ai_provider.set_api_key(creds.chat_api_key.clone());
+    if let Ok(cfg) = state.config.lock() {
+        let mimo_key = if !creds.mimo_tts_api_key.is_empty() {
+            creds.mimo_tts_api_key.clone()
+        } else {
+            cfg.mimo_api_key.clone()
+        };
+        state.tts_mgr.update_config(TTSConfig {
+            engine: parse_tts_engine(&cfg.tts_engine),
+            enable_voice: cfg.enable_voice,
+            speech_rate: cfg.speech_rate,
+            speech_volume: cfg.speech_volume,
+            speech_pitch: cfg.speech_pitch,
+            // Manbo Key 权威来源为注册表/配置，不由 credentials.dat 承载
+            manbo_api_key: cfg.manbo_api_key.clone(),
+            manbo_voice: cfg.manbo_voice.clone(),
+            mimo_api_key: mimo_key,
+            mimo_voice: cfg.mimo_voice.clone(),
+            mimo_style: cfg.mimo_style.clone(),
+            mimo_audio_format: cfg.mimo_audio_format.clone(),
+        });
+    }
+}
+
+/// 选择凭据文件（生产：系统打开对话框；测试构建：不弹窗）
+#[cfg(not(test))]
+fn pick_credentials_file(app_handle: &AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app_handle
+        .dialog()
+        .file()
+        .add_filter("凭据文件", &["dat"])
+        .blocking_pick_file();
+    match picked {
+        None => Ok(None),
+        Some(p) => Ok(Some(
+            p.into_path()
+                .map_err(|e| format!("路径解析失败: {}", e))?
+                .to_string_lossy()
+                .to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+fn pick_credentials_file(_app_handle: &AppHandle) -> Result<Option<String>, String> {
+    Err("测试构建不弹出文件选择对话框".into())
+}
+
+/// 导入 B 站开放平台凭据文件（P1-8）。
+/// 安装包不随包分发 credentials.dat（避免公开分发平台密钥），故提供显式导入入口：
+/// 选择文件 → HMAC 校验 → 复制到 `{数据目录}/credentials.dat` → 即时注入运行状态。
+#[tauri::command]
+fn import_credentials_file(
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<CredentialsStatus, String> {
+    let Some(path) = pick_credentials_file(&app_handle)? else {
+        return Err("已取消导入".into());
+    };
+    let creds = import_credentials_from_path(std::path::Path::new(&path))?;
+    apply_credentials_live(&state, &creds);
+    crate::log_info!("[Credentials] 已导入凭据文件: {}", path);
+
+    let target = credentials::get_credentials_path();
+    Ok(creds.to_status(true, &target.to_string_lossy()))
+}
+
 /// GM: 导出打卡记录（CSV / JSON，系统保存对话框 + UTF-8 BOM；受 Lite 模式控制）
 /// 对齐原工程 DataBridgeExports：支持昵称模糊筛选与日期范围（YYYY-MM-DD）
 #[tauri::command]
@@ -1334,13 +1426,6 @@ fn gm_export_checkin_records(
     save_text_file_with_dialog(&app_handle, &default_name, &format, &content)
 }
 
-/// 播放本地特殊音效（受 Lite 模式控制）
-#[tauri::command]
-fn play_sound_effect(sound_name: String, state: State<'_, AppState>) -> Result<(), String> {
-    ensure_not_lite(&state, "音效模块")?;
-    state.tts_mgr.play_special_sound(&sound_name)
-}
-
 /// 获取 Manbo 全量音色列表（供语音设置下拉，对齐原工程 ToolsMain.ManboVoiceList）
 #[tauri::command]
 fn get_manbo_voice_list() -> Vec<String> {
@@ -1351,12 +1436,14 @@ fn get_manbo_voice_list() -> Vec<String> {
 }
 
 /// 配置字符串 → TTS 引擎类型（"auto" 走自动级联；未知值按原工程默认 Manbo）
+/// 引擎名 → 枚举：未知值按「自动」处理（对齐原工程 TTSProviderFactory::Create
+/// 的 default 分支——未知引擎名走 AUTO 级联，而非退化为手动 Manbo 而丢失降级链）
 fn parse_tts_engine(s: &str) -> TTSEngineType {
     match s.trim().to_ascii_lowercase().as_str() {
-        "auto" => TTSEngineType::Auto,
-        "mimo" => TTSEngineType::MiMo,
+        "manbo" | "曼波" => TTSEngineType::Manbo,
+        "mimo" | "xiaomi" => TTSEngineType::MiMo,
         "sapi" => TTSEngineType::Sapi,
-        _ => TTSEngineType::Manbo,
+        _ => TTSEngineType::Auto,
     }
 }
 
@@ -1528,24 +1615,6 @@ fn hide_window(app_handle: AppHandle, label: String) -> Result<(), String> {
     }
 }
 
-/// 显示指定窗口
-#[tauri::command]
-fn show_window(app_handle: AppHandle, label: String) -> Result<(), String> {
-    if let Some(window) = app_handle.get_webview_window(&label) {
-        window.show().map_err(|e| e.to_string())?;
-        let _ = window.set_focus();
-        Ok(())
-    } else {
-        Err(format!("Window '{}' not found", label))
-    }
-}
-
-/// 退出程序命令（E3）：前端「退出」入口与主窗口关闭共用同一清理链路
-#[tauri::command]
-fn end_app(app_handle: AppHandle, state: State<'_, AppState>) {
-    shutdown_app(&app_handle, &state);
-}
-
 /// 退出清理链路（E3，对齐原工程 Exit 命令：WriteQueue::Flush → BliveManager::Disconnect → PostQuitMessage）：
 /// V2 中队列/配置均为变更即时落盘，此处补做待写悬浮窗位置落盘、停止长连并记录日志，最后退出进程。
 /// 有意差异：不在退出路径阻塞调用 B 站下播接口（end_app API），避免网络等待拖慢退出
@@ -1558,7 +1627,9 @@ fn shutdown_app(app_handle: &AppHandle, state: &AppState) {
             }
         }
     }
-    // 2. 停止直播长连（等价原工程 BliveManager::Disconnect / Destroy）
+    // 2. 队列强制落盘（等价原工程退出前的 WriteQueue::Flush；覆盖 500ms 节流窗口内未写的变更）
+    flush_queue(state, true);
+    // 3. 停止直播长连（等价原工程 BliveManager::Disconnect / Destroy）
     if state.bili_service.is_running() {
         state.bili_service.set_running(false);
         crate::log_info!("[App] 退出：已断开 B 站直播长连");
@@ -1593,6 +1664,11 @@ fn get_credentials_status(state: State<'_, AppState>) -> Result<CredentialsStatu
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 崩溃处理（P1-11）：panic hook 写崩溃报告 + Windows 未处理异常生成全内存 minidump
+    // （对齐原工程 DumpHelper::Init 的能力）。测试构建不安装，避免干扰测试输出。
+    #[cfg(not(test))]
+    logging::install_crash_handler();
+
     let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
     // 对话框插件仅在生产构建注册（原因见 save_text_file_with_dialog 注释）
     #[cfg(not(test))]
@@ -1657,11 +1733,10 @@ pub fn run() {
                     .map(|c| (c.top_pos_x, c.top_pos_y))
                     .unwrap_or((0.0, 0.0));
                 if let Some(win) = app.get_webview_window("overlay") {
-                    if px > 0.0 || py > 0.0 {
-                        let _ = win.set_position(tauri::Position::Logical(
-                            tauri::LogicalPosition::new(px, py),
-                        ));
-                    }
+                    // 原工程无条件应用 TopPos（默认 0,0 即屏幕左上），此处同样不做哨兵判断
+                    let _ = win.set_position(tauri::Position::Logical(
+                        tauri::LogicalPosition::new(px, py),
+                    ));
                 }
 
                 #[cfg(not(test))]
@@ -1678,11 +1753,11 @@ pub fn run() {
                 }
             }
 
-            // 播报泵：每 150ms 出队一条待播报任务（优先队列优先）并结算超时连击，
-            // 与原工程 Tick 的 NormalMsgQueue / GiftMsgQueue 逐条出队语义一致
+            // 播报泵：每 100ms（对齐原工程 TIMER_INTERVAL=100）各出队一条优先/普通任务并结算超时连击；
+            // 并发合成上限 MAX_CONCURRENT_TTS=2（对齐原工程 activeRequestCount_ 闸门）
             let state = app.state::<AppState>().inner().clone();
             tauri::async_runtime::spawn(async move {
-                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(150));
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
                 loop {
                     interval.tick().await;
                     let (is_lite, only_paid) = state
@@ -1699,11 +1774,37 @@ pub fn run() {
                         state.tts_mgr.enqueue_speak(&msg, "", true);
                     }
 
-                    if let Some(task) = state.tts_mgr.dequeue_speak() {
-                        let _ = state.tts_mgr.speak_text(&task.text, &task.user_id).await;
+                    // 各队列每周期各推进一条（普通播报不会被优先队列饿死）
+                    let free = crate::tts::MAX_CONCURRENT_TTS.saturating_sub(state.tts_mgr.inflight_count());
+                    for task in state.tts_mgr.dequeue_one_each(free.min(2)) {
+                        if !state.tts_mgr.try_acquire_slot() {
+                            // 名额被占满：放回队首等待下一周期
+                            state.tts_mgr.requeue_speak(task);
+                            break;
+                        }
+                        let tts = state.tts_mgr.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // 历史留档：记录实际播报出去的文本（对齐原工程 WriteLog::RecordHistory）
+                            logging::record_history(&task.text);
+                            let _ = tts.speak_task(&task).await;
+                            tts.release_slot();
+                        });
                     }
                 }
             });
+
+            // 队列落盘节流：每 500ms 检查脏标记，仅在变更后于锁外写盘
+            // （对齐原工程 PriorityQueueManager::Tick 的 SAVE_INTERVAL_MS=500）
+            {
+                let state = app.state::<AppState>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                    loop {
+                        interval.tick().await;
+                        flush_queue(&state, false);
+                    }
+                });
+            }
 
             // 悬浮窗位置防抖落盘：拖动结束后写回配置 top_pos_x/y（每 3s 检查一次待写位置）
             {
@@ -1738,12 +1839,17 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     // E3：关闭主窗口 = 退出程序，统一走退出清理链路
                     let app = window.app_handle();
                     let state = app.state::<AppState>();
                     shutdown_app(app, &state);
+                } else {
+                    // 悬浮窗关闭 = 隐藏（对齐原工程 OrderedMonsterWindow::OnClosing 的 e.Cancel + Hide），
+                    // 否则窗口被销毁后 toggle_window 将永远失败，用户只能重启程序
+                    api.prevent_close();
+                    let _ = window.hide();
                 }
             }
         })
@@ -1755,11 +1861,9 @@ pub fn run() {
             reorder_queue,
             toggle_window,
             hide_window,
-            show_window,
-            end_app,
             get_credentials_status,
+            import_credentials_file,
             match_monster_name,
-            get_lite_mode,
             set_lite_mode,
             get_app_config,
             save_app_config,
@@ -1769,17 +1873,12 @@ pub fn run() {
             simulate_danmu,
             simulate_gift,
             simulate_live_event,
-            record_checkin,
-            get_checkin_profile,
-            get_retroactive_cards,
-            execute_retroactive_checkin,
             simulate_like,
             gm_batch_checkin,
             gm_search_users,
             gm_grant_card,
             gm_export_checkin_records,
             confirm_action,
-            play_sound_effect,
             get_manbo_voice_list,
             get_current_tts_engine,
             save_manbo_api_key,
@@ -1797,14 +1896,16 @@ pub fn run() {
 #[cfg(test)]
 impl AppState {
     pub fn new_test() -> Self {
-        let app_cfg = AppConfig::default();
+        let mut app_cfg = AppConfig::default();
+        // 单测需覆盖播报链路，故测试基线显式开启语音（生产默认值对齐原工程为 false）
+        app_cfg.enable_voice = true;
         let mut monster_mgr = MonsterDataManager::new();
         let _ = monster_mgr.load_from_file(None);
         let queue_mgr = QueueManager::new();
         let checkin_mgr = CheckinManager::new_in_memory().expect("In-memory SQLite failed");
         let tts_mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Manbo,
-            enable_voice: false,
+            enable_voice: true,
             speech_rate: 0,
             speech_volume: 100,
             speech_pitch: 0,
@@ -1847,7 +1948,7 @@ mod tests {
         let q = state.queue_mgr.lock().unwrap();
         assert_eq!(q.items.len(), 0);
         let cfg = state.config.lock().unwrap();
-        assert_eq!(cfg.opacity, 95);
+        assert_eq!(cfg.opacity, 100);
         assert!(!state.bili_service.is_running());
         println!("[PASS] test_app_state_initialization passed");
     }
@@ -1933,9 +2034,9 @@ mod tests {
     fn test_apply_pending_position_updates_memory_config() {
         let state = AppState::new_test();
 
-        // 无待写位置：返回 None，内存配置保持默认
+        // 无待写位置：返回 None，内存配置保持默认（对齐原工程 topPos = 0,0）
         assert!(apply_pending_position(&state).is_none());
-        assert_eq!(state.config.lock().unwrap().top_pos_x, 100.0);
+        assert_eq!(state.config.lock().unwrap().top_pos_x, 0.0);
 
         // 拖动产生待写位置：并入内存配置并清空 pending
         *state.pending_pos.lock().unwrap() = Some((913.0, 105.0));
@@ -2459,6 +2560,13 @@ mod tests {
         let task = state.tts_mgr.dequeue_speak().expect("点餐应入队");
         assert!(task.text.contains("下单的 麻辣烫 已接单"), "text: {}", task.text);
         assert_eq!(task.user_id, "u_food");
+        // 对齐原工程：接单文案入普通队列（非优先）
+        assert!(!task.priority, "点餐接单文案应进普通队列");
+
+        // 原工程 HandleSpeekDm 点餐后不 return，仍会朗读原文 → 第二条为原文朗读
+        let second = state.tts_mgr.dequeue_speak().expect("点餐弹幕还应朗读原文");
+        assert_eq!(second.text, "吃货水友 说：点餐麻辣烫");
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "点餐不应产生第三条播报");
         println!("[PASS] test_food_order_danmu_enters_priority_queue passed");
     }
 
@@ -2702,9 +2810,10 @@ mod tests {
         assert_eq!(parse_tts_engine("manbo"), TTSEngineType::Manbo);
         assert_eq!(parse_tts_engine("mimo"), TTSEngineType::MiMo);
         assert_eq!(parse_tts_engine("sapi"), TTSEngineType::Sapi);
-        // 未知值与原工程默认一致（Manbo）
-        assert_eq!(parse_tts_engine("unknown"), TTSEngineType::Manbo);
-        assert_eq!(parse_tts_engine(""), TTSEngineType::Manbo);
+        // 未知值/空值按「自动」处理（对齐原工程 TTSProviderFactory::Create 的 default 分支走 AUTO，
+        // 保留 Manbo→MiMo→SAPI 降级链，而不是退化为手动 Manbo）
+        assert_eq!(parse_tts_engine("unknown"), TTSEngineType::Auto);
+        assert_eq!(parse_tts_engine(""), TTSEngineType::Auto);
         println!("[PASS] test_parse_tts_engine_mapping passed");
     }
 

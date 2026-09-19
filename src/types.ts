@@ -86,6 +86,7 @@ export interface BatchCheckinResult {
   success: boolean;
   total_users: number;
   patched_users: number;
+  skipped_users: number;
   total_inserted: number;
   message: string;
 }
@@ -168,19 +169,25 @@ export interface GiftReceivedPayload {
   paid: boolean;
 }
 
-/** LiveEvent 为外部标签枚举：{ SuperChat: {...} } / { Guard: {...} } / { RoomEnter: {...} } */
+/**
+ * LiveEvent 为**内部标签**枚举（Rust `#[serde(tag = "kind")]`）：
+ * `{ kind: "SuperChat", ... }` / `{ kind: "Guard", ... }` / `{ kind: "RoomEnter", ... }`
+ */
 export interface SuperChatReceivedPayload {
-  SuperChat: { user_id: string; uname: string; rmb: number; message: string };
+  kind: "SuperChat";
+  user_id: string;
+  uname: string;
+  rmb: number;
+  message: string;
 }
 
 export interface GuardReceivedPayload {
-  Guard: {
-    user_id: string;
-    uname: string;
-    guard_level: number;
-    guard_num: number;
-    guard_unit: string;
-  };
+  kind: "Guard";
+  user_id: string;
+  uname: string;
+  guard_level: number;
+  guard_num: number;
+  guard_unit: string;
 }
 
 // ---------- D5 运行日志 ----------

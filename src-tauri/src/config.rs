@@ -65,8 +65,8 @@ impl Default for AppConfig {
             access_key_id: String::new(),
             access_key_secret: String::new(),
 
-            tts_engine: "manbo".into(),
-            enable_voice: true,
+            tts_engine: "auto".into(),
+            enable_voice: false,
             speech_rate: 0,
             speech_volume: 100,
             speech_pitch: 0,
@@ -80,16 +80,17 @@ impl Default for AppConfig {
             mimo_audio_format: "mp3".into(),
             tts_cache_days_to_keep: 7,
 
-            only_medal_order: false,
+            only_medal_order: true,
             only_speek_wearing_medal: false,
             only_speek_paid_gift: false,
             only_speek_guard_level: 0,
 
-            opacity: 95,
+            opacity: 100,
             penetrating_mode_opacity: 50,
-            top_pos_x: 100.0,
-            top_pos_y: 100.0,
-            default_marquee_text: "欢迎来到直播间！发送“点怪+怪物名”即可加入排队。".into(),
+            top_pos_x: 0.0,
+            top_pos_y: 0.0,
+            // 原工程默认空串；UI 层（悬浮窗与设置页）以「发送'点怪 xxx'进行点怪」兜底显示
+            default_marquee_text: String::new(),
 
             enable_captain_checkin_ai: true,
             checkin_trigger_words: "打卡,签到".into(),
@@ -155,6 +156,21 @@ impl AppConfig {
         }
         if let Err(e) = fs::write(&out, content) {
             crate::log_warn!("[Config] 写出诊断副本失败 {:?}: {}", out, e);
+        }
+    }
+
+    /// 读取失败时的诊断副本：尝试把原始字节按 UTF-8 宽松解码后落到 `.invalid`，
+    /// 便于用户/支持人员确认文件是否被其它编辑器改写成了非 UTF-8 编码
+    fn dump_invalid_copy(src_path: &Path, reason: &str) {
+        let mut name = src_path.as_os_str().to_os_string();
+        name.push(".invalid");
+        let out = PathBuf::from(name);
+        let body = match fs::read(src_path) {
+            Ok(bytes) => format!("【{}】\n{}", reason, String::from_utf8_lossy(&bytes)),
+            Err(e) => format!("【{}】\n（原始文件亦无法读取: {}）", reason, e),
+        };
+        if let Err(e) = fs::write(&out, body) {
+            crate::log_warn!("[Config] 写出读取失败诊断副本失败 {:?}: {}", out, e);
         }
     }
 
@@ -282,7 +298,15 @@ impl AppConfig {
     fn load_from_file(p: &Path) -> Self {
         match fs::read_to_string(p) {
             Ok(content) => Self::parse_content(&content, Some(p)),
-            Err(_) => Self::default(),
+            Err(e) => {
+                // 读取失败（权限/占用/非 UTF-8 编码）不再静默回退：写日志并保留诊断副本，
+                // 避免用户被其他编辑器写成 GBK 后"设置全丢"且无从排查
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    crate::log_error!("[Config] 读取配置文件失败（{}）: {}", p.display(), e);
+                    Self::dump_invalid_copy(p, &format!("读取失败: {}", e));
+                }
+                Self::default()
+            }
         }
     }
 
@@ -315,6 +339,9 @@ impl AppConfig {
 
     /// 同步 IdCode / ManboApiKey 至 Windows 注册表（注册表为权威来源，仅非空写入）。
     /// 失败仅告警 —— 注册表不可用时不应导致整份配置无法保存
+    ///
+    /// 说明（有意差异）：原工程 SaveConfig 无条件覆写注册表（含空值）。V2 仅在非空时写入，
+    /// 避免注册表瞬时读取失败时把已保存的身份码/Key 清空；「清空身份码」入口为 save_id_code。
     fn persist_registry(&self) {
         if !self.id_code.trim().is_empty() {
             if let Err(e) = crate::registry::write_id_code(&self.id_code) {
@@ -340,7 +367,14 @@ mod tests {
         let path = temp_dir.join("test_configs.json");
 
         let mut cfg = AppConfig::default();
-        assert_eq!(cfg.opacity, 95);
+        // 默认值逐项对齐原工程 ConfigData（MonsterOrderWilds/ConfigManager.h:12-45）
+        assert_eq!(cfg.tts_engine, "auto");
+        assert!(!cfg.enable_voice);
+        assert!(cfg.only_medal_order);
+        assert_eq!(cfg.opacity, 100);
+        assert_eq!(cfg.top_pos_x, 0.0);
+        assert_eq!(cfg.top_pos_y, 0.0);
+        assert_eq!(cfg.default_marquee_text, "");
         assert_eq!(cfg.is_lite_mode, false);
 
         // id_code 不再经 JSON 往返（仅注册表持久化），此处只验证常规字段
@@ -464,6 +498,28 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);
         println!("[PASS] test_config_serialization_excludes_secrets passed");
+    }
+
+    #[test]
+    fn test_config_read_error_keeps_diagnostic_copy() {
+        let temp_dir = std::env::temp_dir().join("mh_test_config_read_error");
+        let _ = fs::create_dir_all(&temp_dir);
+        let path = temp_dir.join("configs.json");
+        let diag = PathBuf::from(format!("{}.invalid", path.display()));
+        let _ = fs::remove_file(&diag);
+
+        // 写入非 UTF-8（模拟被其它编辑器改存为 GBK）→ 读取失败时应落诊断副本
+        fs::write(&path, [0x7B, 0xFF, 0xFE, 0x7D]).unwrap();
+        let cfg = AppConfig::load(Some(&path));
+        // 仍以默认值启动（不 panic），且原文件未被覆盖
+        assert_eq!(cfg.opacity, 100);
+        assert_eq!(fs::read(&path).unwrap(), vec![0x7B, 0xFF, 0xFE, 0x7D], "原文件不得被改写");
+        assert!(diag.exists(), "读取失败应生成 .invalid 诊断副本");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&diag);
+        let _ = fs::remove_dir(&temp_dir);
+        println!("[PASS] test_config_read_error_keeps_diagnostic_copy passed");
     }
 
     #[test]

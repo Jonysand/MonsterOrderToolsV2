@@ -51,10 +51,13 @@ impl QueueItem {
 }
 
 /// 排队队列管理器
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct QueueManager {
     pub items: Vec<QueueItem>,
+    /// 脏标记：变更后置位，由后台任务按 500ms 节流落盘（对齐原工程 PriorityQueueManager::Tick）
     pub dirty: bool,
+    /// user_id 索引：O(1) 判重/定位（对齐原工程 queue-performance spec 的 HashSet 要求）
+    user_index: std::collections::HashSet<String>,
 }
 
 impl QueueManager {
@@ -62,6 +65,21 @@ impl QueueManager {
         Self {
             items: Vec::new(),
             dirty: false,
+            user_index: std::collections::HashSet::new(),
+        }
+    }
+
+    /// O(1) 判定用户是否已在队中（替代原先的线性扫描）
+    pub fn contains(&self, user_id: &str) -> bool {
+        self.user_index.contains(user_id)
+    }
+
+    /// 重建 user_id 索引（整体替换 items 后调用）
+    fn rebuild_index(&mut self) {
+        self.user_index.clear();
+        self.user_index.reserve(self.items.len());
+        for it in &self.items {
+            self.user_index.insert(it.user_id.clone());
         }
     }
 
@@ -94,27 +112,24 @@ impl QueueManager {
         }
 
         // 新项加入，并执行稳定排序
+        self.user_index.insert(new_item.user_id.clone());
         self.items.push(new_item);
         self.sort_queue();
         self.dirty = true;
         true
     }
 
-    /// 二次“优先”置前：根据 user_id 提权（仅当是舰长或已具有舰长身份时允许提权）
+    /// 二次“优先”置前：根据 user_id 提权。
+    /// 对齐原工程 DanmuProcessor.cpp:364-368：**本条弹幕必须自带舰长身份**（`guardLevel > 0`）才允许提权；
+    /// 且只翻转 priority，不修改队列项的 guard_level（避免低等级弹幕把高等级条目降级）。
     pub fn update_priority(&mut self, user_id: &str, guard_level: i32) -> bool {
+        if guard_level <= 0 {
+            return false;
+        }
         if let Some(pos) = self.items.iter().position(|i| i.user_id == user_id) {
             let item = &mut self.items[pos];
-            // 提权必须具有舰长身份（新弹幕带有舰长等级，或队列中已有项是舰长）
-            let effective_guard = if guard_level > 0 { guard_level } else { item.guard_level };
-            if effective_guard <= 0 {
-                return false;
-            }
-
-            if !item.is_priority || (guard_level > 0 && (item.guard_level == 0 || guard_level < item.guard_level)) {
+            if !item.is_priority {
                 item.is_priority = true;
-                if guard_level > 0 {
-                    item.guard_level = guard_level;
-                }
                 self.dirty = true;
                 self.sort_queue();
                 return true;
@@ -127,6 +142,7 @@ impl QueueManager {
     pub fn dequeue_by_user_id(&mut self, user_id: &str) -> Option<QueueItem> {
         if let Some(pos) = self.items.iter().position(|i| i.user_id == user_id) {
             let removed = self.items.remove(pos);
+            self.user_index.remove(&removed.user_id);
             self.dirty = true;
             Some(removed)
         } else {
@@ -138,6 +154,7 @@ impl QueueManager {
     pub fn dequeue_by_index(&mut self, index: usize) -> Option<QueueItem> {
         if index < self.items.len() {
             let removed = self.items.remove(index);
+            self.user_index.remove(&removed.user_id);
             self.dirty = true;
             Some(removed)
         } else {
@@ -149,6 +166,7 @@ impl QueueManager {
     pub fn clear(&mut self) {
         if !self.items.is_empty() {
             self.items.clear();
+            self.user_index.clear();
             self.dirty = true;
         }
     }
@@ -156,6 +174,7 @@ impl QueueManager {
     /// 手动重新排序（主播拖拽调整顺序，保留手动排序次序）
     pub fn reorder(&mut self, new_items: Vec<QueueItem>) {
         self.items = new_items;
+        self.rebuild_index();
         self.dirty = true;
     }
 
@@ -164,8 +183,13 @@ impl QueueManager {
         self.items.sort_by(|a, b| a.compare_priority(b));
     }
 
-    /// 持久化保存至 JSON 文件（原子写临时文件再重命名）
-    pub fn save_to_file(&mut self, path: &Path) -> Result<(), String> {
+    /// 序列化为 JSON 文本（可在持锁期间调用，落盘动作由调用方在锁外执行）
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&self.items).map_err(|e| e.to_string())
+    }
+
+    /// 原子写入 JSON 文本（临时文件 + 重命名），不涉及内存队列状态
+    pub fn write_json(path: &Path, json: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -173,14 +197,18 @@ impl QueueManager {
         }
 
         let temp_path = path.with_extension("tmp");
-        let json_data = serde_json::to_string_pretty(&self.items).map_err(|e| e.to_string())?;
+        {
+            let mut file = File::create(&temp_path).map_err(|e| e.to_string())?;
+            file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+            file.flush().map_err(|e| e.to_string())?;
+        }
+        fs::rename(&temp_path, path).map_err(|e| e.to_string())
+    }
 
-        let mut file = File::create(&temp_path).map_err(|e| e.to_string())?;
-        file.write_all(json_data.as_bytes()).map_err(|e| e.to_string())?;
-        file.flush().map_err(|e| e.to_string())?;
-        drop(file);
-
-        fs::rename(&temp_path, path).map_err(|e| e.to_string())?;
+    /// 持久化保存至 JSON 文件（原子写临时文件再重命名）
+    pub fn save_to_file(&mut self, path: &Path) -> Result<(), String> {
+        let json_data = self.to_json()?;
+        Self::write_json(path, &json_data)?;
         self.dirty = false;
         Ok(())
     }
@@ -203,13 +231,17 @@ impl QueueManager {
         }
 
         // 优先按 V2 格式解析；失败则回退解析原工程 OrderList.list 旧格式
-        let loaded_items: Vec<QueueItem> = match serde_json::from_str::<Vec<QueueItem>>(clean_content) {
-            Ok(items) => items,
-            Err(_) => Self::parse_legacy_items(clean_content)?,
+        let (loaded_items, from_legacy) = match serde_json::from_str::<Vec<QueueItem>>(clean_content) {
+            Ok(items) => (items, false),
+            Err(_) => (Self::parse_legacy_items(clean_content)?, true),
         };
         let count = loaded_items.len();
         self.items = loaded_items;
-        self.sort_queue();
+        self.rebuild_index();
+        if from_legacy {
+            // 旧格式迁移：按优先级归一化一次（后续以文件顺序为准，保留主播手动拖拽次序）
+            self.sort_queue();
+        }
         self.dirty = false;
         Ok(count)
     }
@@ -255,15 +287,25 @@ impl QueueManager {
     }
 }
 
-/// 获取全局默认 order_list.json 路径
+/// 队列写入路径：恒为 V2 自有文件 `order_list.json`。
+/// 旧 `OrderList.list` 仅用于首次读取迁移，不再被覆写（避免把原工程能读的
+/// PascalCase 格式改写成 V2 格式，导致原工程读到空队列）。
 pub fn get_order_list_path() -> PathBuf {
-    // 统一经 paths::config_dir；最高优先沿用原工程队列文件，保证升级后已排队列表不丢失
+    crate::paths::config_dir().join("order_list.json")
+}
+
+/// 队列读取路径：优先 V2 自有文件，其次原工程 `OrderList.list`（首次迁移）
+pub fn resolve_queue_read_path() -> PathBuf {
     let dir = crate::paths::config_dir();
+    let v2 = dir.join("order_list.json");
+    if v2.exists() {
+        return v2;
+    }
     let legacy = dir.join("OrderList.list");
     if legacy.exists() {
         return legacy;
     }
-    dir.join("order_list.json")
+    v2
 }
 
 #[cfg(test)]
@@ -444,6 +486,46 @@ mod tests {
         println!("[PASS] test_two_stage_priority_promotion passed");
     }
 
+    /// 提权门槛与副作用（对齐原工程 DanmuProcessor.cpp:364-368）：
+    /// ① 本条弹幕必须自带舰长身份，队列项昔日的等级不能代为满足门槛；
+    /// ② 提权只翻转 priority，不改写 guard_level（不得把高等级条目降级）；
+    /// ③ 已优先的条目重复提权返回 false（幂等）。
+    #[test]
+    fn test_update_priority_guard_and_no_demotion() {
+        let mut qm = QueueManager::new();
+        qm.add_or_update(QueueItem {
+            id: "1".into(),
+            user_id: "u_expired".into(),
+            user_name: "过期舰长".into(),
+            monster_name: "轰龙".into(),
+            is_priority: false,
+            guard_level: 1, // 队列中曾是总督
+            tempered_level: 0,
+            timestamp: 100,
+            icon_url: "".into(),
+        });
+
+        // ① 本人当前弹幕 guard_level = 0（舰长身份已到期）→ 提权被拒绝
+        assert!(
+            !qm.update_priority("u_expired", 0),
+            "无舰长身份的弹幕不得依赖队列项旧等级提权"
+        );
+        assert!(!qm.items[0].is_priority);
+
+        // ② 舰长本人提权成功，且不得被新弹幕的低等级降级
+        assert!(qm.update_priority("u_expired", 3));
+        assert!(qm.items[0].is_priority);
+        assert_eq!(qm.items[0].guard_level, 1, "提权不得改写队列项的 guard_level");
+
+        // ③ 幂等：已优先的条目再次提权返回 false
+        assert!(!qm.update_priority("u_expired", 3), "重复提权应返回 false");
+
+        // 不存在的用户与非法等级均拒绝
+        assert!(!qm.update_priority("not_in_queue", 3));
+        assert!(!qm.update_priority("u_expired", -1));
+        println!("[PASS] test_update_priority_guard_and_no_demotion passed");
+    }
+
     #[test]
     fn test_order_list_persistence() {
         let temp_dir = std::env::temp_dir().join("mh_test_queue");
@@ -541,5 +623,126 @@ mod tests {
         let _ = fs::remove_file(&file_path);
         let _ = fs::remove_dir(&temp_dir);
         println!("[PASS] test_load_legacy_order_list_format passed");
+    }
+
+    /// P1-12：user_id 索引与 items 必须始终一致（O(1) 判重依赖该索引）
+    #[test]
+    fn test_user_index_stays_in_sync() {
+        let mut q = QueueManager::new();
+        let mk = |id: &str, prio: bool, ts: i64| QueueItem {
+            id: format!("item-{}", id),
+            user_id: id.to_string(),
+            user_name: format!("水友{}", id),
+            monster_name: "火龙".into(),
+            is_priority: prio,
+            guard_level: 0,
+            tempered_level: 0,
+            timestamp: ts,
+            icon_url: String::new(),
+        };
+
+        assert!(!q.contains("u1"));
+        q.add_or_update(mk("u1", false, 1));
+        q.add_or_update(mk("u2", true, 2));
+        assert!(q.contains("u1") && q.contains("u2"), "新入队用户应在索引中");
+
+        // 重复入队（改怪）不改索引
+        q.add_or_update(mk("u1", false, 1));
+        assert_eq!(q.items.iter().filter(|i| i.user_id == "u1").count(), 1);
+
+        // 删除后索引同步移除
+        q.dequeue_by_user_id("u1");
+        assert!(!q.contains("u1"), "删除后索引应同步移除");
+        assert!(q.contains("u2"));
+
+        // 清空后索引为空
+        q.clear();
+        assert!(!q.contains("u2"));
+
+        // reorder 后索引重建
+        q.reorder(vec![mk("u3", false, 3), mk("u4", false, 4)]);
+        assert!(q.contains("u3") && q.contains("u4"));
+
+        // dequeue_by_index 后索引同步
+        q.dequeue_by_index(0);
+        assert!(!q.contains("u3") && q.contains("u4"));
+
+        // 索引与 items 完全一致（无残留/无误标）
+        let expected: std::collections::HashSet<String> =
+            q.items.iter().map(|i| i.user_id.clone()).collect();
+        assert_eq!(expected.len(), q.items.len(), "不应存在重复 user_id");
+        for uid in ["u1", "u2", "u3"] {
+            assert!(!q.contains(uid), "{} 应为已删除状态", uid);
+        }
+        println!("[PASS] test_user_index_stays_in_sync passed");
+    }
+
+    /// P1-12：落盘路径拆分 —— 写入恒为 order_list.json，旧 OrderList.list 仅用于首次读取迁移
+    #[test]
+    fn test_queue_paths_separate_read_and_write() {
+        let dir = crate::paths::config_dir();
+        assert_eq!(
+            get_order_list_path(),
+            dir.join("order_list.json"),
+            "写入路径必须恒为 V2 自有文件，避免覆写原工程可读的 OrderList.list"
+        );
+
+        // 读取路径：V2 文件存在时优先它（此处仅断言解析规则，不创建真实文件）
+        let resolved = resolve_queue_read_path();
+        assert!(
+            resolved == dir.join("order_list.json") || resolved == dir.join("OrderList.list"),
+            "读取路径必须落在数据目录内: {:?}",
+            resolved
+        );
+        println!("[PASS] test_queue_paths_separate_read_and_write passed");
+    }
+
+    /// P1-12：脏标记语义 —— 变更置位、落盘后清除
+    #[test]
+    fn test_dirty_flag_lifecycle() {
+        let temp_dir = std::env::temp_dir().join("mh_test_queue_dirty");
+        let _ = fs::create_dir_all(&temp_dir);
+        let path = temp_dir.join("order_list.json");
+        let _ = fs::remove_file(&path);
+
+        let mut q = QueueManager::new();
+        assert!(!q.dirty, "初始应为干净状态");
+        q.add_or_update(QueueItem {
+            id: "item-1".into(),
+            user_id: "u1".into(),
+            user_name: "水友".into(),
+            monster_name: "火龙".into(),
+            is_priority: false,
+            guard_level: 0,
+            tempered_level: 0,
+            timestamp: 1,
+            icon_url: String::new(),
+        });
+        assert!(q.dirty, "变更后应置脏");
+
+        q.save_to_file(&path).unwrap();
+        assert!(!q.dirty, "落盘后应清除脏标记");
+
+        // to_json / write_json 拆分：序列化不改变脏标记，写盘由调用方在锁外完成
+        q.add_or_update(QueueItem {
+            id: "item-2".into(),
+            user_id: "u2".into(),
+            user_name: "水友2".into(),
+            monster_name: "雷狼龙".into(),
+            is_priority: true,
+            guard_level: 3,
+            tempered_level: 0,
+            timestamp: 2,
+            icon_url: String::new(),
+        });
+        let json = q.to_json().unwrap();
+        assert!(q.dirty, "仅序列化不应清除脏标记");
+        QueueManager::write_json(&path, &json).unwrap();
+        let reloaded = fs::read_to_string(&path).unwrap();
+        assert!(reloaded.contains("u2"));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&temp_dir);
+        println!("[PASS] test_dirty_flag_lifecycle passed");
     }
 }

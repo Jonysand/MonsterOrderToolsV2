@@ -33,7 +33,7 @@ pub struct RetroactiveCardData {
     pub uid: String,
     pub card_count: i32,
     pub total_earned: i32,
-    /// 本周首破领取标记（周起始日 YYYYMMDD），持久化于旧库列 monthly_first_claimed
+    /// 本周首破领取标记（周起始日 YYYYMMDD），持久化于 retroactive_cards.weekly_first_claimed
     pub weekly_first_claimed: i32,
     pub last_earned_date: i32,
 }
@@ -44,6 +44,7 @@ pub struct BatchCheckinResult {
     pub success: bool,
     pub total_users: i32,
     pub patched_users: i32,
+    pub skipped_users: i32,
     pub total_inserted: i32,
     pub message: String,
 }
@@ -199,7 +200,7 @@ impl CheckinManager {
     }
 
     /// 建表语句与原工程 captain_profiles.db 完全一致（表名/列名/可空性/默认值逐一对齐），
-    /// 老库直接可用；V2 不执行任何 ALTER，也不创建原工程没有的表
+    /// 老库直接可用；不创建原工程没有的表
     fn init_schema(&self) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
@@ -226,12 +227,12 @@ impl CheckinManager {
                 UNIQUE(uid, checkin_date)
             );
 
-            -- 列名保持旧库 monthly_first_claimed，V2 以该列承载“本周首破领取日”标记
+            -- 列名对齐原工程 v40+ 权威结构：weekly_first_claimed 承载“本周首破领取日”（周起始日）
             CREATE TABLE IF NOT EXISTS retroactive_cards (
                 uid TEXT PRIMARY KEY,
                 card_count INTEGER DEFAULT 0,
                 total_earned INTEGER DEFAULT 0,
-                monthly_first_claimed INTEGER DEFAULT 0,
+                weekly_first_claimed INTEGER DEFAULT 0,
                 last_earned_date INTEGER DEFAULT 0
             );
 
@@ -252,7 +253,50 @@ impl CheckinManager {
         )
         .map_err(|e| e.to_string())?;
 
+        Self::migrate_schema(&conn)?;
+
         Ok(())
+    }
+
+    /// 结构迁移（与原工程 ProfileManager.cpp 的迁移逻辑逐条对齐）：
+    /// ① user_profiles 缺 cumulative_days → ALTER 追加；
+    /// ② retroactive_cards 缺 weekly_first_claimed → ALTER 追加（老库由月度列升级为周维度列）。
+    /// 迁移只在缺列时执行，已迁移/新库为空操作，不触碰任何既有数据。
+    fn migrate_schema(conn: &Connection) -> Result<(), String> {
+        if !Self::table_has_column(conn, "user_profiles", "cumulative_days")? {
+            conn.execute(
+                "ALTER TABLE user_profiles ADD COLUMN cumulative_days INTEGER DEFAULT 0",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+            crate::log_info!("[Checkin] user_profiles 追加 cumulative_days 列");
+        }
+
+        if !Self::table_has_column(conn, "retroactive_cards", "weekly_first_claimed")? {
+            conn.execute(
+                "ALTER TABLE retroactive_cards ADD COLUMN weekly_first_claimed INTEGER DEFAULT 0",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+            crate::log_info!("[Checkin] retroactive_cards 追加 weekly_first_claimed 列");
+        }
+
+        Ok(())
+    }
+
+    /// 判定表是否已含指定列（PRAGMA table_info 逐列匹配）
+    fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({})", table))
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let name: String = row.get(1).map_err(|e| e.to_string())?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn date_to_int(d: NaiveDate) -> i32 {
@@ -292,9 +336,16 @@ impl CheckinManager {
         let date_int = Self::date_to_int(date);
         let now = Utc::now().timestamp();
 
-        // 尝试插入打卡明细
+        // 尝试插入打卡明细：同日重复打卡时按时间戳更新（对齐原工程
+        // ProfileManager.cpp:31 的 ON CONFLICT ... WHERE created_at != excluded.created_at）
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
+            r#"
+            INSERT INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(uid, checkin_date) DO UPDATE SET
+                created_at = excluded.created_at,
+                username = excluded.username
+            WHERE checkin_records.created_at != excluded.created_at
+            "#,
             params![uid, username, date_int, now],
         );
 
@@ -418,8 +469,9 @@ impl CheckinManager {
             }
         }
 
+        // 无打卡记录时返回 1（对齐原工程 ProfileManager::CalculateContinuousDaysFromRecords）
         if dates.is_empty() {
-            return Ok(0);
+            return Ok(1);
         }
 
         let mut streak = 1;
@@ -482,7 +534,7 @@ impl CheckinManager {
             rewards.streak_reward = true;
             conn.execute(
                 r#"
-                INSERT INTO retroactive_cards (uid, card_count, total_earned, monthly_first_claimed, last_earned_date)
+                INSERT INTO retroactive_cards (uid, card_count, total_earned, weekly_first_claimed, last_earned_date)
                 VALUES (?1, 1, 1, 0, ?2)
                 ON CONFLICT(uid) DO UPDATE SET
                     card_count = card_count + 1,
@@ -526,10 +578,10 @@ impl CheckinManager {
             .map_err(|e| e.to_string())?;
 
         let week_start = Self::get_week_start_date(date);
-        // 旧库列名为 monthly_first_claimed，V2 以该列承载“本周首破领取日”标记（不修改旧库格式）
+        // 周首破标记存于 weekly_first_claimed（与原工程 RetroactiveCheckInModule::IssueWeeklyFirstReward 一致）
         let weekly_first_claimed: i32 = conn
             .query_row(
-                "SELECT monthly_first_claimed FROM retroactive_cards WHERE uid = ?1",
+                "SELECT weekly_first_claimed FROM retroactive_cards WHERE uid = ?1",
                 params![uid],
                 |row| row.get(0),
             )
@@ -538,12 +590,12 @@ impl CheckinManager {
         if total_likes >= 30 && weekly_first_claimed != week_start {
             conn.execute(
                 r#"
-                INSERT INTO retroactive_cards (uid, card_count, total_earned, monthly_first_claimed, last_earned_date)
+                INSERT INTO retroactive_cards (uid, card_count, total_earned, weekly_first_claimed, last_earned_date)
                 VALUES (?1, 1, 1, ?2, ?3)
                 ON CONFLICT(uid) DO UPDATE SET
                     card_count = card_count + 1,
                     total_earned = total_earned + 1,
-                    monthly_first_claimed = ?2,
+                    weekly_first_claimed = ?2,
                     last_earned_date = ?3
                 "#,
                 params![uid, week_start, date_int],
@@ -588,7 +640,7 @@ impl CheckinManager {
     /// 读取补签卡资产（行不存在返回 None）
     fn load_cards(conn: &Connection, uid: &str) -> Option<RetroactiveCardData> {
         conn.query_row(
-            "SELECT uid, card_count, total_earned, monthly_first_claimed, last_earned_date FROM retroactive_cards WHERE uid = ?1",
+            "SELECT uid, card_count, total_earned, weekly_first_claimed, last_earned_date FROM retroactive_cards WHERE uid = ?1",
             params![uid],
             |row| {
                 Ok(RetroactiveCardData {
@@ -638,7 +690,7 @@ impl CheckinManager {
                 |row| row.get(0),
             )
             .unwrap_or(0);
-        if cumulative > 0 && continuous >= cumulative {
+        if continuous >= cumulative {
             return RetroCommandOutcome {
                 reply: format!(
                     "{}，当前连续打卡{}天、累计{}天，无需补签哦~",
@@ -763,14 +815,15 @@ impl CheckinManager {
             )
             .unwrap_or(0);
 
-        if continuous >= cumulative && cumulative > 0 {
+        if continuous >= cumulative {
             return Err("拦截校验失败：连续打卡天数已达到或超过累计打卡天数，当前没有断签断档，无需补签".into());
         }
         Ok(())
     }
 
     /// 查找最近一个缺失的打卡日期（用于补签）
-    /// 从当前日期（含当前日期）向前倒序检查，找到最近的缺失日期
+    /// 对齐原工程 ProfileManager::FindLastMissingCheckinDate：从当前日期（含）向前逐日检查，
+    /// 返回第一个无打卡记录的日期；无任何记录时返回当前日期。
     pub fn find_last_missing_checkin_date(
         &self,
         uid: &str,
@@ -783,28 +836,24 @@ impl CheckinManager {
         let rows = stmt.query_map(params![uid], |r| r.get::<_, i32>(0)).ok()?;
 
         let mut existing = HashSet::new();
-        let mut min_date = None;
         for r in rows.flatten() {
             if let Some(d) = Self::int_to_date(r) {
                 existing.insert(d);
-                if min_date.is_none() || Some(d) < min_date {
-                    min_date = Some(d);
-                }
             }
         }
 
-        let start = min_date?;
         let mut cursor = current_date;
 
-        // 倒序寻找从当前日期到最早打卡日之间的第一个缺漏日期
-        while cursor >= start {
+        // 倒序寻找从当前日期往前的第一个缺漏日期（下界：合法日期范围起点）
+        loop {
             if !existing.contains(&cursor) {
                 return Some(cursor);
             }
-            cursor = cursor - Duration::days(1);
+            match cursor.pred_opt() {
+                Some(prev) if prev.year() >= 1970 => cursor = prev,
+                _ => return None,
+            }
         }
-
-        None
     }
 
     /// 原子事务执行补签 (ExecuteRetroactiveCheckin)
@@ -827,7 +876,7 @@ impl CheckinManager {
             )
             .unwrap_or(0);
 
-        if cur_continuous >= cur_cumulative && cur_cumulative > 0 {
+        if cur_continuous >= cur_cumulative {
             return Err("拦截：连续打卡天数已等于累计打卡天数，无需补签".into());
         }
 
@@ -859,9 +908,9 @@ impl CheckinManager {
         let target_date_int = Self::date_to_int(target_date);
         let now = Utc::now().timestamp();
         tx.execute(
-            "INSERT INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![uid, username, target_date_int, now],
-        ).map_err(|e| format!("插入补签记录失败（可能已存在该日记录）: {}", e))?;
+        ).map_err(|e| format!("插入补签记录失败: {}", e))?;
 
         // 6. 重算连续天数与累计天数
         let new_continuous = Self::internal_calc_continuous(&tx, uid)?;
@@ -939,7 +988,7 @@ impl CheckinManager {
         let today_int = Self::get_today_int();
         conn.execute(
             r#"
-            INSERT INTO retroactive_cards (uid, card_count, total_earned, monthly_first_claimed, last_earned_date)
+            INSERT INTO retroactive_cards (uid, card_count, total_earned, weekly_first_claimed, last_earned_date)
             VALUES (?1, ?2, ?2, 0, ?3)
             ON CONFLICT(uid) DO UPDATE SET
                 card_count = card_count + ?2,
@@ -979,7 +1028,6 @@ impl CheckinManager {
             LEFT JOIN retroactive_cards c ON c.uid = p.uid
             WHERE p.username LIKE ?1 ESCAPE '\' OR p.uid LIKE ?1 ESCAPE '\'
             ORDER BY p.updated_at DESC
-            LIMIT 50
             "#,
             )
             .map_err(|e| e.to_string())?;
@@ -1010,18 +1058,21 @@ impl CheckinManager {
     }
 
     /// 一键黑幕批量补签 (GM 功能)
-    /// 为所有累计天数大于连续天数的用户，自动补齐缺失的历史日期，使连续天数拉满
+    /// 对齐原工程 ProfileManager::BatchCheckin：
+    /// 候选集为全部累计打卡 > 0 的用户；补签区间 = [最早打卡日（无明细时按 今天-(累计-1) 反推）, max(last_checkin_date, 今天)]；
+    /// 补齐后连续天数直接置为累计天数，并记录跳过（无缺失）的用户数
     pub fn batch_checkin(&self) -> Result<BatchCheckinResult, String> {
         let mut conn = self.conn.lock().unwrap();
         let today = Local::now().date_naive();
+        let today_int = Self::date_to_int(today);
         let now = Utc::now().timestamp();
 
         let mut stmt = conn
-            .prepare("SELECT uid, username FROM user_profiles WHERE cumulative_days > continuous_days")
+            .prepare("SELECT uid, username, last_checkin_date, cumulative_days FROM user_profiles WHERE cumulative_days > 0")
             .map_err(|e| e.to_string())?;
 
-        let users: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        let users: Vec<(String, String, i32, i32)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
             .map_err(|e| e.to_string())?
             .flatten()
             .collect();
@@ -1030,11 +1081,12 @@ impl CheckinManager {
 
         let total_users = users.len() as i32;
         let mut patched_users = 0;
+        let mut skipped_users = 0;
         let mut total_inserted = 0;
 
         let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-        for (uid, username) in &users {
+        for (uid, username, last_checkin_date, cumulative_days) in &users {
             let mut rec_stmt = tx
                 .prepare("SELECT DISTINCT checkin_date FROM checkin_records WHERE uid = ?1 ORDER BY checkin_date ASC")
                 .map_err(|e| e.to_string())?;
@@ -1046,45 +1098,49 @@ impl CheckinManager {
                 .filter_map(Self::int_to_date)
                 .collect();
 
-            if existing.is_empty() {
-                continue;
-            }
+            drop(rec_stmt);
 
-            let start = *existing.iter().min().unwrap();
+            // 起始日期：无明细时按累计天数反推（今天往前推 cumulative-1 天）
+            let start = match existing.iter().min() {
+                Some(d) => *d,
+                None => today - Duration::days((*cumulative_days as i64 - 1).max(0)),
+            };
+            // 结束日期：最后打卡日若在未来则补到该日，否则补到今天
+            let end = if *last_checkin_date > 0 && *last_checkin_date > today_int {
+                Self::int_to_date(*last_checkin_date).unwrap_or(today)
+            } else {
+                today
+            };
+
+            let mut missing: Vec<NaiveDate> = Vec::new();
             let mut cursor = start;
-            let mut user_inserted = 0;
-
-            while cursor <= today {
+            while cursor <= end {
                 if !existing.contains(&cursor) {
-                    let d_int = Self::date_to_int(cursor);
-                    let _ = tx.execute(
-                        "INSERT OR IGNORE INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
-                        params![uid, username, d_int, now],
-                    );
-                    user_inserted += 1;
+                    missing.push(cursor);
                 }
                 cursor = cursor + Duration::days(1);
             }
 
-            if user_inserted > 0 {
-                total_inserted += user_inserted;
-                patched_users += 1;
-
-                // 重算该用户的连续天数
-                let new_continuous = Self::internal_calc_continuous(&tx, uid)?;
-                let new_cumulative: i32 = tx
-                    .query_row(
-                        "SELECT COUNT(DISTINCT checkin_date) FROM checkin_records WHERE uid = ?1",
-                        params![uid],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-
-                let today_int = Self::date_to_int(today);
+            for d in &missing {
+                let d_int = Self::date_to_int(*d);
                 let _ = tx.execute(
-                    "UPDATE user_profiles SET last_checkin_date = MAX(last_checkin_date, ?1), continuous_days = ?2, cumulative_days = ?3, updated_at = ?4 WHERE uid = ?5",
-                    params![today_int, new_continuous, new_cumulative, now, uid],
+                    "INSERT OR IGNORE INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![uid, username, d_int, now],
                 );
+                total_inserted += 1;
+            }
+
+            // 更新 Profile：连续天数置为累计天数（对齐原工程 newContinuous = user.cumulativeDays）
+            let new_last_checkin = Self::date_to_int(end);
+            let new_continuous = *cumulative_days;
+            let _ = tx.execute(
+                "UPDATE user_profiles SET last_checkin_date = ?1, continuous_days = ?2, updated_at = ?3 WHERE uid = ?4",
+                params![new_last_checkin, new_continuous, now, uid],
+            );
+            patched_users += 1;
+
+            if missing.is_empty() {
+                skipped_users += 1;
             }
         }
 
@@ -1094,8 +1150,12 @@ impl CheckinManager {
             success: true,
             total_users,
             patched_users,
+            skipped_users,
             total_inserted,
-            message: format!("批量补签完成：覆盖 {} 位断签用户，补签记录 {} 条", patched_users, total_inserted),
+            message: format!(
+                "操作完成\n总用户数: {}\n补签用户数: {}\n跳过用户数: {} (已连续到今天)\n插入打卡记录数: {}",
+                total_users, patched_users, skipped_users, total_inserted
+            ),
         })
     }
 
@@ -1108,7 +1168,7 @@ impl CheckinManager {
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT uid, username, continuous_days, cumulative_days FROM user_profiles ORDER BY continuous_days DESC, updated_at DESC")
+            .prepare("SELECT uid, username, continuous_days, cumulative_days FROM user_profiles WHERE cumulative_days > 0 ORDER BY cumulative_days DESC")
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
@@ -1340,7 +1400,7 @@ mod tests {
         println!("[PASS] test_weekly_first_daily_30_rule passed");
     }
 
-    /// 生成与真实旧库 captain_profiles.db 完全一致的表结构（列名/可空性/默认值逐一对齐）
+    /// 生成与真实旧库 captain_profiles.db 完全一致的表结构（pre-v40：retroactive_cards 只有月度列）
     fn create_legacy_schema(conn: &Connection) {
         conn.execute_batch(
             r#"
@@ -1393,7 +1453,7 @@ mod tests {
             before_schema = schema_snapshot(&conn);
         }
 
-        // 用 V2 的 CheckinManager 直接打开旧库（无迁移、无 ALTER）
+        // 用 V2 的 CheckinManager 直接打开旧库（与原工程一致：缺列时 ALTER 追加 weekly_first_claimed）
         let mgr = CheckinManager::new(Some(&path)).unwrap();
 
         // 旧数据（含旧列 monthly_first_claimed 的月度语义值）可正常读出
@@ -1408,17 +1468,28 @@ mod tests {
         let p2 = mgr.record_checkin("old_u", "老舰长", today).unwrap();
         assert_eq!(p2.cumulative_days, 2);
 
-        // 旧列 monthly_first_claimed（20260101）与本周起始日不同，视作本周未领取：同日达 30 正常发卡
+        // 旧库无 weekly_first_claimed（迁移后默认 0）视为本周未领取：同日达 30 正常发卡
         assert!(mgr.add_likes("old_u", 30, today).unwrap().weekly_reward);
         assert_eq!(mgr.get_cards("old_u").card_count, 3);
 
         // 手动发卡正常
         assert_eq!(mgr.grant_card("old_u", 1).unwrap(), 4);
 
-        // 关键断言：V2 打开并读写后，旧库表结构完全未变（无 ALTER、无新表）
+        // 关键断言：迁移后 retroactive_cards 拥有 weekly_first_claimed，其余表结构逐字不变
         {
             let conn = Connection::open(&path).unwrap();
-            assert_eq!(before_schema, schema_snapshot(&conn), "V2 不得修改旧库表结构");
+            assert!(
+                CheckinManager::table_has_column(&conn, "retroactive_cards", "weekly_first_claimed").unwrap(),
+                "老库应被追加 weekly_first_claimed 列"
+            );
+            let after = schema_snapshot(&conn);
+            assert_eq!(before_schema.len(), after.len(), "迁移不得增删表");
+            for (before, after_one) in before_schema.iter().zip(after.iter()) {
+                if before.0 == "retroactive_cards" {
+                    continue; // 该表仅追加列，CREATE 语句必然变化
+                }
+                assert_eq!(before, after_one, "表 {} 结构不得变更", before.0);
+            }
         }
         drop(mgr);
 
@@ -1432,15 +1503,14 @@ mod tests {
         let mgr = CheckinManager::new_in_memory().unwrap();
         let conn = mgr.conn.lock().unwrap();
 
-        // retroactive_cards 必须使用旧库列名 monthly_first_claimed，且不存在 weekly_first_claimed
+        // retroactive_cards 必须使用原工程 v40+ 权威列名 weekly_first_claimed
         let mut stmt = conn.prepare("PRAGMA table_info(retroactive_cards)").unwrap();
         let cols: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(1))
             .unwrap()
             .flatten()
             .collect();
-        assert!(cols.contains(&"monthly_first_claimed".to_string()), "cols: {:?}", cols);
-        assert!(!cols.contains(&"weekly_first_claimed".to_string()), "cols: {:?}", cols);
+        assert!(cols.contains(&"weekly_first_claimed".to_string()), "cols: {:?}", cols);
 
         // 不创建原工程没有的 weekly_likes 表；原工程同构表齐全
         let names: Vec<String> = schema_snapshot(&conn).into_iter().map(|(n, _)| n).collect();
@@ -1461,6 +1531,100 @@ mod tests {
         assert!(up_cols.contains(&"cumulative_days".to_string()), "cols: {:?}", up_cols);
 
         println!("[PASS] test_v2_schema_matches_legacy_format passed");
+    }
+
+    /// P0 回归：模拟「由原工程 v40+ 全新建库」——retroactive_cards 只有 weekly_first_claimed、无月度列。
+    /// 修复前该场景下 add_likes / get_cards / grant_card 全部报 "no such column" 并被静默吞掉。
+    #[test]
+    fn test_v40_plus_schema_weekly_card_chain() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        {
+            let conn = mgr.conn.lock().unwrap();
+            // 还原为原工程 v40+ 的建表结果（无 monthly_first_claimed 列）
+            conn.execute_batch(
+                r#"
+                DROP TABLE retroactive_cards;
+                CREATE TABLE retroactive_cards (
+                    uid TEXT PRIMARY KEY,
+                    card_count INTEGER DEFAULT 0,
+                    total_earned INTEGER DEFAULT 0,
+                    weekly_first_claimed INTEGER DEFAULT 0,
+                    last_earned_date INTEGER DEFAULT 0
+                );
+                "#,
+            )
+            .unwrap();
+        }
+
+        let uid = "v40_user";
+        let today = NaiveDate::from_ymd_opt(2026, 3, 18).unwrap(); // 周三
+        let week_start = CheckinManager::get_week_start_date(today);
+
+        // 点赞奖卡链路必须畅通（修复前此处为 no such column 被吞）
+        let rewards = mgr.add_likes(uid, 30, today).expect("add_likes 不得报错");
+        assert!(rewards.weekly_reward, "当日达 30 应发周首破奖卡");
+
+        let cards = mgr.get_cards(uid);
+        assert_eq!(cards.card_count, 1);
+        assert_eq!(cards.weekly_first_claimed, week_start, "周首破标记应写入周起始日");
+
+        // 同周再次达 30 不得重复发卡
+        assert!(!mgr.add_likes(uid, 30, today).unwrap().weekly_reward);
+        assert_eq!(mgr.get_cards(uid).card_count, 1);
+
+        // 次周可再次领取
+        let next_week = today + Duration::days(7);
+        assert!(mgr.add_likes(uid, 30, next_week).unwrap().weekly_reward);
+        assert_eq!(mgr.get_cards(uid).card_count, 2);
+
+        // GM 发卡与查询链路同样畅通（按最近领取的那一周查询 → 已领取）
+        assert_eq!(mgr.grant_card(uid, 1).unwrap(), 3);
+        let reply = mgr.query_reply(uid, "周卡水友", next_week);
+        assert!(reply.contains("补签卡3张"), "reply: {}", reply);
+        assert!(reply.contains("每周点赞30：已领取"), "reply: {}", reply);
+
+        drop(mgr);
+        println!("[PASS] test_v40_plus_schema_weekly_card_chain passed");
+    }
+
+    /// 结构迁移：pre-v40 老库（只有 monthly_first_claimed）打开后被追加 weekly_first_claimed，
+    /// 且迁移幂等、不触碰其它表
+    #[test]
+    fn test_schema_migration_adds_weekly_column_idempotently() {
+        let temp_dir = std::env::temp_dir().join("mh_test_schema_migration");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let path = temp_dir.join("legacy.db");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_schema(&conn);
+        }
+
+        let mgr = CheckinManager::new(Some(&path)).unwrap();
+        {
+            let conn = mgr.conn.lock().unwrap();
+            assert!(CheckinManager::table_has_column(&conn, "retroactive_cards", "weekly_first_claimed").unwrap());
+            // 老列保留（不破坏旧数据）
+            assert!(CheckinManager::table_has_column(&conn, "retroactive_cards", "monthly_first_claimed").unwrap());
+        }
+        let first = {
+            let conn = Connection::open(&path).unwrap();
+            schema_snapshot(&conn)
+        };
+        drop(mgr);
+
+        let mgr = CheckinManager::new(Some(&path)).unwrap();
+        let second = {
+            let conn = Connection::open(&path).unwrap();
+            schema_snapshot(&conn)
+        };
+        assert_eq!(first, second, "重复打开不得再次改动结构");
+        drop(mgr);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&temp_dir);
+        println!("[PASS] test_schema_migration_adds_weekly_column_idempotently passed");
     }
 
     #[test]
@@ -1488,7 +1652,7 @@ mod tests {
 
         let _ = mgr.record_checkin(uid, "兼容探针", today).unwrap();
         let _ = mgr.record_checkin(uid, "兼容探针", today - Duration::days(2)).unwrap();
-        assert!(mgr.add_likes(uid, 30, today).unwrap().weekly_reward, "旧库 monthly_first_claimed 列应承载周首破标记并正常发卡");
+        assert!(mgr.add_likes(uid, 30, today).unwrap().weekly_reward, "迁移后的 weekly_first_claimed 列应承载周首破标记并正常发卡");
         assert_eq!(mgr.get_cards(uid).card_count, 1);
         assert_eq!(mgr.grant_card(uid, 2).unwrap(), 3);
 
@@ -1499,12 +1663,31 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 2);
 
-        // 关键断言：对真实旧库副本的全部读写均未改变表结构
-        {
+        // 关键断言：迁移仅向 retroactive_cards 追加 weekly_first_claimed，其余表结构逐字不变
+        let after_schema = {
             let conn = Connection::open(&dst).unwrap();
-            assert_eq!(before_schema, schema_snapshot(&conn), "V2 不得修改真实旧库的表结构");
+            assert!(
+                CheckinManager::table_has_column(&conn, "retroactive_cards", "weekly_first_claimed").unwrap(),
+                "真实旧库应被追加 weekly_first_claimed 列"
+            );
+            schema_snapshot(&conn)
+        };
+        assert_eq!(before_schema.len(), after_schema.len(), "迁移不得增删表");
+        for (before, after_one) in before_schema.iter().zip(after_schema.iter()) {
+            if before.0 == "retroactive_cards" {
+                continue; // 该表仅追加列，CREATE 语句必然变化
+            }
+            assert_eq!(before, after_one, "表 {} 结构不得变更", before.0);
         }
         drop(mgr);
+
+        // 迁移幂等：再次打开同一库不产生任何结构变化
+        let mgr = CheckinManager::new(Some(&dst)).unwrap();
+        drop(mgr);
+        {
+            let conn = Connection::open(&dst).unwrap();
+            assert_eq!(after_schema, schema_snapshot(&conn), "重复打开不得再次改动结构");
+        }
 
         let _ = std::fs::remove_file(&dst);
         let _ = std::fs::remove_dir(&temp_dir);

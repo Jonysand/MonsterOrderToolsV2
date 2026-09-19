@@ -24,6 +24,11 @@
    - 保留核心排队优势：条目完成删除后，队列剩余元素相对顺序保持严格不变。
    - 运行时开关一键切换纯排队 Lite 模式，彻底停用打卡、TTS、点赞奖卡、GM 与 AI 等非排队模块（后端统一守卫 `ensure_not_lite` + 前端置灰降级）。
    - 逐功能覆盖矩阵见 [docs/LITE_COVERAGE_MATRIX.md](docs/LITE_COVERAGE_MATRIX.md)。
+5. **首次使用：导入凭据文件**：
+   - 出于安全考虑，安装包**不随包分发** B 站开放平台凭据 `credentials.dat`。
+   - 请在「设置」页的「敏感凭据加密托管」卡片点击 **导入凭据文件**，选择由原工程生成（或随原始发行包提供）的 `credentials.dat`；
+     程序会先做 Base64 + HMAC-SHA256 校验，再复制到数据目录并**即时生效**（无需重启）。
+   - 凭据文件格式与原工程**双向兼容**（已用真实文件复算 HMAC 验证）。
 
 ---
 
@@ -102,6 +107,7 @@ npm run tauri build
 ## 📖 详细文档导航
 
 * 架构与方案：请参阅 [docs/ARCHITECTURE_DESIGN.md](docs/ARCHITECTURE_DESIGN.md)
+* **审计与修复记录**：请参阅 [docs/AUDIT_FIX_REPORT.md](docs/AUDIT_FIX_REPORT.md)（原工程全量交叉审计发现的 P0/P1 缺陷、修复方式与复验证据）
 * 迁移与修复计划：请参阅 [docs/MIGRATION_COMPLETION_PLAN.md](docs/MIGRATION_COMPLETION_PLAN.md)
 * Lite 模式覆盖矩阵：请参阅 [docs/LITE_COVERAGE_MATRIX.md](docs/LITE_COVERAGE_MATRIX.md)
 * 调研与对比：请参阅 [docs/MIGRATION_ANALYSIS.md](docs/MIGRATION_ANALYSIS.md)
