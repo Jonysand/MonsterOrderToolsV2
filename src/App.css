@@ -1,0 +1,45 @@
+﻿@import "tailwindcss";
+
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  user-select: none;
+}
+
+@keyframes marquee {
+  0% { transform: translateX(100%); }
+  100% { transform: translateX(-100%); }
+}
+
+.animate-marquee {
+  display: inline-block;
+  white-space: nowrap;
+  animation: marquee 16s linear infinite;
+}
+
+.animate-marquee:hover {
+  animation-play-state: paused;
+}
+
+/* D6 长文本往返滚动：位移量由 --marquee-shift 注入（超出容器的像素数） */
+@keyframes marquee-x {
+  from { transform: translateX(0); }
+  to { transform: translateX(var(--marquee-shift, 0px)); }
+}
+
+.marquee-pause:hover span {
+  animation-play-state: paused;
+}
+
+.tempered-glow {
+  box-shadow: 0 0 10px rgba(168, 85, 247, 0.45);
+}
+
+.arch-tempered-glow {
+  box-shadow: 0 0 14px rgba(249, 115, 22, 0.65);
+}

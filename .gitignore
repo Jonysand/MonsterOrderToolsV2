@@ -1,0 +1,36 @@
+# Logs
+logs
+Logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# 运行时用户数据与凭据（禁止入库：credentials.dat 为加密凭据，数据库含水友隐私数据）
+MonsterOrderWilds_configs/credentials.dat
+MonsterOrderWilds_configs/configs.json
+MonsterOrderWilds_configs/order_list.json
+MonsterOrderWilds_configs/MainConfig.cfg
+MonsterOrderWilds_configs/captain_profiles.db
+MonsterOrderWilds_configs/captain_profiles.db-shm
+MonsterOrderWilds_configs/captain_profiles.db-wal
+MonsterOrderWilds_configs/captain_profiles_bak.db
+MonsterOrderWilds_configs/*.invalid
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

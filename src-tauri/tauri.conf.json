@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MHDanmuToolsV2",
+  "version": "0.1.0",
+  "identifier": "com.jonysand.danmutools",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "怪猎荒野 弹幕点怪工具 V2 - 控制台",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 800,
+        "minHeight": 550,
+        "resizable": true
+      },
+      {
+        "label": "overlay",
+        "title": "怪猎荒野 点怪悬浮窗",
+        "url": "index.html#/overlay",
+        "width": 360,
+        "height": 520,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": {
+      "../MonsterOrderWilds_configs/monster_list.json": "MonsterOrderWilds_configs/monster_list.json",
+      "../MonsterOrderWilds_configs/voices": "MonsterOrderWilds_configs/voices",
+      "../MonsterOrderWilds_configs/local_voices.zip": "MonsterOrderWilds_configs/local_voices.zip",
+      "../MonsterOrderWilds_configs/dict/stop_words.utf8": "MonsterOrderWilds_configs/dict/stop_words.utf8",
+      "../MonsterOrderWilds_configs/dict/user.dict.utf8": "MonsterOrderWilds_configs/dict/user.dict.utf8"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
