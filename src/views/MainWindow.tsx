@@ -1559,8 +1559,8 @@ export const MainWindow: React.FC = () => {
                     <span>打卡数据导出</span>
                   </h3>
                   <p className="text-xs text-neutral-400 leading-relaxed">
-                    将 SQLite 数据库中的打卡明细导出为 CSV / JSON 文件（UTF-8 BOM，Excel 直接打开不乱码），
-                    可选按昵称模糊筛选与日期范围过滤，并通过系统保存对话框选择保存位置。
+                    将打卡数据导出为 CSV / JSON 文件（UTF-8 BOM，Excel 直接打开不乱码）。
+                    不填昵称与日期时导出全员打卡总览（连续与累计天数）；指定昵称或日期范围时导出明细流水记录，通过系统原生对话框选择保存路径。
                   </p>
 
                   <div className="grid grid-cols-2 gap-3">

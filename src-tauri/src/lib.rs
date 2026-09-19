@@ -1297,16 +1297,40 @@ fn gm_export_checkin_records(
         }
     }
 
-    let content =
-        state
-            .checkin_mgr
-            .export_records_content(&format, username.as_deref(), start, end)?;
+    let clean_user = username.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let is_summary = clean_user.is_none() && start.is_none() && end.is_none();
 
-    let default_name = format!(
-        "checkin_records_{}.{}",
-        chrono::Local::now().format("%Y%m%d_%H%M%S"),
-        format
-    );
+    let (default_name, content) = if is_summary {
+        // 未指定用户名且未限定日期范围时，导出全量用户打卡总览（对齐原工程 ProfileManager_ExportUsersSummary）
+        let name = format!(
+            "users_summary_{}.{}",
+            chrono::Local::now().format("%Y%m%d_%H%M%S"),
+            format
+        );
+        let text = state.checkin_mgr.export_users_summary(&format)?;
+        (name, text)
+    } else {
+        // 指定了用户名或日期范围时，导出打卡流水明细（对齐原工程 ProfileManager_ExportCheckinRecords）
+        let name = if let Some(u) = clean_user {
+            format!(
+                "checkin_records_{}_{}.{}",
+                u,
+                chrono::Local::now().format("%Y%m%d_%H%M%S"),
+                format
+            )
+        } else {
+            format!(
+                "checkin_records_{}.{}",
+                chrono::Local::now().format("%Y%m%d_%H%M%S"),
+                format
+            )
+        };
+        let text = state
+            .checkin_mgr
+            .export_records_content(&format, clean_user, start, end)?;
+        (name, text)
+    };
+
     save_text_file_with_dialog(&app_handle, &default_name, &format, &content)
 }
 

@@ -803,19 +803,10 @@ impl DanmuProcessor {
 
         let normalized = self.normalize_string(&danmu.message);
 
-        // 4. 用户若已在队中
-        if let Some(existing) = queue_mgr.items.iter().find(|i| i.user_id == danmu.user_id) {
-            // 如果已有用户追加优先关键字且是舰长且尚未优先，则执行提权置顶
-            if self.has_priority_keyword(&danmu.message) && danmu.guard_level > 0 && !existing.is_priority {
-                let updated = queue_mgr.update_priority(&danmu.user_id, danmu.guard_level);
-                if updated {
-                    result.priority_updated = true;
-                    if let Some(item) = queue_mgr.items.iter().find(|i| i.user_id == danmu.user_id) {
-                        result.monster_name = item.monster_name.clone();
-                        result.tempered_level = item.tempered_level;
-                    }
-                }
-            }
+        // 4. 用户若已在队中：直接拦截重复点单（对齐原工程 DanmuProcessor.cpp:116-125）
+        // 注：二次优先置前已在步骤 2 严格按整条精确匹配（is_priority_only_message）处理；
+        // 句中包含“优先”等字样的常态聊天不再误提权（对齐原工程 v43 缺陷修复）
+        if queue_mgr.items.iter().any(|i| i.user_id == danmu.user_id) {
             return result;
         }
 
@@ -1475,7 +1466,23 @@ mod tests {
         assert_eq!(queue_mgr.items.len(), 1);
         assert!(!queue_mgr.items[0].is_priority);
 
-        // 2. 两段式提权弹幕
+        // 2. 在队舰长发送包含“优先”字样的常态聊天（句中含词）：断言不提权（v43 缺陷对齐）
+        let dm_chat = DanmuData {
+            user_id: "user_001".into(),
+            user_name: "猎人甲".into(),
+            message: "主播优先打哪个怪呀".into(),
+            timestamp: 1002,
+            has_medal: true,
+            medal_level: 10,
+            guard_level: 3,
+            msg_id: "msg_chat".into(),
+            is_paid_gift: false,
+        };
+        let res_chat = processor.process_danmu(&dm_chat, &matcher, &mut queue_mgr);
+        assert!(!res_chat.priority_updated, "句中含优先词不应触发提权");
+        assert!(!queue_mgr.items[0].is_priority, "排队项仍应保持非优先状态");
+
+        // 3. 两段式提权弹幕（整条精确等于“优先”）：提权成功
         let dm2 = DanmuData {
             user_id: "user_001".into(),
             user_name: "猎人甲".into(),

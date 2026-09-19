@@ -873,16 +873,17 @@ impl CheckinManager {
             )
             .unwrap_or(0);
 
-        // 7. 更新 UserProfile
+        // 7. 更新 UserProfile（补签日期若大于原打卡日则推进 last_checkin_date，对齐原工程 ProfileManager.cpp:1453）
         tx.execute(
             r#"
             UPDATE user_profiles SET
-                continuous_days = ?1,
-                cumulative_days = ?2,
-                updated_at = ?3
-            WHERE uid = ?4
+                last_checkin_date = MAX(last_checkin_date, ?1),
+                continuous_days = ?2,
+                cumulative_days = ?3,
+                updated_at = ?4
+            WHERE uid = ?5
             "#,
-            params![new_continuous, new_cumulative, now, uid],
+            params![target_date_int, new_continuous, new_cumulative, now, uid],
         )
         .map_err(|e| e.to_string())?;
 
@@ -1079,9 +1080,10 @@ impl CheckinManager {
                     )
                     .unwrap_or(0);
 
+                let today_int = Self::date_to_int(today);
                 let _ = tx.execute(
-                    "UPDATE user_profiles SET continuous_days = ?1, cumulative_days = ?2, updated_at = ?3 WHERE uid = ?4",
-                    params![new_continuous, new_cumulative, now, uid],
+                    "UPDATE user_profiles SET last_checkin_date = MAX(last_checkin_date, ?1), continuous_days = ?2, cumulative_days = ?3, updated_at = ?4 WHERE uid = ?5",
+                    params![today_int, new_continuous, new_cumulative, now, uid],
                 );
             }
         }
@@ -1095,6 +1097,60 @@ impl CheckinManager {
             total_inserted,
             message: format!("批量补签完成：覆盖 {} 位断签用户，补签记录 {} 条", patched_users, total_inserted),
         })
+    }
+
+    /// 导出所有用户打卡总览汇总数据（CSV / JSON，UTF-8 BOM 前置）
+    /// 对齐原工程 DataBridgeExports::ProfileManager_ExportUsersSummary 与 ProfileManager::GetAllUsersSummary
+    pub fn export_users_summary(&self, format: &str) -> Result<String, String> {
+        if format != "csv" && format != "json" {
+            return Err("Unsupported format. Use 'csv' or 'json'".into());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT uid, username, continuous_days, cumulative_days FROM user_profiles ORDER BY continuous_days DESC, updated_at DESC")
+            .map_err(|e| e.to_string())?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, i32>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let users: Vec<(String, String, i32, i32)> = rows.flatten().collect();
+
+        let body = match format {
+            "csv" => {
+                let mut s = String::from("uid,username,continuous_days,cumulative_days\n");
+                for (uid, name, continuous, cumulative) in &users {
+                    s.push_str(&format!("{},{},{},{}\n", uid, name, continuous, cumulative));
+                }
+                s
+            }
+            _ => {
+                let mut s = String::from("[\n");
+                for (i, (uid, name, continuous, cumulative)) in users.iter().enumerate() {
+                    s.push_str("  {\n");
+                    s.push_str(&format!("    \"uid\": \"{}\",\n", uid));
+                    s.push_str(&format!("    \"username\": \"{}\",\n", name));
+                    s.push_str(&format!("    \"continuousDays\": {},\n", continuous));
+                    s.push_str(&format!("    \"cumulativeDays\": {}\n", cumulative));
+                    s.push_str("  }");
+                    if i < users.len() - 1 {
+                        s.push(',');
+                    }
+                    s.push('\n');
+                }
+                s.push_str("]\n");
+                s
+            }
+        };
+
+        Ok(format!("\u{FEFF}{}", body))
     }
 
     /// 导出打卡记录内容（CSV / JSON，UTF-8 BOM 前置，格式对齐原工程 DataBridgeExports）
@@ -1492,10 +1548,11 @@ mod tests {
         // 连续天数达到累计天数后拦截补签
         // 人工将连续天数调平并测试拦截
         let _ = mgr.grant_card("u_retro", 1);
-        // 执行批量补签使连续天数拉满
+        // 执行批量补签使连续天数拉满，并断言最近打卡日期更新为今日（v29 语义）
         let _ = mgr.batch_checkin().unwrap();
         let full = mgr.get_profile("u_retro").unwrap();
         assert_eq!(full.continuous_days, full.cumulative_days);
+        assert_eq!(full.last_checkin_date, CheckinManager::date_to_int(today));
 
         // 再次尝试补签应当被拦截
         let val_res = mgr.check_retroactive_validity("u_retro");
@@ -1518,9 +1575,11 @@ mod tests {
         let missing = mgr.find_last_missing_checkin_date("u_test_missing", d5);
         assert_eq!(missing, Some(d5));
 
-        // 补签 d5 后，再检查应为 d4 (2026-04-23)
+        // 补签 d5 后，再检查应为 d4 (2026-04-23)，并断言 last_checkin_date 推进至 d5 (20260424)
         let _ = mgr.grant_card("u_test_missing", 2);
         let _ = mgr.execute_retroactive_checkin("u_test_missing", "水友", d5).unwrap();
+        let prof_d5 = mgr.get_profile("u_test_missing").unwrap();
+        assert_eq!(prof_d5.last_checkin_date, 20260424);
         let next_missing = mgr.find_last_missing_checkin_date("u_test_missing", d5);
         assert_eq!(next_missing, Some(NaiveDate::from_ymd_opt(2026, 4, 23).unwrap()));
         println!("[PASS] test_missing_current_date_detection passed");
@@ -1754,6 +1813,35 @@ mod tests {
             .unwrap_err()
             .contains("Unsupported format"));
         println!("[PASS] test_export_records_content_formats_and_filters passed");
+    }
+
+    #[test]
+    fn test_export_users_summary_formats() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let d1 = NaiveDate::from_ymd_opt(2026, 9, 10).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 9, 11).unwrap();
+
+        let _ = mgr.record_checkin("u_s1", "总览甲", d1).unwrap();
+        let _ = mgr.record_checkin("u_s1", "总览甲", d2).unwrap();
+        let _ = mgr.record_checkin("u_s2", "总览乙", d2).unwrap();
+
+        // 验证 CSV 格式：表头为 uid,username,continuous_days,cumulative_days
+        let csv = mgr.export_users_summary("csv").unwrap();
+        assert!(csv.starts_with('\u{feff}'), "应带 UTF-8 BOM");
+        assert!(csv.contains("uid,username,continuous_days,cumulative_days\n"));
+        assert!(csv.contains("u_s1,总览甲,2,2"));
+        assert!(csv.contains("u_s2,总览乙,1,1"));
+
+        // 验证 JSON 格式：键名为 uid, username, continuousDays, cumulativeDays
+        let json = mgr.export_users_summary("json").unwrap();
+        assert!(json.starts_with("\u{feff}[\n"));
+        assert!(json.contains("\"uid\": \"u_s1\","));
+        assert!(json.contains("\"continuousDays\": 2,"));
+        assert!(json.contains("\"cumulativeDays\": 2"));
+
+        // 非法格式报错
+        assert!(mgr.export_users_summary("yaml").is_err());
+        println!("[PASS] test_export_users_summary_formats passed");
     }
 
     #[test]
