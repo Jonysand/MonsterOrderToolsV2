@@ -38,7 +38,7 @@
 | D | UI 交互域补齐 | 8 | 6~10 人日 | P1~P2 | ✅ 已完成（2026-09-19） |
 | E | 工程化与一致性 | 6 | 2~3 人日 | P2 | ✅ 已完成（2026-09-19） |
 
-> **总体状态（2026-09-19）：批次 A~E 全部完成；剩余人工待办为安装产物端到端实测与 D8 交互最终确认（见附录）。**
+> **总体状态（2026-09-19）：批次 A~E 全部完成、D8 交互已确认、首次提交与标签 v0.1.0 已生成；剩余人工待办为安装产物端到端实测。**
 
 **建议里程碑**
 - M1 = 批次 A（可开播的最低可用版本）
@@ -445,7 +445,7 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 
 ### D8 交互细节对齐 ✅
 - **透明度仅作用于背景**：悬浮窗外层不再使用整体 `opacity`，改为面板背景 `rgba(3,7,18, alpha)`（alpha = 锁定 ? `penetrating_mode_opacity` : `opacity`），文字与条目保持不透明 —— 与原工程「仅插值 `MainGrid.Background` alpha」一致；实测 `panelBg = rgba(3, 7, 18, 0.95)`。
-- **完成交互**：**保留显式「完成」按钮**（原工程为单击条目即完成）。因「单击即删」在悬浮窗上存在误删风险且计划要求需确认，本轮按默认值保留按钮，并在窗口中标注「点击完成该单并删除」；**待用户最终确认**（见附录）。
+- **完成交互**：**保留显式「完成」按钮**（原工程为单击条目即完成）。因「单击即删」在悬浮窗上存在误删风险，**已经用户确认（2026-09-19）保留按钮方案**，窗口中标注「点击完成该单并删除」，差异标注为有意差异（见附录）。
 
 **批次 D 涉及文件**：`src-tauri/src/logging.rs`（新增）、`src-tauri/src/bilibili.rs`、`src-tauri/src/tts.rs`、`src-tauri/src/lib.rs`、`src-tauri/Cargo.toml`（`tauri-plugin-global-shortcut`）、`src/components/VirtualList.tsx`（新增）、`src/components/MarqueeText.tsx`（新增）、`src/views/MainWindow.tsx`、`src/views/OverlayWindow.tsx`、`src/types.ts`、`src/App.css`、`.gitignore`。
 
@@ -527,7 +527,7 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - [x] Lite 模式全功能降级验证（仅保留点怪排队与悬浮窗）—— E1 产出覆盖矩阵 + 统一守卫 + 单测；安装版端到端仍建议人工回归
 - [x] OBS 方案落地（A4：移除浏览器源误导 + 窗口捕获）
 - [x] README 与 `docs/` 更新：功能状态表、已知差异清单（E 批次：README 重写目录/命令/导航、新增 LITE_COVERAGE_MATRIX、DEVELOPMENT_GUIDE 门禁章节）
-- [ ] D8 完成交互最终确认（当前保留「完成」按钮）
+- [x] D8 完成交互已确认（2026-09-19 用户决策：保留显式「完成」按钮，与原工程「单击条目即完成」的差异已标注为有意差异）
 
 ---
 
@@ -549,6 +549,6 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 2. ~~**C1 分词方案**~~ → 已决策并实施（2026-09-19：引入 `jieba-rs`，对齐原工程 cppjieba 同源词典 + HMM）。
 3. ~~**C5 打卡落库时机**~~ → 已决策并实施（2026-09-19：保留即时落库，与原工程的差异标注为有意差异）。
 4. ~~**C5 打卡日期口径**~~ → 已决策并实施（2026-09-19：采用弹幕服务器时间 sendDate 口径，时间戳缺失回退本机今天）。
-5. **D8 完成交互（待确认）**：本轮按默认值**保留"完成"按钮**（原工程为单击条目即完成）。若需严格对齐原语义，可改为「单击条目保序出队」（代码位置：`OverlayWindow.handleDelete` 与条目 `onClick`）。
+5. ~~**D8 完成交互**~~ → 已决策并实施（2026-09-19：保留显式「完成」按钮；与原工程「单击条目即完成」的差异标注为有意差异）。
 6. ~~**Lite 支持范围确认**~~ → 已按 AGENTS.md 默认实施（D3/D4 不支持 Lite；D5/D6/D7 全模式保留；D1/D2 控件置灰禁用）。
 

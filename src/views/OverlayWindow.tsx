@@ -508,7 +508,8 @@ export const OverlayWindow: React.FC = () => {
         </div>
       </div>
 
-      {/* 点击完成删除按钮（D8 保留显式按钮，避免误删） */}
+      {/* D8 完成交互（已确认）保留显式「完成」按钮而非单击条目即删，避免悬浮窗误删；
+          有意差异：原工程为单击条目保序出队 */}
       <div className="shrink-0 pl-1.5">
         <button
           onClick={(e) => {
