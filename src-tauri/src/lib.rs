@@ -1237,6 +1237,37 @@ fn save_text_file_with_dialog(
     Err("测试构建不弹出系统保存对话框".into())
 }
 
+/// 原生二次确认（替代 WebView2 下静默返回 true 的 window.confirm）
+///
+/// 注：与 `save_text_file_with_dialog` 同源约束——测试构建不引用 tauri-plugin-dialog。
+#[cfg(not(test))]
+fn confirm_with_dialog(app_handle: &AppHandle, title: &str, message: &str) -> Result<bool, String> {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    Ok(app_handle
+        .dialog()
+        .message(message)
+        .title(title)
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::YesNo)
+        .blocking_show())
+}
+
+#[cfg(test)]
+fn confirm_with_dialog(
+    _app_handle: &AppHandle,
+    _title: &str,
+    _message: &str,
+) -> Result<bool, String> {
+    Err("测试构建不弹出确认对话框".into())
+}
+
+/// 二次确认命令（返回 true=用户点击「是」；调用失败由前端按「未确认」处理）
+#[tauri::command]
+fn confirm_action(title: String, message: String, app_handle: AppHandle) -> Result<bool, String> {
+    confirm_with_dialog(&app_handle, &title, &message)
+}
+
 /// GM: 导出打卡记录（CSV / JSON，系统保存对话框 + UTF-8 BOM；受 Lite 模式控制）
 /// 对齐原工程 DataBridgeExports：支持昵称模糊筛选与日期范围（YYYY-MM-DD）
 #[tauri::command]
@@ -1723,6 +1754,7 @@ pub fn run() {
             gm_search_users,
             gm_grant_card,
             gm_export_checkin_records,
+            confirm_action,
             play_sound_effect,
             get_manbo_voice_list,
             get_current_tts_engine,

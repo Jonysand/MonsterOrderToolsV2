@@ -81,8 +81,21 @@ export const MainWindow: React.FC = () => {
   const [conn, setConn] = useState<ConnectionStatusPayload>(DEFAULT_CONNECTION);
   const [simDanmuMsg, setSimDanmuMsg] = useState("");
   const [simDanmuUser, setSimDanmuUser] = useState("测试水友");
+  // 模拟身份（默认沿用旧硬编码值：舰长 + 佩戴 10 级粉丝牌）
+  const [simGuardLevel, setSimGuardLevel] = useState(3);
+  const [simHasMedal, setSimHasMedal] = useState(true);
+  const [simMedalLevel, setSimMedalLevel] = useState(10);
   const [simLikeUser, setSimLikeUser] = useState("测试水友");
   const [simLikeCount, setSimLikeCount] = useState(30);
+  // 直播间事件模拟（B8 礼物连击 / B2 SC·上舰）
+  const [simGiftName, setSimGiftName] = useState("小心心");
+  const [simGiftNum, setSimGiftNum] = useState(1);
+  const [simGiftPaid, setSimGiftPaid] = useState(true);
+  const [simScRmb, setSimScRmb] = useState(30);
+  const [simScMessage, setSimScMessage] = useState("加油！");
+  const [simGuardEventLevel, setSimGuardEventLevel] = useState(3);
+  const [simGuardEventNum, setSimGuardEventNum] = useState(1);
+  const [simGuardEventUnit, setSimGuardEventUnit] = useState("月");
   const [recentDanmu, setRecentDanmu] = useState<DanmuReceivedPayload[]>([]);
   const [recentCheckins, setRecentCheckins] = useState<UserProfile[]>([]);
 
@@ -126,6 +139,15 @@ export const MainWindow: React.FC = () => {
   const showToast = (msg: string) => {
     setToastMsg(msg);
     setTimeout(() => setToastMsg(null), 3500);
+  };
+
+  // 原生二次确认（WebView2 下 window.confirm 静默放行，统一走 Rust 侧消息框）
+  const askConfirm = async (message: string, title = "确认操作") => {
+    try {
+      return await invoke<boolean>("confirm_action", { title, message });
+    } catch {
+      return false;
+    }
   };
 
   const fetchQueue = async () => {
@@ -335,7 +357,7 @@ export const MainWindow: React.FC = () => {
   };
 
   const handleClear = async () => {
-    if (!confirm("确认清空当前点单排队队列吗？")) return;
+    if (!(await askConfirm("确认清空当前点单排队队列吗？", "清空队列"))) return;
     try {
       await invoke("clear_queue");
       setQueue([]);
@@ -490,9 +512,9 @@ export const MainWindow: React.FC = () => {
         user_name: simDanmuUser,
         message: simDanmuMsg.trim(),
         timestamp: Math.floor(Date.now() / 1000),
-        has_medal: true,
-        medal_level: 10,
-        guard_level: 3,
+        has_medal: simHasMedal,
+        medal_level: simHasMedal ? simMedalLevel : 0,
+        guard_level: simGuardLevel,
         msg_id: `sim-${Date.now()}`,
         is_paid_gift: false,
       };
@@ -521,7 +543,7 @@ export const MainWindow: React.FC = () => {
 
   // GM 一键批量补签
   const handleBatchCheckin = async () => {
-    if (!confirm("确定对所有存在断签历史记录的水友执行一键批量补签吗？")) return;
+    if (!(await askConfirm("确定对所有存在断签历史记录的水友执行一键批量补签吗？", "一键黑幕"))) return;
     try {
       const res = await invoke<BatchCheckinResult>("gm_batch_checkin");
       setBatchResult(res);
@@ -531,9 +553,9 @@ export const MainWindow: React.FC = () => {
     }
   };
 
-  // GM 发卡（二次确认，防误触）
+  // GM 发卡（二次确认，防误触；文案对齐原工程 GMRetroactiveCardDialog）
   const handleGrantCard = async (uid: string, username: string) => {
-    if (!confirm(`确定给「${username}」发放 ${grantCardAmount} 张补签卡吗？`)) return;
+    if (!(await askConfirm(`确认为 ${username} 发放 ${grantCardAmount} 张补签卡？`, "确认发放"))) return;
     try {
       const count = await invoke<number>("gm_grant_card", { uid, count: grantCardAmount });
       showToast(`已成功为「${username}」发放 ${grantCardAmount} 张补签卡，当前剩余 ${count} 张`);
@@ -563,7 +585,8 @@ export const MainWindow: React.FC = () => {
     try {
       const replies = await invoke<string[]>("simulate_like", {
         event: {
-          uid: `sim-like-${simLikeUser}`,
+          // 与弹幕模拟通道同口径（sim-{昵称}），保证跨链路档案连通
+          uid: `sim-${simLikeUser}`,
           username: simLikeUser,
           msg_id: `sim_like_${Date.now()}`,
           like_count: simLikeCount,
@@ -577,6 +600,66 @@ export const MainWindow: React.FC = () => {
       );
     } catch (err) {
       showToast(`点赞模拟失败: ${err}`);
+    }
+  };
+
+  // 模拟礼物事件（B8 连击合并 / B11 付费过滤；combo 置空走动态连击跟踪）
+  const handleSimGift = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await invoke("simulate_gift", {
+        event: {
+          open_id: `sim-${simDanmuUser}`,
+          gift_id: `sim_gift_${Date.now()}`,
+          uname: simDanmuUser,
+          gift_name: simGiftName.trim() || "小心心",
+          gift_num: simGiftNum,
+          paid: simGiftPaid,
+          combo: null,
+        },
+      });
+      showToast(`已发射模拟礼物：${simDanmuUser} × ${simGiftName.trim() || "小心心"} ×${simGiftNum}`);
+    } catch (err) {
+      showToast(`礼物模拟失败: ${err}`);
+    }
+  };
+
+  // 模拟 SC 事件（B2 高亮弹幕播报）
+  const handleSimSuperChat = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await invoke("simulate_live_event", {
+        event: {
+          kind: "SuperChat",
+          user_id: `sim-${simDanmuUser}`,
+          uname: simDanmuUser,
+          rmb: simScRmb,
+          message: simScMessage.trim() || "加油！",
+        },
+      });
+      showToast(`已发射模拟 SC：${simDanmuUser} ¥${simScRmb}`);
+    } catch (err) {
+      showToast(`SC 模拟失败: ${err}`);
+    }
+  };
+
+  // 模拟上舰事件（B2 舰长/提督/总督播报）
+  const handleSimGuard = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      await invoke("simulate_live_event", {
+        event: {
+          kind: "Guard",
+          user_id: `sim-${simDanmuUser}`,
+          uname: simDanmuUser,
+          guard_level: simGuardEventLevel,
+          guard_num: simGuardEventNum,
+          guard_unit: simGuardEventUnit.trim() || "月",
+        },
+      });
+      showToast(`已发射模拟上舰：${simDanmuUser} 开通 ${simGuardEventNum} ${simGuardEventUnit.trim() || "月"}`);
+    } catch (err) {
+      showToast(`上舰模拟失败: ${err}`);
     }
   };
 
@@ -1159,6 +1242,45 @@ export const MainWindow: React.FC = () => {
                     </div>
                   </div>
 
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">舰长等级</label>
+                      <select
+                        value={simGuardLevel}
+                        onChange={(e) => setSimGuardLevel(Number(e.target.value))}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-200"
+                      >
+                        <option value={0}>无（普通水友）</option>
+                        <option value={1}>总督</option>
+                        <option value={2}>提督</option>
+                        <option value={3}>舰长</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">粉丝牌（佩戴 / 等级）</label>
+                      <div className="flex items-center gap-2">
+                        <label className="flex items-center gap-1.5 text-xs text-neutral-300 shrink-0">
+                          <input
+                            type="checkbox"
+                            checked={simHasMedal}
+                            onChange={(e) => setSimHasMedal(e.target.checked)}
+                            className="accent-amber-500"
+                          />
+                          <span>佩戴</span>
+                        </label>
+                        <input
+                          type="number"
+                          min="0"
+                          max="40"
+                          value={simMedalLevel}
+                          disabled={!simHasMedal}
+                          onChange={(e) => setSimMedalLevel(Math.max(0, Number(e.target.value)))}
+                          className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
                   <button
                     type="submit"
                     className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-4 py-1.5 rounded-lg text-xs flex items-center gap-1.5"
@@ -1201,6 +1323,124 @@ export const MainWindow: React.FC = () => {
                     <span>发射模拟点赞（30 次触发奖卡）</span>
                   </button>
                 </form>
+
+                {/* 直播间事件模拟（B8 礼物连击 / B2 SC·上舰；复用「模拟昵称」作为 uname） */}
+                <div className="space-y-2.5 pt-3 border-t border-neutral-800">
+                  <div className="text-[11px] font-bold text-neutral-400">
+                    直播间事件模拟（复用上方「模拟昵称」；Lite 下停用）
+                  </div>
+
+                  <form onSubmit={handleSimGift} className="flex flex-wrap items-end gap-2">
+                    <div className="flex-1 min-w-24">
+                      <label className="block text-[10px] text-neutral-500 mb-1">礼物名</label>
+                      <input
+                        type="text"
+                        value={simGiftName}
+                        onChange={(e) => setSimGiftName(e.target.value)}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
+                      />
+                    </div>
+                    <div className="w-20">
+                      <label className="block text-[10px] text-neutral-500 mb-1">数量</label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={simGiftNum}
+                        onChange={(e) => setSimGiftNum(Math.max(1, Number(e.target.value)))}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
+                      />
+                    </div>
+                    <label className="flex items-center gap-1.5 text-xs text-neutral-300 py-1.5">
+                      <input
+                        type="checkbox"
+                        checked={simGiftPaid}
+                        onChange={(e) => setSimGiftPaid(e.target.checked)}
+                        className="accent-amber-500"
+                      />
+                      <span>付费</span>
+                    </label>
+                    <button
+                      type="submit"
+                      disabled={isLite}
+                      className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1.5 disabled:opacity-40"
+                    >
+                      <Gift className="w-3.5 h-3.5" />
+                      <span>模拟礼物</span>
+                    </button>
+                  </form>
+
+                  <form onSubmit={handleSimSuperChat} className="flex flex-wrap items-end gap-2">
+                    <div className="w-20">
+                      <label className="block text-[10px] text-neutral-500 mb-1">金额 (¥)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={simScRmb}
+                        onChange={(e) => setSimScRmb(Math.max(1, Number(e.target.value)))}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
+                      />
+                    </div>
+                    <div className="flex-1 min-w-24">
+                      <label className="block text-[10px] text-neutral-500 mb-1">内容</label>
+                      <input
+                        type="text"
+                        value={simScMessage}
+                        onChange={(e) => setSimScMessage(e.target.value)}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={isLite}
+                      className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1.5 disabled:opacity-40"
+                    >
+                      <Flame className="w-3.5 h-3.5" />
+                      <span>模拟 SC</span>
+                    </button>
+                  </form>
+
+                  <form onSubmit={handleSimGuard} className="flex flex-wrap items-end gap-2">
+                    <div className="w-28">
+                      <label className="block text-[10px] text-neutral-500 mb-1">舰长等级</label>
+                      <select
+                        value={simGuardEventLevel}
+                        onChange={(e) => setSimGuardEventLevel(Number(e.target.value))}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-200"
+                      >
+                        <option value={1}>总督</option>
+                        <option value={2}>提督</option>
+                        <option value={3}>舰长</option>
+                      </select>
+                    </div>
+                    <div className="w-20">
+                      <label className="block text-[10px] text-neutral-500 mb-1">数量</label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={simGuardEventNum}
+                        onChange={(e) => setSimGuardEventNum(Math.max(1, Number(e.target.value)))}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
+                      />
+                    </div>
+                    <div className="w-20">
+                      <label className="block text-[10px] text-neutral-500 mb-1">单位</label>
+                      <input
+                        type="text"
+                        value={simGuardEventUnit}
+                        onChange={(e) => setSimGuardEventUnit(e.target.value)}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={isLite}
+                      className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1.5 disabled:opacity-40"
+                    >
+                      <Shield className="w-3.5 h-3.5" />
+                      <span>模拟上舰</span>
+                    </button>
+                  </form>
+                </div>
               </div>
 
               {/* D4 主播控制台实时动态：原始弹幕 + 打卡记录 */}
