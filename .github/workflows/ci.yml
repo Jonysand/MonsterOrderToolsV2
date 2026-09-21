@@ -1,0 +1,92 @@
+# 持续集成：Windows 全量门禁 + macOS 编译体检
+# 门禁口径与 package.json 的 `verify` 脚本一致：前端构建(tsc+vite) → Rust 单测 → 编码规范核查
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-windows:
+    name: 构建与单元测试 (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: 准备 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # tauri-build 在编译期会校验 frontendDist(../dist) 是否存在，
+      # 故必须先产出前端产物，否则 cargo test 会直接构建失败。
+      - name: 前端类型检查与构建
+        run: npm run build
+
+      - name: 编码规范核查（.rs/.ts/.tsx/.css/.md 需 BOM，JSON 不得带 BOM）
+        run: npm run check:encoding
+
+      - name: Rust 单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  check-macos:
+    name: 编译检查 (macOS，实验性)
+    runs-on: macos-latest
+    # 实验性任务：本工程尚未做 macOS 适配（身份码/ManboApiKey 在非 Windows 退化为内存存储、
+    # SAPI 兜底语音仅 Windows 可用），此处只做编译体检以暴露平台专有代码。
+    # 待其长期稳定通过后，删除下面这行 `continue-on-error` 转为硬门禁。
+    continue-on-error: true
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: 准备 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 前端构建（为 tauri-build 提供 frontendDist）
+        run: npm run build
+
+      - name: Rust 编译检查
+        run: cargo check --manifest-path src-tauri/Cargo.toml
