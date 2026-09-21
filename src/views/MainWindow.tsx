@@ -463,13 +463,12 @@ export const MainWindow: React.FC = () => {
       const isActive = conn.state === "Connected" || conn.state === "Connecting" || conn.state === "Reconnecting";
       const next = !isActive;
       if (next) {
+        // id_code 不下发前端（skip_serializing），故留空时不拦截：交由 Rust 侧回退读注册表
         const currentCode = (config?.id_code || "").trim();
-        if (!currentCode) {
-          showToast("请先输入开播身份码 (id_code)！");
-          return;
+        if (currentCode) {
+          // 自动将当前输入的身份码同步保存至注册表
+          await invoke("save_id_code", { idCode: currentCode });
         }
-        // 自动将当前输入的身份码同步保存至注册表
-        await invoke("save_id_code", { idCode: currentCode });
       }
       await invoke("set_bili_connection", { connected: next });
       showToast(next ? "正在建立 B 站开放平台长连接..." : "已断开直播连接");
@@ -1265,7 +1264,8 @@ export const MainWindow: React.FC = () => {
                   </div>
 
                   <p className="text-[11px] text-neutral-400 leading-relaxed">
-                    提示：填入身份码后，点击【开启直播长连】将自动同步保存至 Windows 注册表并立即建立直播间长连接。
+                    提示：填入身份码后点击【开启直播长连】会自动同步保存至 Windows 注册表；此处留空则直接沿用注册表
+                    HKCU\Software\MonsterOrderWilds\IdCode 中已保存的身份码（出于安全不回显）。
                   </p>
                 </div>
               </div>

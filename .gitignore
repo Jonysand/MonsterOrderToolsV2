@@ -13,10 +13,10 @@ MonsterOrderWilds_configs/credentials.dat
 MonsterOrderWilds_configs/configs.json
 MonsterOrderWilds_configs/order_list.json
 MonsterOrderWilds_configs/MainConfig.cfg
-MonsterOrderWilds_configs/captain_profiles.db
-MonsterOrderWilds_configs/captain_profiles.db-shm
-MonsterOrderWilds_configs/captain_profiles.db-wal
-MonsterOrderWilds_configs/captain_profiles_bak.db
+# 通配覆盖各类快照/备份（如 captain_profiles.snapshot_*.db、captain_profiles_bak.db）
+MonsterOrderWilds_configs/*.db
+MonsterOrderWilds_configs/*.db-shm
+MonsterOrderWilds_configs/*.db-wal
 MonsterOrderWilds_configs/*.invalid
 
 node_modules

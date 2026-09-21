@@ -1,0 +1,30 @@
+# 统一换行符策略：仓库内一律存 LF，检出时按各平台原生换行
+# 目的：Windows（CRLF）与 macOS/Linux（LF）双端开发时不产生整文件级 diff
+* text=auto
+
+# 源码与文本配置：显式声明为文本，避免被误判为二进制
+*.rs    text
+*.ts    text
+*.tsx   text
+*.css   text
+*.html  text
+*.md    text
+*.json  text
+*.toml  text
+*.py    text
+*.sh    text
+
+# 二进制资源：禁止任何换行或编码转换
+*.zip   binary
+*.mp3   binary
+*.wav   binary
+*.db    binary
+*.dat   binary
+*.png   binary
+*.ico   binary
+*.icns  binary
+*.exe   binary
+*.msi   binary
+*.dll   binary
+*.so    binary
+*.dylib binary

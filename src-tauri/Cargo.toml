@@ -45,6 +45,10 @@ md-5 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# 长连 WSS 的 TLS 提供方必须显式钉死：tokio-tungstenite 以 default-features=false 引入 rustls
+# 且不启用任何 crypto provider feature，握手期 rustls 无法判定 provider 直接 panic，
+# release 的 panic="abort" 会让整个进程退出（HTTP 侧走 native-tls 故不受影响）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }

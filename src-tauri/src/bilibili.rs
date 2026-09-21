@@ -70,6 +70,8 @@ impl BiliCredentials {
         // 5. 组装最终请求头
         headers.insert("Authorization".to_string(), signature);
         headers.insert("Content-Type".to_string(), "application/json".to_string());
+        // 开放平台强制校验 Accept，缺失时 start/heartbeat/end 一律返回 code 4013
+        headers.insert("Accept".to_string(), "application/json".to_string());
 
         headers
     }
@@ -249,6 +251,13 @@ impl Packet {
     pub const OP_MESSAGE: i32 = 5;
     pub const OP_AUTH: i32 = 7;
     pub const OP_AUTH_REPLY: i32 = 8;
+
+    /// 服务端下发的正常控制包：鉴权回复(8)，以及自身心跳(2)/鉴权(7) 的回显。
+    /// 原工程 `BliveManager.cpp:510-532` 对它们只记日志/排心跳，仅 switch 落 default 才重连；
+    /// 若当作未知包处理，start 成功后会在第一个鉴权回复上无限重连，真实弹幕永远进不来。
+    pub fn is_ignorable_control(op: i32) -> bool {
+        matches!(op, Self::OP_AUTH_REPLY | Self::OP_AUTH | Self::OP_HEARTBEAT)
+    }
 
     /// 构造数据包
     pub fn new(op: i32, body: Vec<u8>) -> Self {
@@ -1272,6 +1281,9 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                                                 backoff.reset();
                                                 continue;
                                             }
+                                            if Packet::is_ignorable_control(pkt.op) {
+                                                continue;
+                                            }
                                             if pkt.op != Packet::OP_MESSAGE {
                                                 // 未知操作码：原工程按网络错误触发重连（BliveManager.cpp:533-537）
                                                 crate::log_warn!("[BiliLive] 收到未知操作码 {}，触发重连", pkt.op);
@@ -1496,6 +1508,9 @@ mod tests {
         assert_eq!(headers.get("x-bili-signature-method").unwrap(), "HMAC-SHA256");
         assert!(headers.get("x-bili-content-md5").unwrap().len() == 32);
         assert!(headers.get("Authorization").unwrap().len() == 64);
+        // 开放平台缺 Accept 头会直接 code 4013 拒绝，三接口共用同一签名头来源
+        assert_eq!(headers.get("Accept").unwrap(), "application/json");
+        assert_eq!(headers.get("Content-Type").unwrap(), "application/json");
         println!("[PASS] test_bili_api_signature passed");
     }
 
@@ -1511,6 +1526,20 @@ mod tests {
         assert_eq!(unpacked.header_len, 16);
         assert_eq!(unpacked.body, body);
         println!("[PASS] test_packet_pack_unpack passed");
+    }
+
+    #[test]
+    fn test_control_op_classification() {
+        // 真实开播后服务端下发的第一个包就是鉴权回复(op=8)，必须忽略而非触发重连
+        assert!(Packet::is_ignorable_control(Packet::OP_AUTH_REPLY));
+        assert!(Packet::is_ignorable_control(Packet::OP_AUTH));
+        assert!(Packet::is_ignorable_control(Packet::OP_HEARTBEAT));
+        // 弹幕(5) 走业务解析、心跳回复(3) 走重连计数复位，都不属于本分支
+        assert!(!Packet::is_ignorable_control(Packet::OP_MESSAGE));
+        assert!(!Packet::is_ignorable_control(Packet::OP_HEARTBEAT_REPLY));
+        // 未知 op 仍按原工程 switch default 触发重连
+        assert!(!Packet::is_ignorable_control(9));
+        println!("[PASS] test_control_op_classification passed");
     }
 
     #[test]

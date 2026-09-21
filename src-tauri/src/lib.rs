@@ -744,13 +744,21 @@ pub fn handle_incoming_danmu(
     };
 
     if res.added_to_queue || res.priority_updated {
+        // 日志展示条目真实优先级：res.priority_updated 仅代表「二段式提权」这唯一动作，
+        // 新建的带优先点怪该值为 false 但条目已置前，直接打印会误报「优先=false」。
+        // 注意 order-placed 事件仍沿用 priority_updated（原工程回调同字段驱动跑马灯文案）。
+        let item_priority = queued_items
+            .iter()
+            .find(|i| i.user_id == danmu.user_id)
+            .map(|i| i.is_priority)
+            .unwrap_or(false);
         // 弹幕热路径不在此落盘（脏标记已置位，由 500ms 节流任务在锁外写盘，
         // 对齐原工程 PriorityQueueManager::Tick 的 SAVE_INTERVAL_MS=500 语义）
         crate::log_info!(
-            "[Queue] {} {} 成功（优先={}），当前排队 {} 位",
+            "[Queue] {} {} 成功（队列优先={}），当前排队 {} 位",
             danmu.user_name,
             if res.priority_updated { "优先置前" } else { "点怪" },
-            res.priority_updated,
+            item_priority,
             queued_items.len()
         );
         if let Some(handle) = app_handle {
@@ -1668,6 +1676,10 @@ pub fn run() {
     // （对齐原工程 DumpHelper::Init 的能力）。测试构建不安装，避免干扰测试输出。
     #[cfg(not(test))]
     logging::install_crash_handler();
+
+    // 进程级 TLS provider 钉死为 ring：rustls 0.23 在多个 provider 同时启用（或都没启用）时
+    // 会在握手中 expect 失败，而 release 的 panic="abort" 等于开播即崩。
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
     // 对话框插件仅在生产构建注册（原因见 save_text_file_with_dialog 注释）
