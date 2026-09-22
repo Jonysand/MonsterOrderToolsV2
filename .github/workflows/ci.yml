@@ -1,4 +1,4 @@
-# 持续集成：Windows 全量门禁 + macOS 编译体检
+# 持续集成：Windows 与 macOS 双平台全量门禁
 # 门禁口径与 package.json 的 `verify` 脚本一致：前端构建(tsc+vite) → Rust 单测 → 编码规范核查
 name: CI
 
@@ -57,13 +57,9 @@ jobs:
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-  check-macos:
-    name: 编译检查 (macOS，实验性)
+  verify-macos:
+    name: 构建与单元测试 (macOS)
     runs-on: macos-latest
-    # 实验性任务：本工程尚未做 macOS 适配（身份码/ManboApiKey 在非 Windows 退化为内存存储、
-    # SAPI 兜底语音仅 Windows 可用），此处只做编译体检以暴露平台专有代码。
-    # 待其长期稳定通过后，删除下面这行 `continue-on-error` 转为硬门禁。
-    continue-on-error: true
     steps:
       - name: 检出代码
         uses: actions/checkout@v7
@@ -73,6 +69,11 @@ jobs:
         with:
           node-version: "24"
           cache: npm
+
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
 
       - name: 准备 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -85,8 +86,13 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      - name: 前端构建（为 tauri-build 提供 frontendDist）
+      - name: 前端类型检查与构建
         run: npm run build
 
-      - name: Rust 编译检查
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+      - name: 编码规范核查（.rs/.ts/.tsx/.css/.md 需 BOM，JSON 不得带 BOM）
+        run: npm run check:encoding
+
+      # 平台专有路径（macOS 数据目录脱离 .app 包体、registry.dat 加密存储、say 兜底语音）
+      # 均有单测覆盖，故此处与 Windows job 同口径跑全量单测而非仅 cargo check
+      - name: Rust 单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
