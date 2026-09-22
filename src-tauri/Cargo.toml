@@ -1,6 +1,6 @@
 [package]
 name = "mhdanmutoolsv2"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -28,6 +28,8 @@ tauri = { version = "2", default-features = false, features = [
     "dynamic-acl",
     "x11",
     "dbus",
+    # 悬浮窗（overlay）透明背景在 macOS 上依赖私有 API，缺此特性时 transparent 会退化为不透明底
+    "macos-private-api",
 ] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

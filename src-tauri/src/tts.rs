@@ -179,7 +179,7 @@ impl AudioQueue {
                 }
             }
             AudioJob::Sapi { text, params } => {
-                run_powershell_sapi(text, params);
+                run_local_speech(text, params);
             }
         }
     }
@@ -246,9 +246,12 @@ $s.Rate={rate}; $s.Volume={volume}; $s.SpeakSsml('{ssml}')"
     )
 }
 
-/// 执行 SAPI 播报（同步等待，30s 超时强杀，防止回调丢失导致播放线程卡死）
+/// 本地离线语音兜底的实际执行入口。
+/// Windows → PowerShell + System.Speech（SAPI）；macOS → 内置 `say` 命令。
+/// 二者均同步等待播放结束，并在超时后强杀子进程，
+/// 防止子进程异常挂起导致播放线程被永久占用。
 #[cfg(not(test))]
-fn run_powershell_sapi(text: &str, params: &SapiParams) -> bool {
+fn run_local_speech(text: &str, params: &SapiParams) -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -277,10 +280,120 @@ fn run_powershell_sapi(text: &str, params: &SapiParams) -> bool {
             Err(_) => false,
         }
     }
-    #[cfg(not(target_os = "windows"))]
+
+    #[cfg(target_os = "macos")]
     {
+        run_say_macos(text, params)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // 其余平台暂无内置离线语音实现
         let _ = (text, params);
         false
+    }
+}
+
+/// SAPI 档位参数 → `say` 参数映射（纯函数，便于单测）。
+/// - `rate`：SAPI 为 -10~10 档位，`say -r` 为词/分钟（系统默认约 175），按 15 wpm/档折算
+/// - `volume`：本工程配置为 0~200，映射为 `say` 内嵌音量命令的 0.0~1.0
+pub fn say_params_from(rate: i32, volume: i32) -> (i32, f64) {
+    (
+        (175 + rate.clamp(-10, 10) * 15).clamp(80, 400),
+        (volume.clamp(0, 200) as f64) / 200.0,
+    )
+}
+
+/// 构建 macOS `say` 的参数表（不含可执行文件自身）。
+/// 音量以文本前缀 `[[volm 0~1]]` 内嵌语音命令承载 —— `say` 没有独立音量开关。
+/// `pitch` 在 `say` 上无对应参数，此路径不生效（仅影响音调，不影响可听性）。
+pub fn build_say_args(text: &str, params: &SapiParams, voice: Option<&str>) -> Vec<String> {
+    let (rate, volume) = say_params_from(params.rate, params.volume);
+    let mut args = vec!["-r".to_string(), rate.to_string()];
+    if let Some(v) = voice {
+        args.push("-v".to_string());
+        args.push(v.to_string());
+    }
+    args.push(format!("[[volm {:.2}]]{}", volume, text));
+    args
+}
+
+/// 从 `say -v ?` 的输出中挑选首个中文音色名。
+///
+/// 音色名可能自带空格与括号（新版本地化命名），故不能按首个空白截断，
+/// 需以「`#` 注释之前的最后一个空白分隔段」为 locale，其左侧整体为音色名：
+/// ```text
+/// Tingting            zh_CN    # 您好，我叫Tingting。
+/// Eddy (中文（中国大陆）)     zh_CN    # 你好！我叫Eddy。
+/// ```
+/// 注意：`say` 对不存在的音色名不报错（静默回退默认音色），
+/// 故必须精确解析，否则中文文本会被英文音色读出。
+pub fn parse_zh_voice_from_listing(listing: &str) -> Option<String> {
+    for line in listing.lines() {
+        let head = line.split('#').next().unwrap_or("").trim_end();
+        let Some(sep) = head.rfind(char::is_whitespace) else {
+            continue;
+        };
+        let (name, locale) = head.split_at(sep);
+        let name = name.trim();
+        let locale = locale.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if locale.eq_ignore_ascii_case("zh_CN")
+            || locale.eq_ignore_ascii_case("zh_TW")
+            || locale.eq_ignore_ascii_case("zh_HK")
+        {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// macOS 中文音色（首次调用探测并缓存；系统未装中文音色时为 `None`，退回系统默认音色）
+#[cfg(all(target_os = "macos", not(test)))]
+static MACOS_ZH_VOICE: OnceLock<Option<String>> = OnceLock::new();
+
+/// 探测并缓存系统首个中文音色（探测失败或系统无中文音色时返回 `None`）
+#[cfg(all(target_os = "macos", not(test)))]
+fn pick_macos_zh_voice() -> Option<String> {
+    MACOS_ZH_VOICE
+        .get_or_init(|| {
+            let out = std::process::Command::new("/usr/bin/say")
+                .arg("-v")
+                .arg("?")
+                .output()
+                .ok()?;
+            parse_zh_voice_from_listing(&String::from_utf8_lossy(&out.stdout))
+        })
+        .clone()
+}
+
+/// macOS 离线兜底播报（与 Windows SAPI 路径同为同步等待 + 超时强杀）
+#[cfg(all(target_os = "macos", not(test)))]
+fn run_say_macos(text: &str, params: &SapiParams) -> bool {
+    let voice = pick_macos_zh_voice();
+    let mut cmd = std::process::Command::new("/usr/bin/say");
+    cmd.args(build_say_args(text, params, voice.as_deref()));
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let deadline = Instant::now() + SAPI_PLAYBACK_TIMEOUT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => return status.success(),
+                    Ok(None) => {
+                        if Instant::now() >= deadline {
+                            let _ = child.kill();
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => return false,
+                }
+            }
+        }
+        Err(_) => false,
     }
 }
 
@@ -845,7 +958,8 @@ impl TTSManager {
                     }
                 }
             }
-            TTSEngineType::Sapi => true, // SAPI 为本地兜底，恒常可用
+            // 本地兜底恒常可用：Windows 走 System.Speech（SAPI），macOS 走内置 `say`
+            TTSEngineType::Sapi => true,
         }
     }
 
@@ -1172,7 +1286,7 @@ impl TTSManager {
             }
         }
 
-        // 4. Windows SAPI 本地离线兜底（rate/volume/pitch 全参数生效）
+        // 4. 本地离线兜底（Windows SAPI / macOS say），全参数按平台映射
         self.mark_active_engine(TTSEngineType::Sapi);
         let params = SapiParams {
             rate: cfg.speech_rate,
@@ -1644,6 +1758,71 @@ mod tests {
         assert!(cmd2.contains("$s.Rate=10"), "cmd2: {}", cmd2);
         assert!(cmd2.contains("$s.Volume=0"), "cmd2: {}", cmd2);
         println!("[PASS] test_sapi_ssml_and_command passed");
+    }
+
+    /// macOS `say` 兜底路径的参数映射（跨平台可测：不依赖 macOS 运行时）
+    #[test]
+    fn test_say_args_mapping() {
+        // 默认档位 rate=0 → 系统基准 175 wpm
+        assert_eq!(say_params_from(0, 100), (175, 0.5));
+        // 正负档位线性折算
+        assert_eq!(say_params_from(2, 200), (205, 1.0));
+        assert_eq!(say_params_from(-3, 0), (130, 0.0));
+        // 越界钳制：rate 档位先钳到 -10~10（对应 25~325 wpm），再过 80~400 安全区间；volume 钳到 0~1
+        assert_eq!(say_params_from(99, 999), (325, 1.0));
+        assert_eq!(say_params_from(-99, -5), (80, 0.0));
+
+        // 参数表：无音色时不带 -v；有音色时插入 -v <voice>
+        let params = SapiParams { rate: 0, volume: 100, pitch: 5 };
+        let args = build_say_args("你好", &params, None);
+        assert_eq!(args, vec!["-r", "175", "[[volm 0.50]]你好"]);
+
+        let args_zh = build_say_args("你好", &params, Some("Tingting"));
+        assert_eq!(
+            args_zh,
+            vec!["-r", "175", "-v", "Tingting", "[[volm 0.50]]你好"]
+        );
+        println!("[PASS] test_say_args_mapping passed");
+    }
+
+    /// `say -v ?` 中文音色解析：必须保住含空格/括号的音色名，
+    /// 否则会退化成英文音色把中文读成静音（`say` 对无效音色名不报错）
+    #[test]
+    fn test_parse_zh_voice_from_listing() {
+        // 经典格式（音色名无空格）
+        assert_eq!(
+            parse_zh_voice_from_listing("Tingting            zh_CN    # 您好，我叫Tingting。"),
+            Some("Tingting".to_string())
+        );
+
+        // 新版本地化格式：音色名含空格与括号，不得被首个空白截断
+        assert_eq!(
+            parse_zh_voice_from_listing("Eddy (中文（中国大陆）)     zh_CN    # 你好！我叫Eddy。"),
+            Some("Eddy (中文（中国大陆）)".to_string())
+        );
+
+        // 跳过非中文音色，取首个中文音色
+        let listing = "Alex                en_US    # Most people recognize me by my voice.\n\
+                       Eddy (中文（中国大陆）)     zh_CN    # 你好！我叫Eddy。\n\
+                       Tingting            zh_CN    # 您好，我叫Tingting。";
+        assert_eq!(
+            parse_zh_voice_from_listing(listing),
+            Some("Eddy (中文（中国大陆）)".to_string())
+        );
+
+        // 繁体中文同样命中
+        assert_eq!(
+            parse_zh_voice_from_listing("Meijia              zh_TW    # 你好，我叫Meijia。"),
+            Some("Meijia".to_string())
+        );
+
+        // 无中文音色 / 空输出
+        assert_eq!(
+            parse_zh_voice_from_listing("Alex                en_US    # hi"),
+            None
+        );
+        assert_eq!(parse_zh_voice_from_listing(""), None);
+        println!("[PASS] test_parse_zh_voice_from_listing passed");
     }
 
     #[test]

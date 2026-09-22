@@ -7,6 +7,12 @@ use std::sync::OnceLock;
 /// 配置/数据子目录名（与仓库布局及原工程一致）
 pub const CONFIG_DIR_NAME: &str = "MonsterOrderWilds_configs";
 
+/// macOS 用户数据根目录名，必须与 tauri.conf.json 的 `identifier` 一致。
+/// 二者漂移会导致数据被写到一个"看似正确但永不被读取"的目录，
+/// 故由 `test_macos_data_dir_name_matches_bundle_identifier` 单测守护。
+#[cfg(target_os = "macos")]
+pub const MACOS_APP_SUPPORT_DIR_NAME: &str = "com.jonysand.danmutools";
+
 static RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn exe_dir() -> Option<PathBuf> {
@@ -30,7 +36,33 @@ pub fn resource_root() -> Option<PathBuf> {
     exe_dir()
 }
 
+/// 打包态判定：exe 所在目录是否为 macOS 应用包内的 `Contents/MacOS`。
+/// 该判据同时覆盖 .app 与从只读 DMG 直接启动的场景，而开发态
+/// （`tauri dev` / `cargo test`，exe 位于 `target/debug`）不受影响。
+#[cfg(target_os = "macos")]
+fn is_macos_bundle_exe_dir(dir: &Path) -> bool {
+    dir.ends_with("Contents/MacOS")
+}
+
+/// macOS 规范用户数据目录：`~/Library/Application Support/<identifier>/MonsterOrderWilds_configs`
+#[cfg(target_os = "macos")]
+fn macos_user_config_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join(MACOS_APP_SUPPORT_DIR_NAME)
+            .join(CONFIG_DIR_NAME),
+    )
+}
+
 /// 可写数据目录（MonsterOrderWilds_configs）解析顺序：
+///
+/// macOS 打包态优先：exe 同级位于 `.app/Contents/MacOS` 包体内，写入会破坏签名密封，
+/// 且从只读 DMG 启动时静默失败（数据/日志/数据库全部丢失），故改用系统规范数据目录。
+///
+/// 其余情况：
 /// 1. exe 同级（安装版：用户可编辑的随包数据目录；对齐原工程「恒定取 exe 同级」语义）
 /// 2. cwd 下（绿色版 / 在仓库根目录直接运行）
 /// 3. cwd/.. 下（`tauri dev` / `cargo test` 时 cwd = src-tauri）
@@ -39,6 +71,14 @@ pub fn resource_root() -> Option<PathBuf> {
 /// 关键点：按「是否已存在」逐级判定，故开发态 exe 同级不存在时会正确回退到仓库根目录，
 /// 而安装版则恒定使用 exe 同级 —— 避免以不同工作目录启动同一 exe 时读写到不同数据。
 pub fn config_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if exe_dir().map(|d| is_macos_bundle_exe_dir(&d)).unwrap_or(false) {
+        if let Some(dir) = macos_user_config_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            return dir;
+        }
+    }
+
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(dir) = exe_dir() {
         candidates.push(dir.join(CONFIG_DIR_NAME));
@@ -180,6 +220,42 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         assert_eq!(root, exe.parent().unwrap().to_path_buf());
         println!("[PASS] test_resource_root_falls_back_to_exe_dir passed");
+    }
+
+    /// 打包态判据只认 `.app/Contents/MacOS`，不得把开发态 target 目录误判为包内
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_bundle_exe_dir_detection() {
+        assert!(is_macos_bundle_exe_dir(Path::new(
+            "/Applications/MHDanmuToolsV2.app/Contents/MacOS"
+        )));
+        assert!(is_macos_bundle_exe_dir(Path::new(
+            "/Volumes/MHDanmuToolsV2/MHDanmuToolsV2.app/Contents/MacOS"
+        )));
+        // 开发态：cargo test / tauri dev 的 exe 同级
+        assert!(!is_macos_bundle_exe_dir(Path::new(
+            "/Users/x/proj/src-tauri/target/debug"
+        )));
+        // 仅外层是 .app 但并非可执行目录
+        assert!(!is_macos_bundle_exe_dir(Path::new(
+            "/Applications/MHDanmuToolsV2.app/Contents"
+        )));
+        println!("[PASS] test_macos_bundle_exe_dir_detection passed");
+    }
+
+    /// 数据目录名与 bundle identifier 漂移会导致数据写入"永不被读取"的目录，必须锁死
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_data_dir_name_matches_bundle_identifier() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("应能读取 tauri.conf.json");
+        let val: serde_json::Value = serde_json::from_str(&raw).expect("tauri.conf.json 应为合法 JSON");
+        assert_eq!(
+            val["identifier"].as_str(),
+            Some(MACOS_APP_SUPPORT_DIR_NAME),
+            "MACOS_APP_SUPPORT_DIR_NAME 与 tauri.conf.json 的 identifier 不一致"
+        );
+        println!("[PASS] test_macos_data_dir_name_matches_bundle_identifier passed");
     }
 
     #[test]

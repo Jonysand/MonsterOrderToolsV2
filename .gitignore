@@ -13,6 +13,9 @@ MonsterOrderWilds_configs/credentials.dat
 MonsterOrderWilds_configs/configs.json
 MonsterOrderWilds_configs/order_list.json
 MonsterOrderWilds_configs/MainConfig.cfg
+# 非 Windows 平台的注册表等价物（加密键值存储，含身份码与 ManboApiKey）
+MonsterOrderWilds_configs/registry.dat
+MonsterOrderWilds_configs/registry.dat.tmp
 # 通配覆盖各类快照/备份（如 captain_profiles.snapshot_*.db、captain_profiles_bak.db）
 MonsterOrderWilds_configs/*.db
 MonsterOrderWilds_configs/*.db-shm
