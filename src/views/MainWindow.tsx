@@ -13,13 +13,15 @@ import {
   ConnectionStatusPayload,
   DanmuReceivedPayload,
   LogsSnapshot,
+  MonsterDict,
+  RosterData,
 } from "../types";
 import { VirtualList } from "../components/VirtualList";
 import { MarqueeText } from "../components/MarqueeText";
+import { MonsterListTab } from "./MonsterListTab";
+import { MonsterPickerPanel, PickerOrderPayload } from "../components/MonsterPickerPanel";
 import {
   Shield,
-  Trash2,
-  Plus,
   Sparkles,
   Radio,
   Sliders,
@@ -34,6 +36,7 @@ import {
   MessageSquare,
   AlertCircle,
   GripVertical,
+  ListPlus,
   Eye,
   Lock,
   Unlock,
@@ -64,20 +67,20 @@ const ENGINE_LABELS: Record<string, string> = {
 const QUEUE_ROW_HEIGHT = 54;
 
 export const MainWindow: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<"queue" | "bili" | "gm" | "ai" | "settings" | "logs">("queue");
+  const [activeTab, setActiveTab] = useState<
+    "queue" | "monster" | "bili" | "gm" | "ai" | "settings" | "logs"
+  >("queue");
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [isLite, setIsLite] = useState(false);
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [loading, setLoading] = useState(false);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
 
-  // 队列手动添加表单
-  const [userName, setUserName] = useState("");
-  const [monsterInput, setMonsterInput] = useState("");
-  const [isPriority, setIsPriority] = useState(false);
-  const [guardLevel, setGuardLevel] = useState(0);
-  const [temperedLevel, setTemperedLevel] = useState(0);
-  const [matchedPreview, setMatchedPreview] = useState<{ name: string; icon: string } | null>(null);
+  // 怪物字典与禁点名单（名单内的怪不可被点：弹幕点怪与选怪面板共享同一份约束）
+  const [monsterDict, setMonsterDict] = useState<MonsterDict>({});
+  const [roster, setRoster] = useState<RosterData>({ items: [] });
+  const [orderSubmitting, setOrderSubmitting] = useState(false);
+  const rosterRef = useRef<RosterData>({ items: [] });
+  const rosterSaveTimerRef = useRef<number | null>(null);
 
   // B站长连五态状态机（D7）
   const [conn, setConn] = useState<ConnectionStatusPayload>(DEFAULT_CONNECTION);
@@ -226,6 +229,8 @@ export const MainWindow: React.FC = () => {
     fetchCredentialsStatus();
     fetchCurrentEngine();
     fetchOverlayLocked();
+    fetchMonsterDict();
+    fetchRoster();
     invoke<string[]>("get_manbo_voice_list")
       .then(setManboVoices)
       .catch((e) => console.error(e));
@@ -282,6 +287,9 @@ export const MainWindow: React.FC = () => {
 
     return () => {
       clearInterval(interval);
+      if (rosterSaveTimerRef.current !== null) {
+        window.clearTimeout(rosterSaveTimerRef.current);
+      }
       unlistenQueue.then((f) => f());
       unlistenConn.then((f) => f());
       unlistenAi.then((f) => f());
@@ -308,58 +316,120 @@ export const MainWindow: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, logLevel]);
 
-  // 怪物名称输入时动态匹配预览
-  useEffect(() => {
-    if (!monsterInput.trim()) {
-      setMatchedPreview(null);
-      return;
-    }
-    const timer = setTimeout(async () => {
-      try {
-        const res = await invoke<{ monster_name: string; tempered_level: number; icon_url: string } | null>(
-          "match_monster_name",
-          { inputText: monsterInput.trim() }
-        );
-        if (res) {
-          setMatchedPreview({ name: res.monster_name, icon: res.icon_url });
-          if (res.tempered_level > 0) {
-            setTemperedLevel(res.tempered_level);
-          }
-        } else {
-          setMatchedPreview(null);
-        }
-      } catch {
-        setMatchedPreview(null);
-      }
-    }, 200);
-    return () => clearTimeout(timer);
-  }, [monsterInput]);
-
-  const handleAddOrder = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!userName.trim() || !monsterInput.trim()) return;
-    setLoading(true);
+  /* ---------------- 怪物字典 / 禁点名单 ---------------- */
+  const fetchMonsterDict = async () => {
     try {
-      const finalMonster = matchedPreview ? matchedPreview.name : monsterInput.trim();
+      setMonsterDict(await invoke<MonsterDict>("get_monster_dict"));
+    } catch (e) {
+      console.error("获取怪物列表异常:", e);
+    }
+  };
+
+  const fetchRoster = async () => {
+    try {
+      const data = await invoke<RosterData>("get_monster_roster");
+      rosterRef.current = data;
+      setRoster(data);
+    } catch (e) {
+      console.error("获取禁点名单异常:", e);
+    }
+  };
+
+  /** 字典条目增删改后刷新：改名/删除会在后端联动禁点名单，故名单须一并重取 */
+  const refreshMonsterData = async () => {
+    await Promise.all([fetchMonsterDict(), fetchRoster()]);
+  };
+
+  /** 名单变更：本地乐观更新 + 300ms 防抖整表落盘；失败回滚并提示 */
+  const commitRoster = (next: RosterData, immediate = false) => {
+    const prev = rosterRef.current;
+    rosterRef.current = next;
+    setRoster(next);
+    if (rosterSaveTimerRef.current !== null) {
+      window.clearTimeout(rosterSaveTimerRef.current);
+    }
+
+    const persist = async () => {
+      rosterSaveTimerRef.current = null;
+      try {
+        await invoke("set_monster_roster", { data: next });
+      } catch (err) {
+        rosterRef.current = prev;
+        setRoster(prev);
+        showToast(`名单保存失败，已回滚: ${err}`);
+      }
+    };
+
+    if (immediate) {
+      void persist();
+    } else {
+      rosterSaveTimerRef.current = window.setTimeout(persist, 300);
+    }
+  };
+
+  const handleExportRoster = async () => {
+    try {
+      const path = await invoke<string | null>("export_monster_roster");
+      if (path) showToast(`禁点名单已导出: ${path}`);
+    } catch (err) {
+      showToast(`导出失败: ${err}`);
+    }
+  };
+
+  const handleImportRoster = async () => {
+    try {
+      const parsed = await invoke<RosterData | null>("import_monster_roster");
+      if (!parsed) return;
+
+      const merge = await askConfirm(
+        `已选择名单文件：共 ${parsed.items.length} 个怪物将加入禁点名单。\n\n` +
+          "「是」= 合并到当前名单（仅追加新怪物）\n" +
+          `「否」= 覆盖当前名单（现有 ${roster.items.length} 项将被替换）`,
+        "导入禁点名单"
+      );
+
+      let next: RosterData;
+      if (merge) {
+        const merged = [...roster.items];
+        parsed.items.forEach((n) => {
+          if (!merged.includes(n)) merged.push(n);
+        });
+        next = { items: merged };
+      } else {
+        const ok = await askConfirm(
+          `确认覆盖当前名单？\n\n现有 ${roster.items.length} 项将被导入的 ${parsed.items.length} 项替换，此操作不可撤销。`,
+          "确认覆盖名单"
+        );
+        if (!ok) return;
+        next = parsed;
+      }
+
+      commitRoster(next, true);
+      showToast(`名单导入完成（禁点 ${next.items.length} 项）`);
+    } catch (err) {
+      showToast(`导入失败: ${err}`);
+    }
+  };
+
+  /** 选怪面板入队（与弹幕点怪写入同一条队列） */
+  const handlePickerOrder = async (payload: PickerOrderPayload) => {
+    setOrderSubmitting(true);
+    try {
+      const name = payload.userName || "房管";
       const updated = await invoke<QueueItem[]>("add_order", {
         userId: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        userName: userName.trim(),
-        monsterName: finalMonster,
-        isPriority,
-        guardLevel,
-        temperedLevel,
+        userName: name,
+        monsterName: payload.monsterName,
+        isPriority: payload.isPriority,
+        guardLevel: payload.guardLevel,
+        temperedLevel: payload.temperedLevel,
       });
       setQueue(updated);
-      setUserName("");
-      setMonsterInput("");
-      setMatchedPreview(null);
-      setIsPriority(false);
-      setTemperedLevel(0);
-      showToast("点怪条目已成功加入队列！");
+      showToast(`${name} 点怪 ${payload.monsterName} 已入队${payload.isPriority ? "（优先置前）" : ""}`);
     } catch (err) {
-      showToast(`添加失败: ${err}`);
+      showToast(`加入排队失败: ${err}`);
     } finally {
-      setLoading(false);
+      setOrderSubmitting(false);
     }
   };
 
@@ -789,6 +859,32 @@ export const MainWindow: React.FC = () => {
             </button>
 
             <button
+              onClick={() => setActiveTab("monster")}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
+                activeTab === "monster"
+                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                  : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
+              }`}
+            >
+              <ListPlus className="w-4 h-4" />
+              <span>怪物名单</span>
+              <span
+                className={`ml-auto text-[10px] px-1.5 py-0.5 rounded font-mono ${
+                  roster.items.length
+                    ? "bg-red-500/20 text-red-300"
+                    : "bg-neutral-800 text-neutral-400"
+                }`}
+                title={
+                  roster.items.length
+                    ? `禁点名单生效中：${roster.items.length} 个怪物不可被点`
+                    : "禁点名单为空，不限制任何点怪"
+                }
+              >
+                {roster.items.length}
+              </span>
+            </button>
+
+            <button
               onClick={() => setActiveTab("bili")}
               className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
                 activeTab === "bili"
@@ -906,6 +1002,7 @@ export const MainWindow: React.FC = () => {
           <div className="flex items-center gap-3">
             <h1 className="text-sm font-bold text-neutral-200">
               {activeTab === "queue" && "点单排队管理"}
+              {activeTab === "monster" && "怪物名单与禁点配置"}
               {activeTab === "bili" && "B 站开放平台直播间连接与监控"}
               {activeTab === "gm" && "舰长周打卡系统与 GM 运维管理"}
               {activeTab === "ai" && "DeepSeek-v4-flash 思考模式 AI 对话"}
@@ -935,243 +1032,181 @@ export const MainWindow: React.FC = () => {
         <div className="flex-1 overflow-y-auto p-6 scrollbar-thin scrollbar-thumb-neutral-800">
           {/* 1. 队列管理 TAB */}
           {activeTab === "queue" && (
-            <div className="grid grid-cols-12 gap-6">
-              {/* 左侧点单表单 */}
-              <div className="col-span-4 bg-neutral-900/70 border border-neutral-800 rounded-xl p-4 space-y-4">
-                <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
-                  <span className="text-xs font-bold text-amber-300">快速手动点怪</span>
-                  <span className="text-[10px] text-neutral-500">支持 1700+ 怪物别称自动匹配</span>
+            <div className="ml-scope">
+              <header className="page-head">
+                <div>
+                  <h1>点单排队管理</h1>
+                  <p className="sub">
+                    点图标即点怪 · 受「<b>怪物名单</b>」约束（名单内的怪已禁点，弹幕与面板一致）· 与弹幕点单写入同一条队列
+                  </p>
                 </div>
+              </header>
 
-                <form onSubmit={handleAddOrder} className="space-y-3">
-                  <div>
-                    <label className="block text-[11px] font-bold text-neutral-400 mb-1">水友名称</label>
-                    <input
-                      type="text"
-                      value={userName}
-                      onChange={(e) => setUserName(e.target.value)}
-                      placeholder="输入猎人水友昵称..."
-                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-amber-500/50"
-                    />
-                  </div>
+              <div className="editor-main">
+                <section className="card op-panel">
+                  <MonsterPickerPanel
+                    dict={monsterDict}
+                    roster={roster}
+                    submitting={orderSubmitting}
+                    onSubmit={handlePickerOrder}
+                  />
+                </section>
 
-                  <div>
-                    <label className="block text-[11px] font-bold text-neutral-400 mb-1">点单怪物名称 / 别称</label>
-                    <input
-                      type="text"
-                      value={monsterInput}
-                      onChange={(e) => setMonsterInput(e.target.value)}
-                      placeholder="例: 霸主太太 / 煌黑龙 / 明日香..."
-                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-amber-500/50"
-                    />
-                    {matchedPreview && (
-                      <div className="mt-1.5 p-2 bg-neutral-950 border border-emerald-500/40 rounded flex items-center gap-2">
-                        {matchedPreview.icon ? (
-                          <img
-                            src={`/monster_icons/${matchedPreview.icon}`}
-                            alt={matchedPreview.name}
-                            className="w-6 h-6 rounded border border-neutral-800 bg-black/50"
-                          />
-                        ) : null}
-                        <div className="text-[11px] text-emerald-300 font-bold">
-                          命中字典: {matchedPreview.name}
-                        </div>
+                <aside className="card queue-card">
+                  <header>
+                    <span className="ttl">当前排队列表</span>
+                    <span className="cnt">{queue.length}</span>
+                    <span style={{ flex: 1 }} />
+                    <button
+                      className="btn sm"
+                      onClick={() => {
+                        setActiveTab("monster");
+                      }}
+                    >
+                      配置怪物名单
+                    </button>
+                    <button
+                      className="btn sm danger"
+                      disabled={queue.length === 0}
+                      onClick={handleClear}
+                    >
+                      清空队列
+                    </button>
+                  </header>
+                  <div className="flex-1 min-h-0 overflow-y-auto p-2.5">
+                    {queue.length === 0 ? (
+                      <div className="py-20 flex flex-col items-center justify-center text-neutral-500 gap-2">
+                        <Shield className="w-10 h-10 text-neutral-700 mb-1" />
+                        <span className="text-xs">暂无水友排队，等待弹幕发送【点怪 怪物名】</span>
                       </div>
+                    ) : (
+                      <VirtualList
+                        items={queue}
+                        rowHeight={QUEUE_ROW_HEIGHT}
+                        className="h-full overflow-y-auto"
+                        renderItem={(item, idx) => (
+                          <div
+                            key={item.id}
+                            draggable
+                            onDragStart={(e) => handleItemDragStart(e, idx)}
+                            onDragOver={handleItemDragOver}
+                            onDrop={(e) => handleItemDrop(e, idx)}
+                            style={{ height: QUEUE_ROW_HEIGHT - 8, marginBottom: 8 }}
+                            className={`flex items-center justify-between p-2.5 rounded-xl border transition-all select-none ${
+                              draggedIndex === idx ? "opacity-40 scale-95 border-dashed border-amber-400" : ""
+                            } ${
+                              item.tempered_level === 2
+                                ? "bg-gradient-to-r from-orange-950/50 via-red-950/30 to-black/60 border-orange-500/80 arch-tempered-glow text-orange-200"
+                                : item.tempered_level === 1
+                                ? "bg-gradient-to-r from-purple-950/50 via-indigo-950/30 to-black/60 border-purple-500/70 tempered-glow text-purple-200"
+                                : item.is_priority
+                                ? "bg-red-950/40 border-red-500/50 text-red-200"
+                                : "bg-neutral-950/80 border-neutral-800 text-neutral-200"
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <div
+                                title="按住上下拖拽调整排队顺序"
+                                className="p-1 text-neutral-500 hover:text-amber-400 cursor-grab active:cursor-grabbing shrink-0"
+                              >
+                                <GripVertical className="w-4 h-4" />
+                              </div>
+
+                              <span className="font-mono text-sm font-bold text-amber-400 w-5 text-center shrink-0">
+                                #{idx + 1}
+                              </span>
+
+                              {item.icon_url ? (
+                                <img
+                                  src={`/monster_icons/${item.icon_url}`}
+                                  alt={item.monster_name}
+                                  onError={(e) => {
+                                    (e.target as HTMLElement).style.display = "none";
+                                  }}
+                                  className="w-8 h-8 rounded border border-neutral-700/60 object-contain bg-black/60"
+                                />
+                              ) : (
+                                <div className="w-8 h-8 rounded border border-neutral-700/60 bg-black/60 flex items-center justify-center">
+                                  <Shield className="w-4 h-4 text-neutral-500" />
+                                </div>
+                              )}
+
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <MarqueeText
+                                    text={item.monster_name}
+                                    className="text-xs font-bold text-white max-w-[14rem]"
+                                  />
+                                  {item.tempered_level === 2 && (
+                                    <span className="flex items-center gap-0.5 text-[9px] bg-orange-600 text-white font-bold px-1.5 py-0.2 rounded">
+                                      <Flame className="w-2.5 h-2.5" /> 历战王
+                                    </span>
+                                  )}
+                                  {item.tempered_level === 1 && (
+                                    <span className="flex items-center gap-0.5 text-[9px] bg-purple-600 text-white font-bold px-1.5 py-0.2 rounded">
+                                      <Sparkles className="w-2.5 h-2.5" /> 历战
+                                    </span>
+                                  )}
+                                  {item.guard_level === 1 && (
+                                    <span className="text-[9px] bg-gradient-to-r from-red-600 to-amber-500 text-white font-bold px-1 rounded">
+                                      总督
+                                    </span>
+                                  )}
+                                  {item.guard_level === 2 && (
+                                    <span className="text-[9px] bg-gradient-to-r from-purple-600 to-pink-500 text-white font-bold px-1 rounded">
+                                      提督
+                                    </span>
+                                  )}
+                                  {item.guard_level === 3 && (
+                                    <span className="text-[9px] bg-gradient-to-r from-blue-600 to-cyan-500 text-white font-bold px-1 rounded">
+                                      舰长
+                                    </span>
+                                  )}
+                                  {item.is_priority && (
+                                    <span className="text-[9px] bg-red-600 text-white font-bold px-1 rounded animate-pulse">
+                                      优先
+                                    </span>
+                                  )}
+                                </div>
+                                <MarqueeText
+                                  text={`水友: ${item.user_name}`}
+                                  className="text-[11px] text-neutral-400 max-w-[14rem]"
+                                />
+                              </div>
+                            </div>
+
+                            <button
+                              onClick={() => handleDelete(item.user_id)}
+                              className="px-3 py-1 bg-neutral-800 hover:bg-red-600 hover:text-white text-neutral-400 text-xs font-bold rounded-lg transition shrink-0"
+                            >
+                              完成并出队
+                            </button>
+                          </div>
+                        )}
+                      />
                     )}
                   </div>
-
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">历战难度</label>
-                      <select
-                        value={temperedLevel}
-                        onChange={(e) => setTemperedLevel(Number(e.target.value))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-amber-500/50"
-                      >
-                        <option value={0}>普通</option>
-                        <option value={1}>历战 (紫色)</option>
-                        <option value={2}>历战王 (烈焰橙红)</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">大航海身份</label>
-                      <select
-                        value={guardLevel}
-                        onChange={(e) => setGuardLevel(Number(e.target.value))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-amber-500/50"
-                      >
-                        <option value={0}>普通水友</option>
-                        <option value={3}>舰长 (三等)</option>
-                        <option value={2}>提督 (二等)</option>
-                        <option value={1}>总督 (一等)</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2 pt-1">
-                    <input
-                      type="checkbox"
-                      id="isPriorityCheck"
-                      checked={isPriority}
-                      onChange={(e) => setIsPriority(e.target.checked)}
-                      className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
-                    />
-                    <label htmlFor="isPriorityCheck" className="text-xs text-neutral-300 font-bold cursor-pointer">
-                      插队置顶 (优先)
-                    </label>
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={loading}
-                    className="w-full mt-2 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-black font-bold py-2 rounded-lg text-xs flex items-center justify-center gap-1.5 shadow-lg shadow-amber-600/20 transition"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>加入排队列表</span>
-                  </button>
-                </form>
-              </div>
-
-              {/* 右侧实时队列明细 */}
-              <div className="col-span-8 bg-neutral-900/70 border border-neutral-800 rounded-xl p-4 flex flex-col">
-                <div className="flex items-center justify-between pb-3 border-b border-neutral-800 mb-3">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-bold text-neutral-200">当前排队列表</span>
-                    <span className="text-xs text-amber-400 font-mono bg-amber-950/60 border border-amber-500/30 px-2 py-0.5 rounded-full font-bold">
-                      {queue.length} 位猎人
-                    </span>
-                  </div>
-
-                  <button
-                    onClick={handleClear}
-                    disabled={queue.length === 0}
-                    className="flex items-center gap-1 text-[11px] text-red-400 hover:text-red-300 hover:bg-red-500/10 px-2 py-1 rounded transition disabled:opacity-30"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    <span>清空队列</span>
-                  </button>
-                </div>
-
-                <div className="flex-1 overflow-y-auto max-h-[32rem] pr-1">
-                  {queue.length === 0 ? (
-                    <div className="py-20 flex flex-col items-center justify-center text-neutral-500 gap-2">
-                      <Shield className="w-10 h-10 text-neutral-700 mb-1" />
-                      <span className="text-xs">暂无水友排队，等待弹幕发送【点怪 怪物名】</span>
-                    </div>
-                  ) : (
-                    <VirtualList
-                      items={queue}
-                      rowHeight={QUEUE_ROW_HEIGHT}
-                      className="h-[32rem] overflow-y-auto"
-                      renderItem={(item, idx) => (
-                      <div
-                        key={item.id}
-                        draggable
-                        onDragStart={(e) => handleItemDragStart(e, idx)}
-                        onDragOver={handleItemDragOver}
-                        onDrop={(e) => handleItemDrop(e, idx)}
-                        style={{ height: QUEUE_ROW_HEIGHT - 8 }}
-                        className={`flex items-center justify-between p-2.5 mb-2 rounded-xl border transition-all select-none ${
-                          draggedIndex === idx ? "opacity-40 scale-95 border-dashed border-amber-400" : ""
-                        } ${
-                          item.tempered_level === 2
-                            ? "bg-gradient-to-r from-orange-950/50 via-red-950/30 to-black/60 border-orange-500/80 arch-tempered-glow text-orange-200"
-                            : item.tempered_level === 1
-                            ? "bg-gradient-to-r from-purple-950/50 via-indigo-950/30 to-black/60 border-purple-500/70 tempered-glow text-purple-200"
-                            : item.is_priority
-                            ? "bg-red-950/40 border-red-500/50 text-red-200"
-                            : "bg-neutral-950/80 border-neutral-800 text-neutral-200"
-                        }`}
-                      >
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          {/* 拖拽排序手柄 */}
-                          <div
-                            title="按住上下拖拽调整排队顺序"
-                            className="p-1 text-neutral-500 hover:text-amber-400 cursor-grab active:cursor-grabbing shrink-0"
-                          >
-                            <GripVertical className="w-4 h-4" />
-                          </div>
-
-                          <span className="font-mono text-sm font-bold text-amber-400 w-5 text-center shrink-0">
-                            #{idx + 1}
-                          </span>
-
-                          {item.icon_url ? (
-                            <img
-                              src={`/monster_icons/${item.icon_url}`}
-                              alt={item.monster_name}
-                              onError={(e) => {
-                                (e.target as HTMLElement).style.display = "none";
-                              }}
-                              className="w-8 h-8 rounded border border-neutral-700/60 object-contain bg-black/60"
-                            />
-                          ) : (
-                            <div className="w-8 h-8 rounded border border-neutral-700/60 bg-black/60 flex items-center justify-center">
-                              <Shield className="w-4 h-4 text-neutral-500" />
-                            </div>
-                          )}
-
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-2">
-                              <MarqueeText
-                                text={item.monster_name}
-                                className="text-xs font-bold text-white max-w-[14rem]"
-                              />
-                              {item.tempered_level === 2 && (
-                                <span className="flex items-center gap-0.5 text-[9px] bg-orange-600 text-white font-bold px-1.5 py-0.2 rounded">
-                                  <Flame className="w-2.5 h-2.5" /> 历战王
-                                </span>
-                              )}
-                              {item.tempered_level === 1 && (
-                                <span className="flex items-center gap-0.5 text-[9px] bg-purple-600 text-white font-bold px-1.5 py-0.2 rounded">
-                                  <Sparkles className="w-2.5 h-2.5" /> 历战
-                                </span>
-                              )}
-                              {item.guard_level === 1 && (
-                                <span className="text-[9px] bg-gradient-to-r from-red-600 to-amber-500 text-white font-bold px-1 rounded">
-                                  总督
-                                </span>
-                              )}
-                              {item.guard_level === 2 && (
-                                <span className="text-[9px] bg-gradient-to-r from-purple-600 to-pink-500 text-white font-bold px-1 rounded">
-                                  提督
-                                </span>
-                              )}
-                              {item.guard_level === 3 && (
-                                <span className="text-[9px] bg-gradient-to-r from-blue-600 to-cyan-500 text-white font-bold px-1 rounded">
-                                  舰长
-                                </span>
-                              )}
-                              {item.is_priority && (
-                                <span className="text-[9px] bg-red-600 text-white font-bold px-1 rounded animate-pulse">
-                                  优先
-                                </span>
-                              )}
-                            </div>
-                            <MarqueeText
-                              text={`水友: ${item.user_name}`}
-                              className="text-[11px] text-neutral-400 max-w-[14rem]"
-                            />
-                          </div>
-                        </div>
-
-                        <button
-                          onClick={() => handleDelete(item.user_id)}
-                          className="px-3 py-1 bg-neutral-800 hover:bg-red-600 hover:text-white text-neutral-400 text-xs font-bold rounded-lg transition shrink-0"
-                        >
-                          完成并出队
-                        </button>
-                      </div>
-                      )}
-                    />
-                  )}
-                </div>
+                </aside>
               </div>
             </div>
           )}
 
-          {/* 2. 直播长连 TAB */}
+          {/* 2. 怪物名单 TAB */}
+          {activeTab === "monster" && (
+            <MonsterListTab
+              dict={monsterDict}
+              roster={roster}
+              onRosterChange={commitRoster}
+              onDictChanged={refreshMonsterData}
+              onImport={handleImportRoster}
+              onExport={handleExportRoster}
+              toast={showToast}
+              askConfirm={askConfirm}
+            />
+          )}
+
+
+          {/* 3. 直播长连 TAB */}
           {activeTab === "bili" && (
             <div className="max-w-3xl space-y-6">
               <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
@@ -1568,7 +1603,7 @@ export const MainWindow: React.FC = () => {
             </div>
           )}
 
-          {/* 3. 舰长打卡 & GM 运维 TAB */}
+          {/* 4. 舰长打卡 & GM 运维 TAB */}
           {activeTab === "gm" && (
             <div className="space-y-6">
               {isLite && (
@@ -1754,7 +1789,7 @@ export const MainWindow: React.FC = () => {
             </div>
           )}
 
-          {/* 4. AI 思考互动 TAB */}
+          {/* 5. AI 思考互动 TAB */}
           {activeTab === "ai" && (
             <div className="max-w-3xl space-y-6">
               {isLite && (
@@ -1808,7 +1843,7 @@ export const MainWindow: React.FC = () => {
             </div>
           )}
 
-          {/* 5. 设置面板 TAB */}
+          {/* 6. 设置面板 TAB */}
           {activeTab === "settings" && config && (
             <form onSubmit={handleSaveConfig} className="max-w-4xl space-y-6 pb-12">
               {/* 敏感凭证安全托管状态卡片 (禁止手动修改) */}

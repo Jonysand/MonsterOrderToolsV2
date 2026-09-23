@@ -4,10 +4,11 @@
   "version": "0.1.2",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "dev": "npm run gen:icons && vite",
+    "build": "npm run gen:icons && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "gen:icons": "python scripts/gen_icon_manifest.py",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "check:encoding": "python scripts/check_encoding.py",
     "check:fields": "python scripts/check_orphan_fields.py",

@@ -10,6 +10,7 @@ pub mod monster;
 pub mod paths;
 pub mod queue;
 pub mod registry;
+pub mod roster;
 pub mod tts;
 
 use checkin_ai::CheckinLearner;
@@ -20,6 +21,9 @@ use config::AppConfig;
 use credentials::{Credentials, CredentialsStatus};
 use monster::MonsterDataManager;
 use queue::{QueueItem, QueueManager};
+use roster::{MonsterRoster, RosterData};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tts::{TTSConfig, TTSEngineType, TTSManager};
@@ -29,6 +33,8 @@ use tts::{TTSConfig, TTSEngineType, TTSManager};
 pub struct AppState {
     pub queue_mgr: Arc<Mutex<QueueManager>>,
     pub monster_mgr: Arc<MonsterDataManager>,
+    /// 点怪禁点名单（名单内的怪物不可被点单；弹幕与选怪面板共享同一份约束）
+    pub roster: Arc<MonsterRoster>,
     pub checkin_mgr: Arc<CheckinManager>,
     /// 弹幕关键词学习器（jieba 分词）。生产环境在 run() 中注入；测试默认 None（学习链路将被跳过）
     pub checkin_learner: Option<Arc<CheckinLearner>>,
@@ -61,6 +67,9 @@ impl Default for AppState {
         if let Err(e) = monster_mgr.load_from_file(None) {
             crate::log_warn!("[Init] 怪物别名库加载失败，点怪匹配降级: {}", e);
         }
+
+        // 1.1 初始化点怪可选名单（白名单默认关闭；文件缺失即用默认值）
+        let roster = MonsterRoster::load(None);
 
         // 2. 初始化排队管理器并自动加载持久化列表
         //    读取优先 V2 的 order_list.json，其次原工程 OrderList.list（首次迁移，只读不改写）
@@ -119,6 +128,7 @@ impl Default for AppState {
         Self {
             queue_mgr: Arc::new(Mutex::new(queue_mgr)),
             monster_mgr: Arc::new(monster_mgr),
+            roster: Arc::new(roster),
             checkin_mgr: Arc::new(checkin_mgr),
             checkin_learner: None,
             tts_mgr: Arc::new(tts_mgr),
@@ -188,6 +198,8 @@ fn save_queue_now(state: &AppState) {
 }
 
 /// 新增点怪
+/// `tempered_level`：None = 跟随字典默认等级（选怪面板「难度：默认」），
+/// Some(v) = 强制该等级（主播显式指定，覆盖字典默认值）
 #[tauri::command]
 fn add_order(
     user_id: String,
@@ -203,7 +215,7 @@ fn add_order(
 
     // 匹配怪物别名与图标
     let (final_monster, final_tempered, icon_url) = if let Some(m) = state.monster_mgr.match_monster(&monster_name) {
-        (m.monster_name, m.tempered_level, m.icon_url)
+        (m.monster_name, tempered_level.unwrap_or(m.tempered_level), m.icon_url)
     } else {
         (
             monster_name,
@@ -306,6 +318,190 @@ fn match_monster_name(
     state: State<'_, AppState>,
 ) -> Result<Option<monster::MonsterMatchResult>, String> {
     Ok(state.monster_mgr.match_monster(&input_text))
+}
+
+/// 读取全量怪物字典（图鉴库展示与别称冲突检测的数据源）
+#[tauri::command]
+fn get_monster_dict(
+    state: State<'_, AppState>,
+) -> Result<HashMap<String, monster::MonsterConfig>, String> {
+    Ok(state.monster_mgr.get_all_monsters())
+}
+
+/// 新增 / 更新字典条目并热重载匹配器；`original` 为改名前旧名（用于同步可选名单）。
+/// 返回落盘后的条目总数
+#[tauri::command]
+fn save_monster_entry(
+    name: String,
+    config: monster::MonsterConfig,
+    original: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("怪物名不能为空".into());
+    }
+
+    let renamed_from = original
+        .map(|o| o.trim().to_string())
+        .filter(|o| !o.is_empty() && *o != name);
+
+    let path = MonsterDataManager::find_monster_list_path();
+    let count = state.monster_mgr.edit_and_save(&path, |raw| {
+        if let Some(old) = &renamed_from {
+            raw.remove(old);
+        }
+        raw.insert(
+            name.clone(),
+            serde_json::to_value(&config).map_err(|e| format!("条目序列化失败: {}", e))?,
+        );
+        Ok(())
+    })?;
+
+    // 改名时同步可选名单中的引用（保持原顺位）；失败仅告警 —— 字典已落盘，不应谎报失败
+    if let Some(old) = &renamed_from {
+        match state.roster.rename_item(old, &name) {
+            Ok(true) => crate::log_info!("[Dict] 条目改名 {} → {}，已同步可选名单", old, name),
+            Ok(false) => {}
+            Err(e) => crate::log_warn!("[Dict] 条目改名后同步可选名单失败: {}", e),
+        }
+    }
+
+    crate::log_info!("[Dict] 已保存条目「{}」，当前共 {} 条", name, count);
+    Ok(count)
+}
+
+/// 删除字典条目：落盘 + 热重载匹配器 + 同步清理禁点名单（名单恒为字典子集）。
+/// 返回剩余条目总数
+fn delete_monster_entry_impl(
+    mgr: &MonsterDataManager,
+    roster: &MonsterRoster,
+    dict_path: &Path,
+    name: &str,
+) -> Result<usize, String> {
+    let count = mgr.edit_and_save(dict_path, |raw| {
+        raw.remove(name);
+        Ok(())
+    })?;
+
+    // 禁点名单在 UI 上为只读展示、无手动移除入口，故这里的同名残留必须一并清理
+    if roster.snapshot().items.iter().any(|n| n == name) {
+        match roster.remove(name) {
+            Ok(()) => crate::log_info!("[Dict] 条目「{}」已删除，同步移出禁点名单", name),
+            Err(e) => crate::log_warn!("[Dict] 删除条目后同步移出禁点名单失败: {}", e),
+        }
+    }
+
+    crate::log_info!("[Dict] 已删除条目「{}」，当前共 {} 条", name, count);
+    Ok(count)
+}
+
+/// 删除字典条目并热重载匹配器；返回剩余条目总数
+#[tauri::command]
+fn delete_monster_entry(name: String, state: State<'_, AppState>) -> Result<usize, String> {
+    let path = MonsterDataManager::find_monster_list_path();
+    delete_monster_entry_impl(&state.monster_mgr, &state.roster, &path, &name)
+}
+
+/// 读取点怪可选名单（含白名单开关状态）
+#[tauri::command]
+fn get_monster_roster(state: State<'_, AppState>) -> Result<RosterData, String> {
+    Ok(state.roster.snapshot())
+}
+
+/// 整表保存名单（编辑器点击加入/移出后落盘），返回保存后的快照
+#[tauri::command]
+fn set_monster_roster(data: RosterData, state: State<'_, AppState>) -> Result<RosterData, String> {
+    state.roster.replace(data)?;
+    Ok(state.roster.snapshot())
+}
+
+/// 解析名单 JSON 文本（导入用，纯逻辑便于单测）。
+/// 接受两种形态：`{items}` 或裸字符串数组。
+/// 旧版白名单文件（含 `enabled` 字段）语义相反，沿用会把全部怪物误判为禁点，故直接拒绝
+pub fn parse_roster_json(content: &str) -> Result<RosterData, String> {
+    let clean = content.strip_prefix('\u{FEFF}').unwrap_or(content);
+    let value: serde_json::Value =
+        serde_json::from_str(clean).map_err(|e| format!("名单 JSON 解析失败: {}", e))?;
+
+    match value {
+        serde_json::Value::Object(ref map) => {
+            if map.contains_key("enabled") {
+                return Err(
+                    "该文件是旧版「可选名单（白名单）」格式：请改为 {\"items\": [\"怪物名\", ...]} 后再导入"
+                        .into(),
+                );
+            }
+            serde_json::from_value(value.clone())
+                .map_err(|e| format!("名单 JSON 结构非法（需为 {{\"items\": [...]}}）: {}", e))
+        }
+        serde_json::Value::Array(_) => {
+            let items: Vec<String> = serde_json::from_value(value)
+                .map_err(|e| format!("名单数组元素必须为字符串: {}", e))?;
+            Ok(RosterData { items })
+        }
+        _ => Err("名单 JSON 顶层必须是对象或字符串数组".into()),
+    }
+}
+
+/// 导出当前禁点名单（系统保存对话框；JSON 无 BOM）。用户取消时返回 None
+#[tauri::command]
+fn export_monster_roster(app_handle: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let data = state.roster.snapshot();
+    let json = serde_json::to_string_pretty(&data).map_err(|e| format!("名单序列化失败: {}", e))?;
+
+    match save_text_file_with_dialog(&app_handle, "monster_roster.json", "json", &json) {
+        Ok(path) => {
+            crate::log_info!("[Roster] 已导出禁点名单（{} 项）到 {}", data.items.len(), path);
+            Ok(Some(path))
+        }
+        // 「已取消导出」不是错误：前端据 None 静默处理
+        Err(e) if e.contains("已取消") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// 选择名单 JSON 文件（生产：系统打开对话框；测试构建：不弹窗）
+#[cfg(not(test))]
+fn pick_roster_file(app_handle: &AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app_handle
+        .dialog()
+        .file()
+        .add_filter("可选名单 JSON", &["json"])
+        .blocking_pick_file();
+    match picked {
+        None => Ok(None),
+        Some(p) => Ok(Some(
+            p.into_path()
+                .map_err(|e| format!("路径解析失败: {}", e))?
+                .to_string_lossy()
+                .to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+fn pick_roster_file(_app_handle: &AppHandle) -> Result<Option<String>, String> {
+    Err("测试构建不弹出文件选择对话框".into())
+}
+
+/// 导入禁点名单：弹打开对话框 → 读取并校验 JSON → 返回解析结果（由前端选定「覆盖 / 合并」后经
+/// set_monster_roster 统一落盘，写入路径唯一）。用户取消时返回 None
+#[tauri::command]
+fn import_monster_roster(app_handle: AppHandle) -> Result<Option<RosterData>, String> {
+    let Some(path) = pick_roster_file(&app_handle)? else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取名单文件失败（{}）: {}", path, e))?;
+    let data = parse_roster_json(&content)?;
+    crate::log_info!(
+        "[Roster] 已读取导入名单（{} 项）来自 {}",
+        data.items.len(),
+        path
+    );
+    Ok(Some(data))
 }
 
 /// 设置 Lite 模式开关并持久化
@@ -755,11 +951,30 @@ pub fn handle_incoming_danmu(
         let mut q = state.queue_mgr.lock().unwrap();
         let res = state
             .danmu_processor
-            .process_danmu(&danmu, &state.monster_mgr, &mut q);
+            .process_danmu(&danmu, &state.monster_mgr, &state.roster, &mut q);
         let items = q.items.clone();
         (res, items)
         // 锁在此处释放：后续日志/事件广播/落盘均不持锁
     };
+
+    // 3.1 禁点名单拦截：命中字典但该怪已被禁点 —— 不入队，仅记录并就地提示
+    if res.blocked_by_roster {
+        crate::log_info!(
+            "[Roster] {} 点怪「{}」未生效（该怪在禁点名单内）",
+            danmu.user_name,
+            res.monster_name
+        );
+        if let Some(handle) = app_handle {
+            let _ = handle.emit(
+                "order-blocked",
+                &serde_json::json!({
+                    "user_id": danmu.user_id,
+                    "user_name": danmu.user_name,
+                    "monster_name": res.monster_name,
+                }),
+            );
+        }
+    }
 
     if res.added_to_queue || res.priority_updated {
         // 日志展示条目真实优先级：res.priority_updated 仅代表「二段式提权」这唯一动作，
@@ -1990,6 +2205,13 @@ pub fn run() {
             get_credentials_status,
             import_credentials_file,
             match_monster_name,
+            get_monster_dict,
+            save_monster_entry,
+            delete_monster_entry,
+            get_monster_roster,
+            set_monster_roster,
+            export_monster_roster,
+            import_monster_roster,
             set_lite_mode,
             get_app_config,
             save_app_config,
@@ -2045,10 +2267,17 @@ impl AppState {
         let ai_provider = DeepSeekAIChatProvider::new(String::new());
         let danmu_processor = bilibili::DanmuProcessor::new();
         let creds = credentials::load_credentials(None).unwrap_or_default();
+        // 单测名单指向临时目录：绝不读写真实 monster_roster.json
+        let roster = MonsterRoster::load(Some(
+            &std::env::temp_dir()
+                .join("mh_test_appstate_roster")
+                .join(roster::ROSTER_FILE_NAME),
+        ));
 
         Self {
             queue_mgr: Arc::new(Mutex::new(queue_mgr)),
             monster_mgr: Arc::new(monster_mgr),
+            roster: Arc::new(roster),
             checkin_mgr: Arc::new(checkin_mgr),
             checkin_learner: None,
             tts_mgr: Arc::new(tts_mgr),
@@ -2991,5 +3220,115 @@ mod tests {
         assert_eq!(taken, Some((913.0, 105.0)));
         assert!(state.pending_pos.lock().unwrap().is_none());
         println!("[PASS] test_overlay_lock_and_position_runtime_state passed");
+    }
+
+    /// 名单/字典命令的接线守护：AppState 已注入名单、禁点判定默认放行、字典已加载
+    #[test]
+    fn test_roster_and_dict_command_surface() {
+        let state = AppState::new_test();
+
+        // get_monster_dict 的数据源：字典必须已加载（空白字典会让图鉴库与选怪面板全空）
+        let dict = state.monster_mgr.get_all_monsters();
+        assert!(dict.len() > 100, "字典条目数异常: {}", dict.len());
+        assert!(dict.contains_key("黑龙"));
+
+        // 默认空名单：不做任何限制，任何点怪都不被拦截
+        assert!(state.roster.snapshot().items.is_empty());
+        assert!(!state.roster.is_blocked("任意未禁点怪物"));
+
+        // set/get 名单往返一致，且真正落盘（重新加载后不变）
+        let dir = std::env::temp_dir().join("mh_test_lib_roster_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(roster::ROSTER_FILE_NAME);
+
+        let roster = MonsterRoster::load(Some(&path));
+        let payload = RosterData {
+            items: vec!["黑龙".into(), "嗟怨震天怨虎龙".into()],
+        };
+        roster.replace(payload.clone()).unwrap();
+        assert_eq!(roster.snapshot(), payload);
+        assert_eq!(MonsterRoster::load(Some(&path)).snapshot(), payload);
+        assert!(roster.is_blocked("黑龙"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_roster_and_dict_command_surface passed");
+    }
+
+    /// 导入解析：对象形态 / 裸数组 / 旧白名单文件拒绝 / 非法内容 / BOM 容忍
+    #[test]
+    fn test_parse_roster_json() {
+        let d = parse_roster_json(r#"{ "items": ["黑龙", "麒麟"] }"#).unwrap();
+        assert_eq!(d.items, vec!["黑龙", "麒麟"]);
+
+        // 裸数组
+        let d = parse_roster_json(r#"["黑龙", "麒麟"]"#).unwrap();
+        assert_eq!(d.items.len(), 2);
+
+        // 带 BOM 的文件内容（Windows 记事本另存）
+        let d = parse_roster_json("\u{FEFF}{ \"items\": [] }").unwrap();
+        assert!(d.items.is_empty());
+
+        // 缺字段 → 取默认值（空名单 = 不限制）
+        let d = parse_roster_json(r#"{}"#).unwrap();
+        assert!(d.items.is_empty());
+
+        // 旧版白名单文件（含 enabled）语义相反，直接拒绝
+        assert!(parse_roster_json(r#"{ "enabled": true, "items": ["黑龙"] }"#).is_err());
+
+        assert!(parse_roster_json("不是 JSON").is_err());
+        assert!(parse_roster_json(r#"["黑龙", 42]"#).is_err());
+        assert!(parse_roster_json(r#""just a string""#).is_err());
+        println!("[PASS] test_parse_roster_json passed");
+    }
+
+    /// 删除字典条目：落盘 + 热重载 + 同步清理禁点名单（名单在 UI 上只读，无手动移除入口）
+    #[test]
+    fn test_delete_monster_entry_prunes_roster() {
+        let dir = std::env::temp_dir().join("mh_test_delete_entry_prunes_roster");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dict_path = dir.join("monster_list.json");
+        std::fs::write(
+            &dict_path,
+            r#"{"黑龙":{"默认历战等级":2,"图标地址":"a.png","别称":["米拉"]},"麒麟":{"默认历战等级":0,"图标地址":"","别称":[]}}"#,
+        )
+        .unwrap();
+
+        let mut mgr = MonsterDataManager::new();
+        assert_eq!(mgr.load_from_file(Some(&dict_path)).unwrap(), 2);
+
+        let roster_path = dir.join(roster::ROSTER_FILE_NAME);
+        let roster = MonsterRoster::load(Some(&roster_path));
+        roster
+            .replace(RosterData {
+                items: vec!["黑龙".into(), "麒麟".into()],
+            })
+            .unwrap();
+
+        // 删除字典条目 → 匹配器热重载，禁点名单中的同名项同步移出
+        let left = delete_monster_entry_impl(&mgr, &roster, &dict_path, "黑龙").unwrap();
+        assert_eq!(left, 1);
+        assert!(!mgr.get_all_monsters().contains_key("黑龙"));
+        assert_eq!(roster.snapshot().items, vec!["麒麟".to_string()]);
+        assert!(!roster.is_blocked("黑龙"));
+
+        // 磁盘核验：字典与名单文件均已更新
+        assert!(!MonsterDataManager::read_ordered_dict(&dict_path)
+            .unwrap()
+            .contains_key("黑龙"));
+        assert_eq!(
+            MonsterRoster::load(Some(&roster_path)).snapshot().items,
+            vec!["麒麟".to_string()]
+        );
+
+        // 删除不在名单中的条目 → 名单保持不变
+        delete_monster_entry_impl(&mgr, &roster, &dict_path, "麒麟").unwrap();
+        assert!(roster.snapshot().items.is_empty());
+        assert_eq!(mgr.get_all_monsters().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_delete_monster_entry_prunes_roster passed");
     }
 }
