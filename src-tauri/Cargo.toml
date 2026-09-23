@@ -36,7 +36,9 @@ tauri-plugin-dialog = "2"
 # D2：悬浮窗锁定/解锁全局热键（Alt+,）
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order：字典编辑写回时必须保持 monster_list.json 既有条目顺序
+# （serde_json 默认用 BTreeMap 会按 Unicode 码点重排整份文件，产生无意义的大面积 diff）
+serde_json = { version = "1", features = ["preserve_order"] }
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }

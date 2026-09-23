@@ -1,0 +1,1302 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>点怪可选名单编辑器 · 视觉设计稿 · MonsterOrderTools V2</title>
+<style>
+/* =============================================================================
+   内嵌字体：与打包产物同源的子集化字体（src/assets/fonts）
+   ============================================================================= */
+@font-face{font-family:"MH Sans SC";src:url("../../src/assets/fonts/MH-Sans-SC-Common.woff2") format("woff2");font-weight:100 900;font-display:swap}
+@font-face{font-family:"MH Serif SC";src:url("../../src/assets/fonts/MH-Serif-SC-MonsterNames.woff2") format("woff2");font-weight:100 900;font-display:swap}
+@font-face{font-family:"MH DM Serif";src:url("../../src/assets/fonts/DMSerifDisplay-Regular.woff2") format("woff2");font-weight:400;font-display:swap}
+
+:root{
+  --font-sans:"MH Sans SC","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  --font-serif:"MH Serif SC","MH Sans SC","Noto Serif SC",serif;
+  --font-num:"MH DM Serif","MH Serif SC",serif;
+
+  /* 主窗口（控制台）配色：对齐现网 Tailwind neutral + amber 体系 */
+  --w-bg:#0a0a0a;--w-panel:rgba(23,23,23,.72);--w-panel-solid:#171717;
+  --w-line:#262626;--w-line-2:#333;--w-line-3:#404040;
+  --w-ink:#e5e5e5;--w-ink-2:#a3a3a3;--w-ink-3:#737373;--w-ink-4:#525252;
+  --amber:#f59e0b;--amber-2:#fbbf24;--amber-3:#fcd34d;
+
+  /* 稀有度语义：普通 / 历战（紫） / 历战王（橙），全应用一致 */
+  --r-normal:#c7c0ab;--r-tempered:#a78bfa;--r-arch:#ffa02e;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:
+    radial-gradient(1200px 600px at 50% -10%,rgba(245,158,11,.05),transparent 60%),
+    #050505;
+  color:var(--w-ink);
+  font-family:var(--font-sans);
+  font-size:13px;
+  user-select:none;
+  padding:0 0 80px;
+}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
+::-webkit-scrollbar-track{background:transparent}
+
+/* =============================================================================
+   设计稿外壳：视图切换 + 说明
+   ============================================================================= */
+.mock-top{position:sticky;top:0;z-index:99;background:rgba(5,5,5,.86);backdrop-filter:blur(10px);border-bottom:1px solid #1c1c1c}
+.mock-top-in{max-width:1120px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.mock-brand{font-family:var(--font-serif);font-size:15px;color:var(--amber-3);letter-spacing:.04em}
+.mock-brand em{font-style:normal;font-size:10px;color:var(--w-ink-3);margin-left:6px;font-family:var(--font-sans)}
+.mock-tabs{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+.mock-tab{
+  font-family:var(--font-sans);font-size:12px;font-weight:700;color:var(--w-ink-2);
+  background:#141414;border:1px solid var(--w-line);border-radius:8px;padding:7px 13px;cursor:pointer;
+  transition:.15s;display:flex;align-items:center;gap:7px;
+}
+.mock-tab:hover{color:var(--w-ink);border-color:var(--w-line-3)}
+.mock-tab.active{background:linear-gradient(180deg,#fbbf24,#f59e0b);color:#1c1917;border-color:#fbbf24;box-shadow:0 4px 18px rgba(245,158,11,.25)}
+.mock-tab .idx{font-family:var(--font-num);font-size:11px;opacity:.7}
+.mock-hint{max-width:1120px;margin:0 auto;padding:12px 24px 0;font-size:11.5px;color:var(--w-ink-3);line-height:1.7}
+.mock-hint b{color:var(--amber-2);font-weight:700}
+.mock-hint code{font-family:var(--font-num);background:#141414;border:1px solid var(--w-line);border-radius:4px;padding:0 5px;color:var(--amber-3)}
+
+.view{display:none;padding:26px 24px 0;max-width:1120px;margin:0 auto}
+.view.active{display:block}
+.stage{display:flex;align-items:flex-start;gap:26px;flex-wrap:wrap}
+.stage-notes{flex:1;min-width:220px;max-width:300px;padding-top:8px}
+.note{padding:11px 13px;border-left:2px solid var(--amber);background:rgba(245,158,11,.05);border-radius:0 8px 8px 0;margin-bottom:10px}
+.note h4{margin:0 0 5px;font-size:11.5px;color:var(--amber-2);font-weight:700}
+.note p{margin:0;font-size:11px;line-height:1.65;color:var(--w-ink-2)}
+.note code{font-family:var(--font-num);color:var(--amber-3);background:#141414;padding:0 4px;border-radius:3px}
+
+/* =============================================================================
+   模拟主窗口：1000×700（对齐 tauri.conf.json main 窗口）
+   ============================================================================= */
+.app-window{
+  width:1000px;height:700px;flex:0 0 auto;display:flex;flex-direction:column;
+  background:#0d0d0d;border:1px solid #2a2a2a;border-radius:12px;overflow:hidden;
+  box-shadow:0 30px 80px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.02) inset;
+  position:relative;
+}
+.app-titlebar{
+  height:34px;flex:0 0 auto;display:flex;align-items:center;padding:0 12px;gap:10px;
+  background:linear-gradient(180deg,#161616,#101010);border-bottom:1px solid #222;
+}
+.app-titlebar .dots{display:flex;gap:6px}
+.app-titlebar .dots i{width:10px;height:10px;border-radius:50%;background:#2e2e2e}
+.app-titlebar .dots i:nth-child(1){background:#3a2a17}
+.app-titlebar .dots i:nth-child(2){background:#3a3320}
+.app-titlebar .dots i:nth-child(3){background:#1f3a24}
+.app-titlebar .title{font-size:11px;color:var(--w-ink-3);letter-spacing:.02em}
+
+.app-nav{
+  height:42px;flex:0 0 auto;display:flex;align-items:center;gap:2px;padding:0 12px;
+  background:#101010;border-bottom:1px solid #1f1f1f;
+}
+.app-nav button{
+  font-family:var(--font-sans);font-size:12px;color:var(--w-ink-3);background:transparent;border:0;
+  padding:7px 11px;border-radius:7px;cursor:pointer;font-weight:600;transition:.14s;position:relative;
+}
+.app-nav button:hover{color:var(--w-ink-2);background:#1a1a1a}
+.app-nav button.active{color:var(--amber-3);background:rgba(245,158,11,.1)}
+.app-nav button.active::after{content:"";position:absolute;left:10px;right:10px;bottom:-9px;height:2px;background:linear-gradient(90deg,transparent,var(--amber),transparent)}
+.app-nav .spacer{flex:1}
+.app-nav .ver{font-family:var(--font-num);font-size:10.5px;color:var(--w-ink-4)}
+
+.page-body{flex:1;min-height:0;padding:16px 18px 18px;display:flex;flex-direction:column;gap:12px;overflow:hidden}
+.page-head{display:flex;align-items:center;gap:14px;flex:0 0 auto}
+.page-head h1{margin:0;font-family:var(--font-serif);font-size:19px;font-weight:800;letter-spacing:.03em;color:#fafafa}
+.page-head .sub{margin:4px 0 0;font-size:11px;color:var(--w-ink-3)}
+.page-head .sub b{color:var(--amber-2);font-weight:700}
+.head-actions{margin-left:auto;display:flex;align-items:center;gap:8px}
+
+/* 白名单开关胶囊 */
+.wl-pill{
+  display:flex;align-items:center;gap:9px;padding:6px 10px;border-radius:9px;
+  background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.32);
+}
+.wl-pill.off{background:rgba(120,120,120,.07);border-color:#333}
+.wl-pill .lbl{font-size:11px;font-weight:700;color:#6ee7b7;line-height:1.15}
+.wl-pill.off .lbl{color:var(--w-ink-3)}
+.wl-pill .lbl small{display:block;font-size:9.5px;font-weight:400;color:var(--w-ink-3);margin-top:1px}
+.switch{width:32px;height:18px;border-radius:999px;background:#065f46;position:relative;flex:0 0 auto;cursor:pointer;transition:.18s;border:1px solid rgba(16,185,129,.4)}
+.switch::after{content:"";position:absolute;top:1.5px;left:16px;width:13px;height:13px;border-radius:50%;background:#a7f3d0;transition:.18s}
+.switch.off{background:#262626;border-color:#3a3a3a}
+.switch.off::after{left:1.5px;background:#8a8a8a}
+.btn{
+  font-family:var(--font-sans);font-size:11px;font-weight:700;display:inline-flex;align-items:center;gap:6px;
+  padding:7px 11px;border-radius:8px;border:1px solid var(--w-line-2);background:#1a1a1a;color:var(--w-ink-2);
+  cursor:pointer;transition:.14s;
+}
+.btn:hover{background:#222;color:var(--w-ink)}
+.btn.primary{background:linear-gradient(180deg,var(--amber-2),var(--amber));border-color:var(--amber);color:#1c1917}
+.btn.primary:hover{filter:brightness(1.07)}
+.btn.danger{color:#fca5a5;border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.08)}
+.btn.danger:hover{background:rgba(239,68,68,.16);color:#fecaca}
+.btn svg{width:13px;height:13px}
+.btn.sm{padding:5px 9px;font-size:10.5px}
+
+/* 统计条 */
+.stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;flex:0 0 auto}
+.stat{
+  background:var(--w-panel);border:1px solid var(--w-line);border-radius:10px;padding:9px 12px;
+  display:flex;flex-direction:column;gap:2px;position:relative;overflow:hidden;
+}
+.stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--amber);opacity:.55}
+.stat .num{font-family:var(--font-num);font-size:21px;line-height:1.1;color:var(--amber-2)}
+.stat .num small{font-size:11px;color:var(--w-ink-3);font-family:var(--font-sans);font-weight:400;margin-left:3px}
+.stat .cap{font-size:10px;color:var(--w-ink-3)}
+.stat.warn::before{background:#ef4444}
+.stat.warn .num{color:#fca5a5}
+
+/* 编辑器主区 */
+.editor-main{flex:1;min-height:0;display:flex;gap:12px}
+.card{background:var(--w-panel);border:1px solid var(--w-line);border-radius:12px;display:flex;flex-direction:column;min-height:0}
+.card>header{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #212121}
+.card>header .ttl{font-size:12px;font-weight:700;color:var(--w-ink)}
+.card>header .cnt{font-family:var(--font-num);font-size:11px;color:var(--amber-2);background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);border-radius:999px;padding:1px 8px}
+.lib{flex:1;min-width:0}
+.roster{width:308px;flex:0 0 auto}
+
+/* 工具栏 */
+.toolbar{flex:0 0 auto;padding:10px 12px 8px;border-bottom:1px solid #1d1d1d;display:flex;flex-direction:column;gap:8px}
+.tb-row{display:flex;align-items:center;gap:8px}
+.search{flex:1;position:relative;display:flex;align-items:center}
+.search svg{position:absolute;left:9px;width:13px;height:13px;color:var(--w-ink-4);pointer-events:none}
+.search input{
+  width:100%;background:#0d0d0d;border:1px solid var(--w-line);border-radius:8px;
+  padding:7px 9px 7px 28px;font-size:11.5px;color:var(--w-ink);font-family:var(--font-sans);outline:none;transition:.15s;
+}
+.search input::placeholder{color:var(--w-ink-4)}
+.search input:focus{border-color:rgba(245,158,11,.55);box-shadow:0 0 0 3px rgba(245,158,11,.08)}
+.seg{display:flex;background:#0d0d0d;border:1px solid var(--w-line);border-radius:8px;padding:2px;gap:2px}
+.seg button{
+  font-family:var(--font-sans);font-size:10.5px;font-weight:600;color:var(--w-ink-3);background:transparent;border:0;
+  padding:4px 9px;border-radius:6px;cursor:pointer;transition:.14s;white-space:nowrap;
+}
+.seg button:hover{color:var(--w-ink-2)}
+.seg button.active{background:#242424;color:var(--amber-3);font-weight:700}
+.tb-count{margin-left:auto;font-size:10.5px;color:var(--w-ink-4);font-family:var(--font-num);white-space:nowrap}
+
+/* 怪物图鉴网格 */
+.grid-wrap{flex:1;min-height:0;overflow-y:auto;padding:10px 12px 12px}
+.monster-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px}
+.mcard{
+  position:relative;background:rgba(8,8,8,.85);border:1px solid #232323;border-radius:10px;
+  padding:9px 6px 7px;text-align:center;cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s;
+}
+.mcard:hover{border-color:rgba(245,158,11,.5);transform:translateY(-2px);box-shadow:0 8px 20px rgba(0,0,0,.5)}
+.mcard.picked{border-color:rgba(245,158,11,.75);background:linear-gradient(180deg,rgba(245,158,11,.07),rgba(8,8,8,.9))}
+.mcard.picked::before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:2px;border-radius:2px;background:linear-gradient(180deg,var(--amber-3),rgba(245,158,11,.15))}
+.mcard .ic{
+  width:54px;height:54px;margin:0 auto 6px;display:block;object-fit:contain;
+  background:#000;border:1px solid #2c2c2c;border-radius:9px;padding:3px;
+}
+.mcard.wild .ic{border-color:#2f3a2a}
+.mcard .nm{
+  font-family:var(--font-serif);font-size:11px;line-height:1.3;color:#d4d4d4;
+  height:29px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
+  padding:0 2px;word-break:break-all;
+}
+.mcard.picked .nm{color:#fde68a}
+.mcard .meta{margin-top:4px;font-size:9px;color:var(--w-ink-4);display:flex;align-items:center;justify-content:center;gap:5px}
+.lv{display:inline-flex;align-items:center;gap:3px;font-size:8.5px;font-weight:700;padding:0 4px;border-radius:4px;height:13px}
+.lv.l0{color:var(--r-normal);background:rgba(199,192,171,.08)}
+.lv.l1{color:#c4b5fd;background:rgba(167,139,250,.13)}
+.lv.l2{color:#fdba74;background:rgba(255,160,46,.13)}
+.pick-dot{
+  position:absolute;top:6px;right:6px;width:15px;height:15px;border-radius:50%;
+  border:1.5px solid #3a3a3a;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;transition:.15s;
+}
+.pick-dot svg{width:9px;height:9px;color:#1c1917;opacity:0;transition:.15s}
+.mcard.picked .pick-dot{background:var(--amber-2);border-color:var(--amber-3);box-shadow:0 0 10px rgba(245,158,11,.5)}
+.mcard.picked .pick-dot svg{opacity:1}
+.edit-btn{
+  position:absolute;top:6px;left:6px;width:19px;height:19px;border-radius:6px;border:1px solid #333;background:rgba(10,10,10,.9);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;opacity:0;transition:.15s;padding:0;
+}
+.edit-btn svg{width:10px;height:10px;color:var(--w-ink-2)}
+.mcard:hover .edit-btn{opacity:1}
+.edit-btn:hover{background:var(--amber);border-color:var(--amber-2)}
+.edit-btn:hover svg{color:#1c1917}
+.grid-empty{padding:50px 0;text-align:center;color:var(--w-ink-4);font-size:11.5px}
+.grid-empty svg{width:32px;height:32px;color:#2e2e2e;margin-bottom:10px}
+
+/* 名单面板 */
+.roster-list{flex:1;min-height:0;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:5px}
+.rrow{
+  display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:8px;
+  background:rgba(8,8,8,.7);border:1px solid #202020;cursor:grab;transition:.14s;
+}
+.rrow:hover{border-color:#333;background:rgba(14,14,14,.85)}
+.rrow.dragging{opacity:.35;border-style:dashed;border-color:var(--amber)}
+.rrow.drop-target{border-color:rgba(245,158,11,.6)}
+.rrow .grip{flex:0 0 auto;color:#3f3f3f;display:flex}
+.rrow:hover .grip{color:#6b6b6b}
+.rrow .grip svg{width:11px;height:11px}
+.rrow .seq{font-family:var(--font-num);font-size:11px;color:var(--amber-2);width:16px;text-align:center;flex:0 0 auto}
+.rrow .ric{width:26px;height:26px;object-fit:contain;background:#000;border:1px solid #2c2c2c;border-radius:6px;padding:1px;flex:0 0 auto}
+.rrow .rn{flex:1;min-width:0;font-family:var(--font-serif);font-size:11px;color:#d9d9d9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rrow .ra{font-size:9px;color:var(--w-ink-4);flex:0 0 auto}
+.rrow .rm{flex:0 0 auto;background:transparent;border:0;color:#4a4a4a;cursor:pointer;padding:2px;border-radius:5px;display:flex;transition:.14s}
+.rrow .rm:hover{color:#fca5a5;background:rgba(239,68,68,.12)}
+.rrow .rm svg{width:11px;height:11px}
+.roster footer{flex:0 0 auto;padding:9px 10px;border-top:1px solid #1f1f1f}
+.roster footer .btn{width:100%;justify-content:center}
+.roster-note{padding:0 10px 9px;font-size:9.5px;color:var(--w-ink-4);line-height:1.6}
+
+/* 标注徽章 */
+.anno{
+  display:inline-flex;align-items:center;gap:4px;font-size:9.5px;font-weight:700;
+  background:rgba(245,158,11,.14);border:1px dashed rgba(245,158,11,.6);color:var(--amber-2);
+  border-radius:5px;padding:1px 6px;white-space:nowrap;
+}
+
+/* 设计稿操作反馈浮层 */
+.toast{
+  position:fixed;top:16px;left:50%;transform:translateX(-50%) translateY(-8px);z-index:300;
+  background:rgba(18,18,18,.97);border:1px solid rgba(245,158,11,.55);color:#fde68a;
+  font-size:12px;font-weight:600;padding:9px 16px;border-radius:10px;
+  box-shadow:0 14px 40px rgba(0,0,0,.7),0 0 20px rgba(245,158,11,.12);
+  opacity:0;transition:opacity .18s,transform .18s;pointer-events:none;max-width:70vw;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* =============================================================================
+   视图 2：条目编辑抽屉 + 图标选择器
+   ============================================================================= */
+.drawer-stage{position:relative;width:1000px;height:700px;flex:0 0 auto}
+.drawer-mask{position:absolute;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(1.5px);border-radius:12px;z-index:2}
+.drawer{
+  position:absolute;top:0;right:0;bottom:0;width:412px;z-index:4;display:flex;flex-direction:column;
+  background:#111;border-left:1px solid #2c2c2c;border-radius:0 12px 12px 0;box-shadow:-24px 0 60px rgba(0,0,0,.6);
+}
+.drawer>header{flex:0 0 auto;display:flex;align-items:center;gap:9px;padding:13px 14px;border-bottom:1px solid #222}
+.drawer>header .ttl{font-family:var(--font-serif);font-size:14px;font-weight:800;color:#fafafa}
+.drawer>header .src{font-size:9.5px;color:var(--w-ink-4);font-family:var(--font-num)}
+.drawer>header .x{margin-left:auto;background:transparent;border:0;color:var(--w-ink-3);cursor:pointer;padding:4px;border-radius:6px;display:flex}
+.drawer>header .x:hover{background:#222;color:#fff}
+.drawer>header .x svg{width:13px;height:13px}
+.drawer-body{flex:1;min-height:0;overflow-y:auto;padding:14px}
+.field{margin-bottom:14px}
+.field>label{display:block;font-size:10.5px;font-weight:700;color:var(--w-ink-3);margin-bottom:6px;letter-spacing:.02em}
+.field .hint{font-size:9.5px;color:var(--w-ink-4);margin-top:5px;line-height:1.6}
+.input{
+  width:100%;background:#0b0b0b;border:1px solid var(--w-line);border-radius:8px;padding:8px 10px;
+  font-size:12px;color:var(--w-ink);font-family:var(--font-sans);outline:none;transition:.15s;
+}
+.input:focus{border-color:rgba(245,158,11,.55);box-shadow:0 0 0 3px rgba(245,158,11,.08)}
+.input::placeholder{color:var(--w-ink-4)}
+
+.icon-edit{display:flex;align-items:center;gap:12px}
+.icon-edit .big{
+  width:78px;height:78px;object-fit:contain;background:#000;border:1px solid #2f2f2f;border-radius:12px;padding:5px;flex:0 0 auto;
+}
+.icon-edit .info{flex:1;min-width:0}
+.icon-edit .info .ipath{font-family:var(--font-num);font-size:10px;color:var(--w-ink-3);word-break:break-all;line-height:1.5}
+.icon-edit .info .btn{margin-top:7px}
+
+.lv-seg{display:flex;gap:6px}
+.lv-seg button{
+  flex:1;background:#0b0b0b;border:1px solid var(--w-line);border-radius:8px;padding:8px 0;cursor:pointer;
+  font-family:var(--font-sans);font-size:11px;font-weight:700;color:var(--w-ink-3);transition:.15s;display:flex;flex-direction:column;align-items:center;gap:3px;
+}
+.lv-seg button:hover{border-color:var(--w-line-3);color:var(--w-ink-2)}
+.lv-seg button.active{color:#0b0b0b}
+.lv-seg button.active.a0{background:linear-gradient(180deg,#d6d3d1,#a8a29e);border-color:#d6d3d1}
+.lv-seg button.active.a1{background:linear-gradient(180deg,#c4b5fd,#8b5cf6);border-color:#c4b5fd}
+.lv-seg button.active.a2{background:linear-gradient(180deg,#fdba74,#f97316);border-color:#fdba74}
+.lv-seg button small{font-weight:400;font-size:9px;opacity:.75}
+
+.alias-box{background:#0b0b0b;border:1px solid var(--w-line);border-radius:8px;padding:8px;display:flex;flex-wrap:wrap;gap:5px;min-height:42px}
+.chip{
+  display:inline-flex;align-items:center;gap:5px;background:#1d1d1d;border:1px solid #333;border-radius:6px;
+  padding:3px 6px 3px 8px;font-size:11px;color:#d4d4d4;font-family:var(--font-serif);
+}
+.chip.orig{border-color:rgba(245,158,11,.5);color:#fde68a;background:rgba(245,158,11,.08)}
+.chip.dup{border-color:rgba(239,68,68,.55);color:#fca5a5;background:rgba(239,68,68,.09)}
+.chip .x{background:transparent;border:0;color:inherit;opacity:.55;cursor:pointer;padding:0;display:flex;line-height:1}
+.chip .x:hover{opacity:1}
+.chip .x svg{width:9px;height:9px}
+.alias-input{border:0;background:transparent;outline:none;color:var(--w-ink);font-size:11.5px;font-family:var(--font-sans);flex:1;min-width:110px;padding:4px 2px}
+.alias-input::placeholder{color:var(--w-ink-4)}
+
+.alert{display:flex;gap:8px;padding:9px 10px;border-radius:8px;font-size:10.5px;line-height:1.6}
+.alert svg{width:13px;height:13px;flex:0 0 auto;margin-top:1px}
+.alert.warn{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);color:#fca5a5}
+.alert.info{background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.28);color:#93c5fd}
+.alert code{font-family:var(--font-num);color:#fcd34d}
+.drawer>footer{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:12px 14px;border-top:1px solid #222;background:#0d0d0d}
+.drawer>footer .spacer{flex:1}
+
+/* 图标选择器（二级弹层） */
+.icon-picker{
+  position:absolute;left:34px;top:60px;bottom:60px;width:404px;z-index:6;display:flex;flex-direction:column;
+  background:#101010;border:1px solid #2f2f2f;border-radius:12px;box-shadow:0 24px 70px rgba(0,0,0,.75);overflow:hidden;
+}
+.icon-picker>header{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #222}
+.icon-picker>header .ttl{font-size:12px;font-weight:700}
+.icon-picker>header .x{margin-left:auto;background:transparent;border:0;color:var(--w-ink-3);cursor:pointer;display:flex;padding:3px;border-radius:5px}
+.icon-picker>header .x:hover{background:#222;color:#fff}
+.icon-picker>header .x svg{width:12px;height:12px}
+.icon-picker .pk-tools{flex:0 0 auto;display:flex;gap:7px;padding:9px 12px;border-bottom:1px solid #1c1c1c;flex-wrap:wrap}
+.icon-picker .pk-grid{flex:1;min-height:0;overflow-y:auto;padding:10px 12px;display:grid;grid-template-columns:repeat(auto-fill,minmax(56px,1fr));gap:7px;align-content:start}
+.ipick{
+  position:relative;aspect-ratio:1;background:#000;border:1px solid #262626;border-radius:8px;padding:4px;cursor:pointer;transition:.14s;
+}
+.ipick img{width:100%;height:100%;object-fit:contain}
+.ipick:hover{border-color:rgba(245,158,11,.5)}
+.ipick.sel{border-color:var(--amber-2);box-shadow:0 0 0 2px rgba(245,158,11,.28)}
+.ipick.sel::after{content:"";position:absolute;right:3px;bottom:3px;width:7px;height:7px;border-radius:50%;background:var(--amber-2);box-shadow:0 0 6px var(--amber-2)}
+
+/* =============================================================================
+   视图 3：「点单排队管理」tab —— 选怪面板（替换原「快速手动点怪」文字表单）
+   ============================================================================= */
+.op-panel{width:392px;flex:0 0 auto}
+.op-tools{flex:0 0 auto;padding:9px 10px 8px;border-bottom:1px solid #1d1d1d;display:flex;flex-direction:column;gap:7px}
+.op-tools .search input{padding:6px 8px 6px 26px;font-size:11px}
+.op-tools .search svg{width:12px;height:12px}
+.op-segs{display:flex;gap:3px}
+.op-segs button{
+  font-family:var(--font-sans);font-size:10px;font-weight:600;color:var(--w-ink-3);background:#0d0d0d;
+  border:1px solid var(--w-line);border-radius:6px;padding:3px 7px;cursor:pointer;transition:.14s;white-space:nowrap;
+}
+.op-segs button:hover{color:var(--w-ink-2)}
+.op-segs button.active{background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.55);color:var(--amber-3);font-weight:700}
+.op-grid{
+  flex:1;min-height:0;overflow-y:auto;display:grid;grid-template-columns:repeat(4,1fr);gap:6px;align-content:start;
+  padding:8px 10px;
+}
+.oc{
+  position:relative;background:rgba(8,8,8,.85);border:1px solid #232323;border-radius:8px;
+  padding:6px 3px 5px;text-align:center;cursor:pointer;transition:.15s;
+}
+.oc:hover{border-color:rgba(245,158,11,.5);transform:translateY(-1px)}
+.oc.sel{border-color:var(--amber-2);background:rgba(245,158,11,.1);box-shadow:0 0 0 1px rgba(245,158,11,.35)}
+.oc.locked{opacity:.3;cursor:not-allowed;filter:grayscale(1)}
+.oc.locked:hover{transform:none;border-color:#232323}
+.oc img{width:38px;height:38px;object-fit:contain;background:#000;border:1px solid #2c2c2c;border-radius:6px;padding:2px;display:block;margin:0 auto 4px}
+.oc .nm{font-family:var(--font-serif);font-size:9.5px;color:#d4d4d4;line-height:1.25;height:24px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-all}
+.oc.sel .nm{color:#fde68a}
+.oc .lock-ic{position:absolute;top:4px;right:4px;width:10px;height:10px;color:#6b6b6b}
+.oc .lv{position:absolute;top:3px;left:3px;transform:scale(.92);transform-origin:top left}
+
+/* 选中确认卡 */
+.op-confirm{flex:0 0 auto;padding:9px 10px;border-top:1px solid #1f1f1f;background:rgba(10,10,10,.55)}
+.op-confirm .sel-line{display:flex;align-items:center;gap:8px;padding-bottom:8px;border-bottom:1px dashed #2c2c2c;margin-bottom:8px}
+.op-confirm .sel-line img{width:30px;height:30px;object-fit:contain;background:#000;border:1px solid #2c2c2c;border-radius:7px;padding:1px}
+.op-confirm .sel-line .m{font-family:var(--font-serif);font-size:12.5px;font-weight:800;color:#fde68a}
+.op-confirm .sel-line .an{font-size:9.5px;color:var(--w-ink-4);margin-top:1px}
+.op-confirm .crow{display:flex;gap:6px;margin-bottom:7px}
+.op-confirm input,.op-confirm select{
+  background:#0b0b0b;border:1px solid var(--w-line);border-radius:7px;color:var(--w-ink);
+  font-family:var(--font-sans);font-size:11px;padding:5px 7px;outline:none;width:100%;
+}
+.op-confirm input::placeholder{color:var(--w-ink-4)}
+.op-confirm input:focus,.op-confirm select:focus{border-color:rgba(245,158,11,.55)}
+.op-confirm .cfoot{display:flex;align-items:center;gap:8px}
+.op-confirm .prio{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--w-ink-2);cursor:pointer;flex:1}
+.op-confirm .prio input{width:auto}
+.op-confirm .go{
+  flex:0 0 auto;background:linear-gradient(180deg,var(--amber-2),var(--amber));border:1px solid var(--amber-2);border-radius:8px;
+  color:#1c1917;font-family:var(--font-sans);font-weight:800;font-size:12px;padding:7px 16px;cursor:pointer;letter-spacing:.04em;
+}
+.op-confirm .go:hover{filter:brightness(1.06)}
+.op-foot{flex:0 0 auto;padding:7px 10px;font-size:9.5px;color:var(--w-ink-4);display:flex;align-items:center;gap:6px;border-top:1px solid #1f1f1f}
+.op-foot svg{width:10px;height:10px}
+
+/* 右侧实时队列（复刻现网「当前排队列表」样式） */
+.queue-card{flex:1;min-width:0}
+.q-list{flex:1;min-height:0;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
+.q-row{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:10px;
+  border:1px solid var(--w-line);background:rgba(8,8,8,.8);transition:.15s;
+}
+.q-row:hover{border-color:var(--w-line-3)}
+.q-row[data-rarity="1"]{background:linear-gradient(90deg,rgba(88,28,135,.45),rgba(30,27,75,.25) 45%,rgba(0,0,0,.6));border-color:rgba(168,85,247,.65)}
+.q-row[data-rarity="2"]{background:linear-gradient(90deg,rgba(124,45,18,.45),rgba(127,29,29,.25) 45%,rgba(0,0,0,.6));border-color:rgba(249,115,22,.75)}
+.q-row[data-prio="1"]{border-color:rgba(239,68,68,.5)}
+.q-left{display:flex;align-items:center;gap:9px;min-width:0}
+.q-grip{color:#4a4a4a;flex:0 0 auto;display:flex}
+.q-grip svg{width:13px;height:13px}
+.q-seq{font-family:var(--font-num);font-size:13px;font-weight:700;color:var(--amber-2);width:20px;text-align:center;flex:0 0 auto}
+.q-ic{width:30px;height:30px;object-fit:contain;background:#000;border:1px solid #333;border-radius:7px;padding:1px;flex:0 0 auto}
+.q-info{min-width:0}
+.q-name{display:flex;align-items:center;gap:6px;font-family:var(--font-serif);font-size:12px;font-weight:700;color:#f5f5f5}
+.q-user{font-size:10.5px;color:var(--w-ink-3);margin-top:1px}
+.q-badge{font-size:8.5px;font-weight:700;padding:1px 5px;border-radius:4px;color:#fff;flex:0 0 auto}
+.q-badge.g1{background:linear-gradient(90deg,#dc2626,#f59e0b)}
+.q-badge.g2{background:linear-gradient(90deg,#9333ea,#ec4899)}
+.q-badge.g3{background:linear-gradient(90deg,#2563eb,#22d3ee)}
+.q-badge.l1{background:#7c3aed}
+.q-badge.l2{background:#ea580c}
+.q-badge.prio{background:#dc2626}
+.q-done{
+  padding:5px 10px;border-radius:8px;border:1px solid var(--w-line-2);background:#1a1a1a;color:var(--w-ink-2);
+  font-family:var(--font-sans);font-size:10.5px;font-weight:700;cursor:pointer;flex:0 0 auto;transition:.14s;
+}
+.q-done:hover{background:#dc2626;border-color:#dc2626;color:#fff}
+</style>
+</head>
+<body>
+
+<!-- ===================== 设计稿导航 ===================== -->
+<div class="mock-top">
+  <div class="mock-top-in">
+    <span class="mock-brand">点怪可选名单编辑器<em>视觉设计稿 · MonsterOrderTools V2</em></span>
+    <div class="mock-tabs">
+      <button class="mock-tab active" data-view="viewA"><span class="idx">01</span>名单编辑器</button>
+      <button class="mock-tab" data-view="viewB"><span class="idx">02</span>条目编辑抽屉</button>
+      <button class="mock-tab" data-view="viewC"><span class="idx">03</span>选怪面板·点单排队</button>
+    </div>
+  </div>
+</div>
+<p class="mock-hint">
+  数据取自真实字典 <code>monster_list.json</code>（175 条 · 432 张图鉴图标）。可交互：搜索 / 筛选 / 点击卡片切换入选 / 拖动右侧名单排序 / 查看条目编辑抽屉 / 在点单排队页点图标选怪。<br>
+  名单语义为<b>双重作用</b>：既是点单排队页选怪面板的候选池，也是弹幕点怪的白名单（名单外的点单请求不生效）。
+</p>
+
+<!-- ===================== 视图 01：主窗口「怪物名单」tab ===================== -->
+<section class="view active" id="viewA">
+  <div class="stage">
+    <div class="app-window" id="appWin">
+      <div class="app-titlebar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="title">怪猎荒野 弹幕点怪工具 V2 - 控制台</span>
+      </div>
+      <nav class="app-nav">
+        <button>点单排队管理</button>
+        <button>直播长连</button>
+        <button class="active">怪物名单</button>
+        <button>打卡系统</button>
+        <button>AI 陪聊</button>
+        <button>运行日志</button>
+        <button>参数设置</button>
+        <span class="spacer"></span>
+        <span class="ver">名单快照 v2.0.0</span>
+      </nav>
+
+      <div class="page-body">
+        <header class="page-head">
+          <div>
+            <h1>怪物名单</h1>
+            <p class="sub">点怪可选名单：决定「弹幕能被点的怪」与「选怪面板的候选」· 字典数据源 <b>monster_list.json</b></p>
+          </div>
+          <div class="head-actions">
+            <div class="wl-pill" id="wlPill">
+              <span class="lbl">弹幕白名单<small>名单外点单 → 静默忽略</small></span>
+              <span class="switch" id="wlSwitch" title="切换白名单生效状态"></span>
+            </div>
+            <button class="btn" id="listImport"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"/></svg>导入</button>
+            <button class="btn" id="listExport"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9m0 0 4 4m-4-4-4 4M5 5h14"/></svg>导出</button>
+          </div>
+        </header>
+
+        <div class="stat-grid">
+          <div class="stat"><span class="num" id="statTotal">175</span><span class="cap">字典怪物总数 · 覆盖 5 部作品</span></div>
+          <div class="stat"><span class="num" id="statPicked">0<small> / 175</small></span><span class="cap">已入选可选名单</span></div>
+          <div class="stat warn"><span class="num">2</span><span class="cap">别称冲突 · 字典序优先命中</span></div>
+        </div>
+
+        <div class="editor-main">
+          <section class="card lib">
+            <div class="toolbar">
+              <div class="tb-row">
+                <label class="search">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                  <input id="libSearch" placeholder="搜索怪物名 / 别称（试试：大胖虎、历战钢龙、霸主）…">
+                </label>
+                <span class="tb-count" id="libCount">175 项</span>
+                <button class="btn sm" id="pickAllResult" title="把当前筛选（作品 / 状态 / 关键词）命中的怪物批量加入可选名单">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M3 12h18M3 18h18"/><path d="m17 15 3 3-3 3" transform="translate(-1 -1)"/></svg>
+                  全选结果
+                </button>
+              </div>
+              <div class="tb-row">
+                <div class="seg" id="segGame">
+                  <button class="active" data-g="all">全部</button>
+                  <button data-g="MHWilds">荒野</button>
+                  <button data-g="MHWorld">世界</button>
+                  <button data-g="MHWI">冰原</button>
+                  <button data-g="MHRise">崛起</button>
+                  <button data-g="MHRS">曙光</button>
+                </div>
+                <div class="seg" id="segState">
+                  <button class="active" data-s="all">全部</button>
+                  <button data-s="in">已入选</button>
+                  <button data-s="out">未入选</button>
+                </div>
+              </div>
+            </div>
+            <div class="grid-wrap">
+              <div class="monster-grid" id="monsterGrid"></div>
+            </div>
+          </section>
+
+          <aside class="card roster">
+            <header>
+              <span class="ttl">可选名单</span>
+              <span class="cnt" id="rosterCnt">0</span>
+              <span style="flex:1"></span>
+              <button class="btn sm" id="rosterAll" title="把全部 175 个怪物加入可选名单">全选</button>
+              <button class="btn sm danger" id="rosterClear">清空</button>
+            </header>
+            <div class="roster-list" id="rosterList"></div>
+            <div class="roster-note">拖拽调整顺位 · 顺序决定选怪面板中的展示次序，常用怪建议置顶</div>
+            <footer><button class="btn" id="addCustom">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+              新增自定义怪物</button></footer>
+          </aside>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage-notes">
+      <div class="note">
+        <h4>入口形态</h4>
+        <p>顶部导航新增独立 tab「怪物名单」，位于「点单排队管理」之后。左侧为全量字典图鉴库，右侧为可选名单。</p>
+      </div>
+      <div class="note">
+        <h4>卡片交互</h4>
+        <p>点击卡片 = 入选 / 移出（右上角金勾同步）；悬停左上角铅笔 = 打开条目编辑抽屉（完整字典编辑）。</p>
+      </div>
+      <div class="note">
+        <h4>搜索命中别称</h4>
+        <p>搜索框同时匹配怪物原名与全部别称，可直接用黑话定位（如「大胖虎」→ 嗟怨震天怨虎龙）。</p>
+      </div>
+      <div class="note">
+        <h4>冲突守护</h4>
+        <p>统计卡「别称冲突」点击可直达冲突条目：同一别称被多个怪物占用时，运行时按字典序命中，编辑器在此显式告警。</p>
+      </div>
+      <div class="note">
+        <h4>全选与批量</h4>
+        <p>名单面板「全选」一键纳入全部 175 个怪物；图鉴库「全选结果」把当前筛选（作品 / 状态 / 关键词）命中的怪批量追加，便于按系列圈定本场池。</p>
+      </div>
+      <div class="note">
+        <h4>白名单开关</h4>
+        <p>关闭后弹幕可点全部字典怪物；开启时名单外的点单请求被静默忽略（后续可扩展为跑马灯提示「暂不可点」）。</p>
+      </div>
+    </div>
+  </div>
+</section>
+<!-- ===================== 视图 02：条目编辑抽屉（完整字典编辑） ===================== -->
+<section class="view" id="viewB">
+  <div class="stage">
+    <div class="drawer-stage" id="drawerStage">
+      <div class="drawer-mask"></div>
+
+      <div class="icon-picker">
+        <header>
+          <span class="ttl">选择图标</span>
+          <span class="tb-count" id="pkCount">432 张</span>
+          <button class="x" id="pkClose"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+        </header>
+        <div class="pk-tools">
+          <div class="seg" id="pkSeg">
+            <button class="active" data-p="all">全部</button>
+            <button data-p="MHWilds">荒野</button>
+            <button data-p="MHWorld">世界</button>
+            <button data-p="MHWI">冰原</button>
+            <button data-p="MHRise">崛起</button>
+            <button data-p="MHRS">曙光</button>
+          </div>
+          <label class="search" style="flex:1">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="pkSearch" placeholder="图标文件名…">
+          </label>
+        </div>
+        <div class="pk-grid" id="pkGrid"></div>
+      </div>
+
+      <aside class="drawer">
+        <header>
+          <span class="ttl">编辑怪物条目</span>
+          <span class="src">monster_list.json</span>
+          <button class="x" id="drawerClose"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+        </header>
+        <div class="drawer-body">
+          <div class="field">
+            <label>图鉴图标</label>
+            <div class="icon-edit">
+              <img class="big" id="editIcon" alt="">
+              <div class="info">
+                <div class="ipath" id="editIconPath"></div>
+                <button class="btn sm" id="changeIcon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M12 3v12m0-12 4 4m-4-4-4 4"/></svg>
+                  更换图标
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>怪物原名（字典 Key）</label>
+            <input class="input" id="editName" value="">
+            <div class="hint">修改原名会重建字典 Key —— 已排队条目保留旧名，不影响直播中的队列</div>
+          </div>
+
+          <div class="field">
+            <label>默认历战等级</label>
+            <div class="lv-seg" id="editLv">
+              <button class="a0 active" data-lv="0">普通<small>等级 0</small></button>
+              <button class="a1" data-lv="1">历战<small>等级 1 · 紫色</small></button>
+              <button class="a2" data-lv="2">历战王<small>等级 2 · 橙红</small></button>
+            </div>
+            <div class="hint">弹幕未写「历战 / 历战王 / AT」修饰词时，采用此默认值</div>
+          </div>
+
+          <div class="field">
+            <label>别称（回车添加）</label>
+            <div class="alias-box" id="aliasBox">
+              <input class="alias-input" id="aliasInput" placeholder="+ 输入别称后回车…">
+            </div>
+            <div class="hint">别称与弹幕文本做全字匹配（<code style="font-family:var(--font-num);color:var(--amber-3)">^…$</code>）；原名自动可作为别称参与匹配</div>
+          </div>
+
+          <div class="alert warn" id="dupAlert" style="display:none">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+            <span>别称「<b id="dupWord"></b>」与条目「<b id="dupOwner"></b>」重复：运行时按字典序优先命中，本条目该别称可能永不生效。建议更换或删除冲突项。</span>
+          </div>
+        </div>
+        <footer>
+          <button class="btn danger" id="delEntry">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>
+            删除条目
+          </button>
+          <span class="spacer"></span>
+          <button class="btn" id="drawerCancel">取消</button>
+          <button class="btn primary" id="drawerSave">保存到字典</button>
+        </footer>
+      </aside>
+    </div>
+
+    <div class="stage-notes">
+      <div class="note">
+        <h4>完整字典编辑</h4>
+        <p>抽屉即 <code>monster_list.json</code> 单条目编辑器：原名 / 图标 / 默认历战等级 / 别称增删，保存后写回字典并热重载匹配器。</p>
+      </div>
+      <div class="note">
+        <h4>图标选择器</h4>
+        <p>432 张随包图标按作品分组浏览；选中即回填，避免手写「MHRS/xxx_Icon.png」路径出错。</p>
+      </div>
+      <div class="note">
+        <h4>冲突实时校验</h4>
+        <p>添加别称时即时比对抗全字典；命中冲突给出运行时的真实结论（字典序命中哪一条），而非泛泛提示。</p>
+      </div>
+      <div class="note">
+        <h4>安全边界</h4>
+        <p>删除条目、改写原名属破坏性操作：保存前二次确认；运行中的匹配器在下次刷新时才切换，不打断当前队列。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== 视图 03：主窗口「点单排队管理」—— 选怪面板取代文字输入 ===================== -->
+<section class="view" id="viewC">
+  <div class="stage">
+    <div class="app-window">
+      <div class="app-titlebar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="title">怪猎荒野 弹幕点怪工具 V2 - 控制台</span>
+      </div>
+      <nav class="app-nav">
+        <button class="active">点单排队管理</button>
+        <button>直播长连</button>
+        <button>怪物名单</button>
+        <button>打卡系统</button>
+        <button>AI 陪聊</button>
+        <button>运行日志</button>
+        <button>参数设置</button>
+        <span class="spacer"></span>
+        <span class="ver">连接正常 · LIVE</span>
+      </nav>
+
+      <div class="page-body">
+        <header class="page-head">
+          <div>
+            <h1>点单排队管理</h1>
+            <p class="sub">点图标即点怪 · 候选受「<b>怪物名单</b>」约束（名单外置灰不可点）· 与弹幕点单写入同一条队列</p>
+          </div>
+          <div class="head-actions">
+            <span class="anno">原「快速手动点怪」文字表单已被本面板替换</span>
+            <span class="wl-pill" style="opacity:.9">
+              <span class="lbl">弹幕白名单<small>名单外点单 → 静默忽略</small></span>
+              <span class="switch" style="cursor:default"></span>
+            </span>
+          </div>
+        </header>
+
+        <div class="editor-main">
+          <!-- 左：选怪面板（取代原文字输入表单） -->
+          <section class="card op-panel">
+            <header>
+              <span class="ttl">选怪面板</span>
+              <span class="cnt" id="opCount">175</span>
+              <span style="flex:1"></span>
+              <span style="font-size:9.5px;color:var(--w-ink-4)">点图标 → 确认 → 入队</span>
+            </header>
+            <div class="op-tools">
+              <label class="search">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                <input id="opSearch" placeholder="搜索怪物 / 别称，点图标即点怪…">
+              </label>
+              <div class="op-segs" id="opSegs">
+                <button class="active" data-g="all">全部</button>
+                <button data-g="MHWilds">荒野</button>
+                <button data-g="MHWorld">世界</button>
+                <button data-g="MHWI">冰原</button>
+                <button data-g="MHRise">崛起</button>
+                <button data-g="MHRS">曙光</button>
+              </div>
+            </div>
+            <div class="op-grid" id="opGrid"></div>
+            <div class="op-confirm" id="opConfirm">
+              <div class="sel-line">
+                <img id="opSelIcon" alt="">
+                <div>
+                  <div class="m" id="opSelName"></div>
+                  <div class="an" id="opSelAlias"></div>
+                </div>
+              </div>
+              <div class="crow"><input id="opUser" placeholder="水友昵称（留空 → 以「房管」身份入队）"></div>
+              <div class="crow">
+                <select id="opGuard">
+                  <option value="0">身份：普通水友</option>
+                  <option value="3">身份：舰长（三等）</option>
+                  <option value="2">身份：提督（二等）</option>
+                  <option value="1">身份：总督（一等）</option>
+                </select>
+                <select id="opTempered">
+                  <option value="default">难度：默认（跟随字典）</option>
+                  <option value="0">难度：普通</option>
+                  <option value="1">难度：历战</option>
+                  <option value="2">难度：历战王</option>
+                </select>
+              </div>
+              <div class="cfoot">
+                <label class="prio"><input type="checkbox" id="opPrio"> 优先插队</label>
+                <button class="go" id="opGo">加入排队</button>
+              </div>
+            </div>
+            <div class="op-foot">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+              <span id="opFootTip">名单外的怪物已置灰不可点 · 弹幕白名单生效中</span>
+            </div>
+          </section>
+
+          <!-- 右：实时队列（沿用现网样式） -->
+          <aside class="card queue-card">
+            <header>
+              <span class="ttl">当前排队列表</span>
+              <span class="cnt" id="qCount">3</span>
+              <span style="flex:1"></span>
+              <button class="btn sm danger">清空队列</button>
+            </header>
+            <div class="q-list" id="qList"></div>
+          </aside>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage-notes">
+      <div class="note">
+        <h4>替换关系</h4>
+        <p>原「快速手动点怪」要求输入怪物名/别称并靠模糊匹配，现已整体替换为选怪面板：点图标即可点怪，零输入、零拼错。</p>
+      </div>
+      <div class="note">
+        <h4>名单约束可视化</h4>
+        <p>候选池即「怪物名单」的入选怪；搜索命中的名单外怪物以置灰 + 锁标记呈现，点击只提示拦截原因，不会入队。</p>
+      </div>
+      <div class="note">
+        <h4>确认卡语义</h4>
+        <p>水友昵称 / 身份（总督·提督·舰长·普通） / 难度（跟随字典或强制历战等级） / 优先插队 —— 房管代水友下单时一次填齐，写入与弹幕点单同一条队列。</p>
+      </div>
+      <div class="note">
+        <h4>与弹幕的关系</h4>
+        <p>弹幕「点怪 xxx」仍走别名模糊匹配并在悬浮窗展示队列；面板用于直播中代点与水友诉求的快速响应，两条路径共享名单约束。</p>
+      </div>
+      <div class="note">
+        <h4>Lite 模式</h4>
+        <p>该功能在 <code>ONLY_ORDER_MONSTER=1</code> 下同样可用（属核心点怪能力），不依赖 TTS / 打卡 / AI 模块。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script id="monster-data" type="application/json">[{"n":"霸主雌火龙","i":"MHRise/MHRS-Apex_Rathian_Icon.png","t":0,"a":["霸主雌火","霸主太太","霸主雌火龙"],"g":"MHRise"},{"n":"烈祸月迅龙","i":"MHRS/MHRS-Lucent_Nargacuga_Icon.png","t":0,"a":["烈祸月迅","烈祸月迅龙"],"g":"MHRS"},{"n":"土砂龙","i":"MHWorld/MHWI-Barroth_Icon.png","t":0,"a":["土砂","土砂龙"],"g":"MHWorld"},{"n":"骨锤龙","i":"MHWorld/MHWI-Radobaan_Icon.png","t":0,"a":["骨锤","骨锤龙"],"g":"MHWorld"},{"n":"刺花蜘蛛","i":"MHWilds/MHWilds-Lala_Barina_Icon.png","t":0,"a":["呲花","刺花蜘蛛"],"g":"MHWilds"},{"n":"嗟怨震天怨虎龙","i":"MHRS/MHRS-Scorned_Magnamalo_Icon.png","t":0,"a":["明日香","霸天虎","大胖虎","独眼胖虎","震天虎","嗟怨震天怨虎龙"],"g":"MHRS"},{"n":"大痹贼龙","i":"MHWorld/MHWI-Great_Girros_Icon.png","t":0,"a":["痹贼","大凶颚龙","凶颚龙","大痹贼龙"],"g":"MHWorld"},{"n":"霸主青熊兽","i":"MHRise/MHRS-Apex_Arzuros_Icon.png","t":0,"a":["霸主青熊","霸主青熊兽"],"g":"MHRise"},{"n":"火龙","i":"MHWilds/MHWilds-Rathalos_Icon.png","t":0,"a":["雄火龙","雄火","天空王者","天空亡者","火龙"],"g":"MHWilds"},{"n":"冰人鱼龙","i":"MHRS/MHRS-Aurora_Somnacanth_Icon.png","t":0,"a":["冰人鱼","冰人鱼龙"],"g":"MHRS"},{"n":"岩龙","i":"MHRise/MHRS-Basarios_Icon.png","t":0,"a":["岩龙"],"g":"MHRise"},{"n":"风漂龙","i":"MHWorld/MHWI-Legiana_Icon.png","t":0,"a":["风漂","风飘","风飘龙","风漂龙"],"g":"MHWorld"},{"n":"眩鸟","i":"MHWorld/MHWI-Tzitzi-Ya-Ku_Icon.png","t":0,"a":["战地记者","记者","眩鸟"],"g":"MHWorld"},{"n":"尸套龙","i":"MHWorld/MHWI-Vaal_Hazak_Icon.png","t":0,"a":["尸套","尸套龙"],"g":"MHWorld"},{"n":"再会雷狼龙","i":"MHWI/MHWI-Zinogre_Icon.png","t":0,"a":["再会雷狼龙","炭只狼","碳只狼","炭治郎"],"g":"MHWI"},{"n":"霸主角龙","i":"MHRise/MHRS-Apex_Diablos_Icon.png","t":0,"a":["霸主角龙"],"g":"MHRise"},{"n":"霸主火龙","i":"MHRise/MHRS-Apex_Rathalos_Icon.png","t":0,"a":["霸主雄火龙","霸主火龙"],"g":"MHRise"},{"n":"痹毒龙","i":"MHWI/MHWI-Viper_Tobi-Kadachi_Icon.png","t":0,"a":["痹毒","痹毒龙"],"g":"MHWI"},{"n":"樱火龙","i":"MHWorld/MHWI-Pink_Rathian_Icon.png","t":0,"a":["樱火","樱火龙"],"g":"MHWorld"},{"n":"风暴的棺材","i":"MHWorld_Tempered/MHWI-Tempered_Kushala_Daora.png","t":1,"a":["历战钢龙","风暴的棺材","棺材"],"g":"MHWorld"},{"n":"影蜘蛛","i":"MHWilds/MHWilds-Nerscylla_Hatchling_Icon.png","t":0,"a":["影蜘蛛"],"g":"MHWilds"},{"n":"毒妖鸟","i":"MHWorld/MHWI-Pukei-Pukei_Icon.png","t":0,"a":["毒妖","毒妖鸟"],"g":"MHWorld"},{"n":"海龙","i":"MHWilds/MHWilds-Lagiacrus_Icon.png","t":0,"a":["海龙"],"g":"MHWilds"},{"n":"雾瘴尸套龙","i":"MHWI/MHWI-Blackveil_Vaal_Hazak_Icon.png","t":0,"a":["雾瘴尸套","花嫁尸套龙","花嫁尸套","雾瘴尸套龙"],"g":"MHWI"},{"n":"百龙渊源雷神龙","i":"MHRise/MHRS-Narwa_the_Allmother_Icon.png","t":0,"a":["百龙渊源","百雷","渊雷","百龙渊源雷神龙"],"g":"MHRise"},{"n":"霞龙","i":"MHRise/MHRS-Chameleos_Icon.png","t":0,"a":["霞龙"],"g":"MHRise"},{"n":"黑狼鸟","i":"MHWI/MHWI-Yian_Garuga_Icon.png","t":0,"a":["黑疯子","黑狼","黑鸡","黑狼鸟"],"g":"MHWI"},{"n":"猛牛龙","i":"MHWI/MHWI-Banbaro_Icon.png","t":0,"a":["猛牛","牛牛","猛牛龙"],"g":"MHWI"},{"n":"煌黑龙","i":"MHWI/MHWI-Alatreon_Icon.png","t":0,"a":["煌黑","羊驼","煌尼玛","黄黑龙","黄尼玛","草泥马","黎明死星","黄昏黑星","煌黑龙"],"g":"MHWI"},{"n":"烈祸棘茶龙","i":"MHRS/MHRS-Flaming_Espinas_Icon.png","t":0,"a":["烈祸棘茶","烈祸棘","烈祸棘茶龙"],"g":"MHRS"},{"n":"怪异克服钢龙","i":"MHRS_Risen/MHRS-Risen_Kushala_Daora_Icon.png","t":0,"a":["怪克钢龙","300钢龙","怪异克服钢龙"],"g":"MHRS"},{"n":"月迅龙","i":"MHRS/MHRS-Lucent_Nargacuga_Icon.png","t":0,"a":["月迅","月迅龙"],"g":"MHRS"},{"n":"雷狼龙","i":"MHWI/MHWI-Zinogre_Icon.png","t":0,"a":["雷狼","雷娘","雷狗","雷狼龙"],"g":"MHWI"},{"n":"250霞龙","i":"MHRise/MHRS-Chameleos_Icon.png","t":0,"a":["250霞龙"],"g":"MHRise"},{"n":"恐暴龙","i":"MHWorld/MHWI-Deviljho_Icon.png","t":0,"a":["恐暴","丝瓜","黄瓜","金瓜","恐暴龙"],"g":"MHWorld"},{"n":"冻峰龙","i":"MHWilds/MHWilds-Jin_Dahaad_Icon.png","t":0,"a":["冻峰","东风龙","东风","冻峰龙"],"g":"MHWilds"},{"n":"焰狐龙","i":"MHRS/MHRS-Violet_Mizutsune_Icon.png","t":0,"a":["焰狐","紫色答辩","焰狐龙"],"g":"MHRS"},{"n":"泥翁龙","i":"MHRise/MHRS-Almudron_Icon.png","t":0,"a":["泥翁","泥翁龙"],"g":"MHRise"},{"n":"辟兽","i":"MHWilds/MHWilds-Doshaguma_Icon.png","t":0,"a":["p兽","P兽","阿p","阿P","辟兽"],"g":"MHWilds"},{"n":"泥鱼龙","i":"MHWorld/MHWI-Jyuratodus_Icon.png","t":0,"a":["泥鱼","泥鱼龙"],"g":"MHWorld"},{"n":"护辟兽","i":"MHWilds/MHWilds-Guardian_Doshaguma_Icon.png","t":0,"a":["护辟","护p","护p兽","护P","护P兽","护阿p","护阿P","护辟兽"],"g":"MHWilds"},{"n":"妃蜘蛛","i":"MHRise/MHRS-Rakna-Kadaki_Icon.png","t":0,"a":["妃蜘蛛"],"g":"MHRise"},{"n":"人鱼龙","i":"MHRise/MHRS-Somnacanth_Icon.png","t":0,"a":["人鱼","怪异人鱼","怪异化人鱼龙","怪异化人鱼","怪异人鱼龙","300人鱼","300人鱼龙","人鱼龙"],"g":"MHRise"},{"n":"风铗龙","i":"MHWilds/MHWilds-Hirabami_Icon.png","t":0,"a":["风铗","风夹龙","风霞龙","风铗龙"],"g":"MHWilds"},{"n":"沙海龙","i":"MHWilds/MHWilds-Balahara_Icon.png","t":0,"a":["沙海","沙海龙"],"g":"MHWilds"},{"n":"棘龙","i":"MHRS/MHRS-Espinas_Icon.png","t":0,"a":["怪异克服棘龙","怪克棘龙","棘龙"],"g":"MHRS"},{"n":"黑角龙","i":"MHWorld/MHWI-Black_Diablos_Icon.png","t":0,"a":["黑角","黑光炯炯","黑角龙"],"g":"MHWorld"},{"n":"暗器蛸","i":"MHWilds/MHWilds-Xu_Wu_Icon.png","t":0,"a":["暗器","暗器烧","暗器蛸"],"g":"MHWilds"},{"n":"爆鳞龙","i":"MHWorld/MHWI-Bazelgeuse_Icon.png","t":0,"a":["爆鳞","B52","上位爆鳞龙","上位爆鳞","阿爆","爆鳞龙"],"g":"MHWorld"},{"n":"250炎王龙 250炎王","i":"MHRise/MHRS-Teostra_Icon.png","t":0,"a":["250炎王龙 250炎王"],"g":"MHRise"},{"n":"惶怒恐暴龙","i":"MHWI/MHWI-Savage_Deviljho_Icon.png","t":0,"a":["惶怒","酱瓜","瓜瓜","阿瓜","惶怒恐暴龙"],"g":"MHWI"},{"n":"水妖鸟","i":"MHWI/MHWI-Coral_Pukei-Pukei_Icon.png","t":0,"a":["水妖","水妖鸟"],"g":"MHWI"},{"n":"白炽龙","i":"MHWilds/MHWilds-Zoh_Shia_Icon.png","t":0,"a":["白炽","白炽龙","白炽灯","白痴","白痴龙"],"g":"MHWilds"},{"n":"绯天狗兽","i":"MHRS/MHRS-Blood_Orange_Bishaten_Icon.png","t":0,"a":["绯天狗","绯天狗兽"],"g":"MHRS"},{"n":"青熊兽","i":"MHRise/MHRS-Arzuros_Icon.png","t":0,"a":["青熊","青熊兽"],"g":"MHRise"},{"n":"爵银龙","i":"MHRS/MHRS-Malzeno_Icon.png","t":0,"a":["爵银","爵银龙"],"g":"MHRS"},{"n":"狱狼龙","i":"MHWI/MHWI-Stygian_Zinogre_Icon.png","t":0,"a":["狱狼","狱娘","黑狗","狱狼龙"],"g":"MHWI"},{"n":"古代鹿首精","i":"MHWorld/MHWI-Leshen_Icon.png","t":0,"a":["古代鹿","古代鹿首精"],"g":"MHWorld"},{"n":"飞雷龙","i":"MHWorld/MHWI-Tobi-Kadachi_Icon.png","t":0,"a":["飞雷","飞雷龙"],"g":"MHWorld"},{"n":"炎妃龙","i":"MHWorld/MHWI-Lunastra_Icon.png","t":0,"a":["炎妃","蓝猫","蓝色粪怪","疯婆子","蓝色答辩","娜娜","炎妃龙"],"g":"MHWorld"},{"n":"赤甲兽","i":"MHRise/MHRS-Volvidon_Icon.png","t":0,"a":["赤甲","赤甲兽"],"g":"MHRise"},{"n":"炎尾龙","i":"MHWilds/MHWilds-Quematrice_Icon.png","t":0,"a":["鸡哥","坤坤","炎尾","炎尾龙"],"g":"MHWilds"},{"n":"棘茶龙","i":"MHRS/MHRS-Flaming_Espinas_Icon.png","t":0,"a":["茶几","茶几龙","棘茶","棘茶龙"],"g":"MHRS"},{"n":"炎王龙","i":"MHWorld/MHWI-Teostra_Icon.png","t":0,"a":["炎王","红猫","炎喵","红喵","火喵","粉喵","火炎王","粉炎王","炎王龙"],"g":"MHWorld"},{"n":"天狗兽","i":"MHRise/MHRS-Bishaten_Icon.png","t":0,"a":["天狗","舔狗","舔狗兽","天狗兽"],"g":"MHRise"},{"n":"冥赤龙","i":"MHWI/MHWI-Safijiiva_Icon.png","t":0,"a":["赤龙","冥赤","冥赤龙"],"g":"MHWI"},{"n":"将军镰蟹","i":"MHRS/MHRS-Shogun_Ceanataur_Icon.png","t":0,"a":["镰蟹","将军镰蟹"],"g":"MHRS"},{"n":"银火龙","i":"MHWI/MHWI-Silver_Rathalos_Icon.png","t":0,"a":["银火","银火龙"],"g":"MHWI"},{"n":"镰鼬龙王","i":"MHRise/MHRS-Great_Izuchi_Icon.png","t":0,"a":["镰鼬","镰鼬龙","镰鼬龙王"],"g":"MHRise"},{"n":"贝希摩斯","i":"MHWorld/MHWI-Behemoth_Icon.png","t":0,"a":["贝","贝希摩斯"],"g":"MHWorld"},{"n":"电龙","i":"MHRS/MHRS-Astalos_Icon.png","t":0,"a":["电龙"],"g":"MHRS"},{"n":"护火龙","i":"MHWilds/MHWilds-Guardian_Rathalos_Icon.png","t":0,"a":["护火","护火龙"],"g":"MHWilds"},{"n":"岚龙","i":"MHRS/MHRS-Amatsu_Icon.png","t":0,"a":["岚妹","岚龙"],"g":"MHRS"},{"n":"冥灯龙","i":"MHWorld/MHWI-Xenojiiva_Icon.png","t":0,"a":["小明","冥灯","冥灯龙"],"g":"MHWorld"},{"n":"岩贼龙","i":"MHWorld/MHWI-Dodogama_Icon.png","t":0,"a":["肥宅","岩贼龙"],"g":"MHWorld"},{"n":"我的高贵灵魂","i":"MHWorld_Tempered/MHWI-Tempered_Lunastra.png","t":1,"a":["高贵灵魂","我的高贵灵魂"],"g":"MHWorld"},{"n":"冰鱼龙","i":"MHWI/MHWI-Beotodus_Icon.png","t":0,"a":["冰鱼","冰鱼龙"],"g":"MHWI"},{"n":"灭日","i":"MHWorld_Tempered/MHWI-Tempered_Teostra.png","t":1,"a":["灭日"],"g":"MHWorld"},{"n":"水兽","i":"MHRise/MHRS-Royal_Ludroth_Icon.png","t":0,"a":["香蕉","怪异克服水兽","怪克水兽","怪异水兽","水兽"],"g":"MHRise"},{"n":"奇怪龙","i":"MHRise/MHRS-Khezu_Icon.png","t":0,"a":["夫鲁夫鲁","奇怪牛牛","奇怪龙"],"g":"MHRise"},{"n":"原初形态爵银龙","i":"MHRS/MHRS-Primordial_Malzeno_Icon.png","t":0,"a":["原爵","烈祸爵银","烈祸爵","原初爵银","原初爵","原初形态爵银龙","原初形态爵银龙"],"g":"MHRS"},{"n":"蛮颚龙","i":"MHWorld/MHWI-Anjanath_Icon.png","t":0,"a":["蛮颚","蛮颚龙","蛮鄂龙","蛮鄂"],"g":"MHWorld"},{"n":"250钢龙","i":"MHWorld/MHWI-Kushala_Daora_Icon.png","t":0,"a":["250钢龙"],"g":"MHWorld"},{"n":"天地煌啼龙","i":"MHWI/MHWI-Shara_Ishvalda_Icon.png","t":0,"a":["弟弟龙","地啼龙","天地煌啼","天地煌啼龙"],"g":"MHWI"},{"n":"桃毛兽王","i":"MHWilds/MHWilds-Congalala_Icon.png","t":0,"a":["大桃毛","桃毛","桃毛兽王"],"g":"MHWilds"},{"n":"雪狮子王","i":"MHWilds/MHWilds-Blangonga_Icon.png","t":0,"a":["雪狮子","大雪狮子","大雪狮","雪狮子王"],"g":"MHWilds"},{"n":"最后的白骑士","i":"MHWI_Tempered/MHWI-Tempered_Barioth_Icon.png","t":1,"a":["历战霜牙","历战霜刃冰牙","历战霜冰","最后的白骑士","历战霜刃冰牙龙"],"g":"MHWI"},{"n":"雪鬼兽","i":"MHRise/MHRS-Goss_Harag_Icon.png","t":0,"a":["雪鬼","双刀哥","双刀侠","雪鬼兽"],"g":"MHRise"},{"n":"眠狗龙王","i":"MHRise/MHRS-Great_Baggi_Icon.png","t":0,"a":["眠狗","眠狗龙","眠狗龙王"],"g":"MHRise"},{"n":"护雷颚龙","i":"MHWilds/MHWilds-Guardian_Fulgur_Anjanath_Icon.png","t":0,"a":["护雷","护雷颚龙","护雷颚","护雷鄂"],"g":"MHWilds"},{"n":"雷颚龙","i":"MHWI/MHWI-Fulgur_Anjanath_Icon.png","t":0,"a":["雷颚","雷颚龙","雷鄂龙","雷鄂"],"g":"MHWI"},{"n":"钢龙","i":"MHWorld/MHWI-Kushala_Daora_Icon.png","t":0,"a":["钢钢子","阿钢","钢龙"],"g":"MHWorld"},{"n":"270天彗龙 270天彗","i":"MHRise/MHRS-Crimson_Glow_Valstrax_Icon.png","t":0,"a":["270天彗龙 270天彗"],"g":"MHRise"},{"n":"千刃龙","i":"MHWilds/MHWilds-Seregios_Icon.png","t":0,"a":["千刃","千刃鸡","松果鸡","千刃鸡","千刃龙"],"g":"MHWilds"},{"n":"红莲爆鳞龙","i":"MHWI/MHWI-Seething_Bazelgeuse_Icon.png","t":0,"a":["红莲","红莲爆鳞","红莲阿爆","红莲爆鳞龙"],"g":"MHWI"},{"n":"战痕黑狼鸟","i":"MHWI_Tempered/MHWI-Tempered_Scarred_Yian_Garuga_Icon.png","t":1,"a":["战痕黑鸡","战痕","战痕黑狼鸟"],"g":"MHWI"},{"n":"黑轰龙","i":"MHWI/MHWI-Brute_Tigrex_Icon.png","t":0,"a":["黑轰","白轰","白轰龙","黑轰龙"],"g":"MHWI"},{"n":"锁刃龙","i":"MHWilds/MHWilds-Arkveld_Icon.png","t":0,"a":["锁刃","普锁","锁刃龙"],"g":"MHWilds"},{"n":"斩龙","i":"MHWI/MHWI-Glavenus_Icon.png","t":0,"a":["斩龙"],"g":"MHWI"},{"n":"搔鸟","i":"MHWorld/MHWI-Kulu-Ya-Ku_Icon.png","t":0,"a":["骚鸟","搔鸟"],"g":"MHWorld"},{"n":"混沌黑蚀龙","i":"MHRS/MHRS-Chaotic_Gore_Magala_Icon.png","t":0,"a":["混沌黑蚀","奥利奥","混沌黑丝","混沌黑蚀龙"],"g":"MHRS"},{"n":"溟波龙","i":"MHWI/MHWI-Namielle_Icon.png","t":0,"a":["溟波","溟波龙","冥波","冥波龙","明波龙","马桶"],"g":"MHWI"},{"n":"熔翁龙","i":"MHRS/MHRS-Magma_Almudron_Icon.png","t":0,"a":["熔翁","熔翁龙"],"g":"MHRS"},{"n":"护凶爪龙","i":"MHWilds/MHWilds-Guardian_Ebony_Odogaron_Icon.png","t":0,"a":["凶爪","凶爪龙","护凶","护凶爪龙"],"g":"MHWilds"},{"n":"溟呼远响","i":"MHWI_ArchTempered/MHWI-Arch_Tempered_Namielle_Icon.png","t":2,"a":["王溟波","历战王溟波龙","王冥波","历战王冥波龙","溟呼远响","王明波","王马桶"],"g":"MHWI"},{"n":"鹿首精","i":"MHWorld/MHWI-Leshen_Icon.png","t":0,"a":["鹿首精"],"g":"MHWorld"},{"n":"爆锤龙","i":"MHWorld/MHWI-Uragaan_Icon.png","t":0,"a":["爆锤","姚明","车轮滚滚","暴锤","暴锤龙","爆锤龙"],"g":"MHWorld"},{"n":"刚缠兽","i":"MHRS/MHRS-Garangolm_Icon.png","t":0,"a":["刚缠","刚缠兽"],"g":"MHRS"},{"n":"铠龙","i":"MHWilds/MHWilds-Gravios_Icon.png","t":0,"a":["铠龙"],"g":"MHWilds"},{"n":"熔山龙","i":"MHWorld/MHWI-Zorah_Magdaros_Icon.png","t":0,"a":["熔山","熔山龙"],"g":"MHWorld"},{"n":"大贼龙","i":"MHWorld/MHWI-Great_Jagras_Icon.png","t":0,"a":["中分哥","大凶豺龙","凶豺龙","贼龙","大贼龙"],"g":"MHWorld"},{"n":"凶爪龙","i":"MHWI/MHWI-Ebony_Odogaron_Icon.png","t":0,"a":["凶爪","凶爪龙"],"g":"MHWI"},{"n":"黑蚀龙","i":"MHWilds/MHWilds-Gore_Magala_Icon.png","t":0,"a":["黑蚀","黑丝","嗨丝","黑蚀龙"],"g":"MHWilds"},{"n":"霜刃冰牙龙","i":"MHWI/MHWI-Frostfang_Barioth_Icon.png","t":0,"a":["霜牙","霜刃冰牙","霜冰","霜刃冰牙龙"],"g":"MHWI"},{"n":"神秘红光天彗龙","i":"MHRise/MHRS-Crimson_Glow_Valstrax_Icon.png","t":0,"a":["天彗","天彗龙","神秘红光天彗龙"],"g":"MHRise"},{"n":"狱焰蛸","i":"MHWilds/MHWilds-Nu_Udra_Icon.png","t":0,"a":["章鱼","章鱼烧","大章鱼","狱焰蛸","狱焰烧","狱炎蛸","狱炎烧","火章鱼"],"g":"MHWilds"},{"n":"暗夜渔火","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Nu_Udra.png","t":2,"a":["暗夜渔火，纳吾诅咒","暗夜渔火纳吾诅咒","王章鱼","王章鱼烧","王大章鱼","王狱焰蛸","王狱焰烧","王狱炎蛸","王狱炎烧","王火章鱼","历战王章鱼","历战王章鱼烧","历战王大章鱼","历战王狱焰蛸","历战王狱焰烧","历战王狱炎蛸","历战王狱炎烧","历战王火章鱼"],"g":"MHWilds"},{"n":"激昂金狮子","i":"MHWI/MHWI-Furious_Rajang_Icon.png","t":0,"a":["激昂","超级赛亚人","赛亚人","超赛","拉詹很生气","激昂金狮子"],"g":"MHWI"},{"n":"极贝","i":"MHWorld/MHWI-Behemoth_Icon.png","t":0,"a":["极贝"],"g":"MHWorld"},{"n":"雷神龙","i":"MHRise/MHRS-Thunder_Serpent_Narwa_Icon.png","t":0,"a":["雷神","雷神龙"],"g":"MHRise"},{"n":"冰狼龙","i":"MHRS/MHRS-Lunagaron_Icon.png","t":0,"a":["冰狼","加鲁鲁","兽人加鲁鲁","冰狼龙"],"g":"MHRS"},{"n":"煌雷龙","i":"MHWilds/MHWilds-Rey_Dau_Icon.png","t":0,"a":["黄磊","煌雷","黄雷","煌雷龙"],"g":"MHWilds"},{"n":"无言的闪光","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Rey_Dau.png","t":2,"a":["王黄磊","王煌雷","王雷","王黄雷","王煌雷龙","历战王黄磊","历战王煌雷","历战王雷","历战王黄雷","历战王煌雷龙","无言的闪光","屋檐的闪光","无语的闪光"],"g":"MHWilds"},{"n":"角龙","i":"MHWorld/MHWI-Diablos_Icon.png","t":0,"a":["角龙"],"g":"MHWorld"},{"n":"冰呪龙","i":"MHWI/MHWI-Velkhana_Icon.png","t":0,"a":["冰呪","冰粥","冰呪龙","冰粥龙","冰冰子","冰咒","冰咒龙","冰冰"],"g":"MHWI"},{"n":"怪异克服霞龙","i":"MHRS_Risen/MHRS-Risen_Chameleos_Icon.png","t":0,"a":["怪克霞龙","300霞龙","怪异克服霞龙"],"g":"MHRS"},{"n":"雌火龙","i":"MHWilds/MHWilds-Rathian_Icon.png","t":0,"a":["雌火","太太","雌火龙"],"g":"MHWilds"},{"n":"炽妃蜘蛛","i":"MHRS/MHRS-Pyre_Rakna-Kadaki_Icon.png","t":0,"a":["红蜘蛛","炽妃蜘蛛"],"g":"MHRS"},{"n":"猛爆碎龙","i":"MHWI/MHWI-Raging_Brachydios_Icon.png","t":0,"a":["猛爆","萌宝","爆碎","萌宝碎龙","猛爆碎龙"],"g":"MHWI"},{"n":"怪异克服天彗龙","i":"MHRS_Risen/MHRS-Risen_Crimson_Glow_Valstrax_Icon.png","t":0,"a":["怪异克服天彗","怪克天彗龙","怪克天彗","300天彗","300天彗龙","怪异克服天彗龙"],"g":"MHRS"},{"n":"苍火龙","i":"MHWorld/MHWI-Azure_Rathalos_Icon.png","t":0,"a":["苍火","苍火龙"],"g":"MHWorld"},{"n":"冰牙龙","i":"MHWI/MHWI-Barioth_Icon.png","t":0,"a":["冰牙","白色答辩","灵活的狗","山里灵活的狗","白色粪怪","冰牙龙"],"g":"MHWI"},{"n":"金狮子","i":"MHWI/MHWI-Rajang_Icon.png","t":0,"a":["辣酱","金狮子"],"g":"MHWI"},{"n":"风神龙","i":"MHRise/MHRS-Wind_Serpent_Ibushi_Icon.png","t":0,"a":["风神","风神龙"],"g":"MHRise"},{"n":"毒怪鸟","i":"MHWilds/MHWilds-Gypceros_Icon.png","t":0,"a":["毒怪鸟"],"g":"MHWilds"},{"n":"浮空龙","i":"MHWorld/MHWI-Paolumu_Icon.png","t":0,"a":["浮空","浮空龙"],"g":"MHWorld"},{"n":"白兔兽","i":"MHRise/MHRS-Lagombi_Icon.png","t":0,"a":["白兔","白兔兽"],"g":"MHRise"},{"n":"怪异克服炎王龙","i":"MHRS_Risen/MHRS-Risen_Teostra_Icon.png","t":0,"a":["怪异克服炎王","怪克炎王龙","怪克炎王","300炎王","300炎王龙","怪异克服炎王龙"],"g":"MHRS"},{"n":"护锁刃龙","i":"MHWilds/MHWilds-Guardian_Arkveld_Icon.png","t":0,"a":["护锁刃","护锁","护锁刃龙"],"g":"MHWilds"},{"n":"金火龙","i":"MHWI/MHWI-Gold_Rathian_Icon.png","t":0,"a":["金火","金火龙"],"g":"MHWI"},{"n":"泡狐龙","i":"MHWilds/MHWilds-Mizutsune_Icon.png","t":0,"a":["泡狐","泡泡","泡狐龙"],"g":"MHWilds"},{"n":"迅龙","i":"MHWI/MHWI-Nargacuga_Icon.png","t":0,"a":["迅喵","迅龙"],"g":"MHWI"},{"n":"波衣龙","i":"MHWilds/MHWilds-Uth_Duna_Icon.png","t":0,"a":["boy龙","boi龙","boi","波一龙","波衣龙"],"g":"MHWilds"},{"n":"涟漪涤得残垣清，独爱安眠古都静","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Uth_Duna.png","t":2,"a":["涟漪涤得残垣清","涟漪涤得残垣清，独爱安眠古都静","王boy龙","王boy","王boi龙","王boi","王波一龙","王波衣龙","历战王boy龙","历战王boy","历战王boi龙","历战王boi","历战王波一龙","历战王波衣龙"],"g":"MHWilds"},{"n":"霸主雷狼龙","i":"MHRise/MHRS-Apex_Zinogre_Icon.png","t":0,"a":["霸主雷狼","霸主雷娘","霸主雷狗","霸主雷狼龙"],"g":"MHRise"},{"n":"毒狗龙王","i":"MHRise/MHRS-Great_Wroggi_Icon.png","t":0,"a":["毒狗","怪异克服毒狗龙王","怪克毒狗龙王","怪异克服毒狗","怪克毒狗","怪异毒狗","怪异毒狗龙","怪异毒狗龙王","毒狗龙王"],"g":"MHRise"},{"n":"浮眠龙","i":"MHWI/MHWI-Nightshade_Paolumu_Icon.png","t":0,"a":["浮眠","眠浮","眠浮龙","浮眠龙"],"g":"MHWI"},{"n":"黑龙","i":"MHWI/MHWI-Fatalis_Icon.png","t":0,"a":["米拉","米拉小姐","嗨龙","米拉波雷亚斯","尼龙","黑龙"],"g":"MHWI"},{"n":"麒麟","i":"MHWorld/MHWI-Kirin_Icon.png","t":0,"a":["电驴","断角麒麟","彩虹小马","小马","麒麟"],"g":"MHWorld"},{"n":"惨爪龙","i":"MHWorld/MHWI-Odogaron_Icon.png","t":0,"a":["惨爪","惨爪龙"],"g":"MHWorld"},{"n":"碎龙","i":"MHWI/MHWI-Brachydios_Icon.png","t":0,"a":["碎龙"],"g":"MHWI"},{"n":"灭尽龙","i":"MHWorld/MHWI-Nergigante_Icon.png","t":0,"a":["灭尽","上位咩咩","上位灭尽龙","上位灭尽","上位咩咩子","灭尽龙","咩","咩咩子"],"g":"MHWorld"},{"n":"冥渊龙","i":"MHRS/MHRS-Gaismagorm_Icon.png","t":0,"a":["冥渊","冥渊龙"],"g":"MHRS"},{"n":"怨虎龙","i":"MHRise/MHRS-Magnamalo_Icon.png","t":0,"a":["胖虎","胖虎龙","怨虎龙"],"g":"MHRise"},{"n":"缠蛙","i":"MHWilds/MHWilds-Chatacabra_Icon.png","t":0,"a":["蛙蛙","缠蛙"],"g":"MHWilds"},{"n":"赫猿兽","i":"MHWilds/MHWilds-Ajarakan_Icon.png","t":0,"a":["二刺螈","二刺猿","火猴","火猴子","赫猿兽"],"g":"MHWilds"},{"n":"伞鸟","i":"MHRise/MHRS-Aknosom_Icon.png","t":0,"a":["唐伞妖怪","怪异伞鸟","怪异化伞鸟","300伞鸟","伞鸟"],"g":"MHRise"},{"n":"歼世灭尽龙","i":"MHWI/MHWI-Ruiner_Nergigante_Icon.png","t":0,"a":["歼灭","歼咩","花嫁灭尽","花嫁灭尽龙","花嫁歼咩","花嫁歼灭","咩咩","歼世灭尽龙"],"g":"MHWI"},{"n":"雪花沉睡","i":"MHWI_ArchTempered/MHWI-Arch_Tempered_Velkhana_Icon.png","t":2,"a":["王冰","王冰呪","王冰粥","王冰呪龙","王冰粥龙","王冰咒","王冰冰","历战王冰","历战王冰呪","历战王冰粥","历战王冰呪龙","历战王冰粥龙","历战王冰咒","历战王冰冰","雪花沉睡"],"g":"MHWI"},{"n":"轰龙","i":"MHWI/MHWI-Tigrex_Icon.png","t":0,"a":["车龙","车车车龙","车车车","车车龙","轰爬爬","轰龙"],"g":"MHWI"},{"n":"绚辉龙","i":"MHWorld/MHWI-Kulve_Taroth_Icon.png","t":0,"a":["富婆","渣渣辉","绚辉","绚辉龙"],"g":"MHWorld"},{"n":"你是黄金奖杯","i":"MHWI_Tempered/MHWI-Tempered_Furious_Rajang_Icon.png","t":1,"a":["奖杯","黄金奖杯","原神","猿神","你是黄金奖杯","历战激昂金狮子","历战激昂","J8"],"g":"MHWI"},{"n":"沼喷龙","i":"MHWilds/MHWilds-Rompopolo_Icon.png","t":0,"a":["蚊子","蚊子龙","嗦你屁眼","嗦你皮炎","嗦你皮燕","沼喷龙"],"g":"MHWilds"},{"n":"霸主泡狐龙","i":"MHRise/MHRS-Apex_Mizutsune_Icon.png","t":0,"a":["霸主泡狐","霸主泡狐龙"],"g":"MHRise"},{"n":"天廻龙","i":"MHRS/MHRS-Shagaru_Magala_Icon.png","t":0,"a":["天廻","天回","天回龙","白丝","天廻龙"],"g":"MHRS"},{"n":"硫斩龙","i":"MHWI/MHWI-Acidic_Glavenus_Icon.png","t":0,"a":["硫斩","流斩","硫斩龙"],"g":"MHWI"},{"n":"怪鸟","i":"MHWilds/MHWilds-Yian_Kut-Ku_Icon.png","t":0,"a":["大怪鸟","羊库库","老师","怪鸟"],"g":"MHWilds"},{"n":"熔岩龙","i":"MHWorld/MHWI-Lavasioth_Icon.png","t":0,"a":["烤鱼","熔岩龙"],"g":"MHWorld"},{"n":"霜翼风漂龙","i":"MHWI/MHWI-Shrieking_Legiana_Icon.png","t":0,"a":["霜漂","霜飘","霜翼风漂","霜翼风飘龙","霜翼风飘","霜翼风漂龙"],"g":"MHWI"},{"n":"怪异克服天廻龙","i":"MHRS_Risen/MHRS-Risen_Shagaru_Magala_Icon.png","t":0,"a":["怪异克服天廻","怪克天廻龙","怪克天廻","怪异克服天回","怪克天回龙","怪克天回","300天回","300天廻","怪异克服天廻龙"],"g":"MHRS"},{"n":"大名盾蟹","i":"MHRS/MHRS-Daimyo_Hermitaur_Icon.png","t":0,"a":["盾蟹","大名盾蟹"],"g":"MHRS"},{"n":"零式游星欧米茄","i":"MHWilds_Tempered/MHWilds-Tempered_Omega_Planetes.png","t":1,"a":["零式欧米茄","零式欧米加","历战欧米茄","历战欧米加","零食欧米茄","零食欧米加","零式","零食","历战游星欧米茄","历战游星欧米加","零式游星欧米茄","零食游星欧米茄","零式游星欧米加","零食游星欧米加","历战游星欧米茄","历战游星欧米加"],"g":"MHWilds"},{"n":"游星欧米茄","i":"MHWilds/MHWilds-Omega_Planetes_Icon.png","t":0,"a":["欧米茄","欧米加","游星欧米茄","游星欧米加"],"g":"MHWilds"},{"n":"犹大环的心脏","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Jin_Dahaad.png","t":2,"a":["犹大环的心脏","历战王冻峰龙","王冻峰龙","王冻峰","王冻","历战王东风龙","王东风龙","王东风"],"g":"MHWilds"},{"n":"走出孤独，名为自由","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Arkveld.png","t":2,"a":["走出孤独，名为自由","历战王锁刃龙","王锁刃龙","王锁刃","王锁","王所"],"g":"MHWilds"}]</script>
+<script id="icon-data" type="application/json">["MHRS/MHRS-Amatsu_Icon.png","MHRS/MHRS-Astalos_Icon.png","MHRS/MHRS-Aurora_Somnacanth_Icon.png","MHRS/MHRS-Blood_Orange_Bishaten_Icon.png","MHRS/MHRS-Boggi_Icon.png","MHRS/MHRS-Ceanataur_Icon.png","MHRS/MHRS-Chaotic_Gore_Magala_Icon.png","MHRS/MHRS-Daimyo_Hermitaur_Icon.png","MHRS/MHRS-Espinas_Icon.png","MHRS/MHRS-Flaming_Espinas_Icon.png","MHRS/MHRS-Furious_Rajang_Icon.png","MHRS/MHRS-Gaismagorm_Icon.png","MHRS/MHRS-Garangolm_Icon.png","MHRS/MHRS-Gold_Rathian_Icon.png","MHRS/MHRS-Gore_Magala_Icon.png","MHRS/MHRS-Gowngoat_Icon.png","MHRS/MHRS-Hermitaur_Icon.png","MHRS/MHRS-Hornetaur_Icon.png","MHRS/MHRS-Lucent_Nargacuga_Icon.png","MHRS/MHRS-Lunagaron_Icon.png","MHRS/MHRS-Magma_Almudron_Icon.png","MHRS/MHRS-Malzeno_Icon.png","MHRS/MHRS-Primordial_Malzeno_Icon.png","MHRS/MHRS-Pyrantula_Icon.png","MHRS/MHRS-Pyre_Rakna-Kadaki_Icon.png","MHRS/MHRS-Risen_Chameleos_Icon.png","MHRS/MHRS-Risen_Crimson_Glow_Valstrax_Icon.png","MHRS/MHRS-Risen_Kushala_Daora_Icon.png","MHRS/MHRS-Risen_Shagaru_Magala_Icon.png","MHRS/MHRS-Risen_Teostra_Icon.png","MHRS/MHRS-Scorned_Magnamalo_Icon.png","MHRS/MHRS-Seething_Bazelgeuse_Icon.png","MHRS/MHRS-Seregios_Icon.png","MHRS/MHRS-Shagaru_Magala_Icon.png","MHRS/MHRS-Shogun_Ceanataur_Icon.png","MHRS/MHRS-Silver_Rathalos_Icon.png","MHRS/MHRS-Velkhana_Icon.png","MHRS/MHRS-Velociprey_Icon.png","MHRS/MHRS-Vespoid_Icon.png","MHRS/MHRS-Violet_Mizutsune_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Aknosom_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Almudron_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Anjanath_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Arzuros_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Astalos_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Aurora_Somnacanth_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Barioth_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Barroth_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Basarios_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Bazelgeuse_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Bishaten_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Blood_Orange_Bishaten_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Chaotic_Gore_Magala_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Daimyo_Hermitaur_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Diablos_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Espinas_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Flaming_Espinas_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Furious_Rajang_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Garangolm_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Gold_Rathian_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Gore_Magala_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Goss_Harag_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Great_Baggi_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Great_Izuchi_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Great_Wroggi_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Jyuratodus_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Khezu_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Kulu-Ya-Ku_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Lagombi_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Lunagaron_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Magma_Almudron_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Magnamalo_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Mizutsune_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Nargacuga_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Pukei-Pukei_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Pyre_Rakna-Kadaki_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Rajang_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Rakna-Kadaki_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Rathalos_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Rathian_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Royal_Ludroth_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Scorned_Magnamalo_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Seething_Bazelgeuse_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Seregios_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Shogun_Ceanataur_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Silver_Rathalos_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Somnacanth_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Tetranadon_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Tigrex_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Tobi-Kadachi_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Volvidon_Icon.png","MHRS_Afflicted/MHRS-Afflicted_Zinogre_Icon.png","MHRS_Afflicted/MHRS-Qurio_Effect_Icon.png","MHRS_Risen/MHRS-Risen_Chameleos_Icon.png","MHRS_Risen/MHRS-Risen_Crimson_Glow_Valstrax_Icon.png","MHRS_Risen/MHRS-Risen_Kushala_Daora_Icon.png","MHRS_Risen/MHRS-Risen_Shagaru_Magala_Icon.png","MHRS_Risen/MHRS-Risen_Teostra_Icon.png","MHRise/MHRS-Aknosom_Icon.png","MHRise/MHRS-Almudron_Icon.png","MHRise/MHRS-Altaroth_Icon.png","MHRise/MHRS-Anjanath_Icon.png","MHRise/MHRS-Anteka_Icon.png","MHRise/MHRS-Apex_Arzuros_Icon.png","MHRise/MHRS-Apex_Diablos_Icon.png","MHRise/MHRS-Apex_Mizutsune_Icon.png","MHRise/MHRS-Apex_Rathalos_Icon.png","MHRise/MHRS-Apex_Rathian_Icon.png","MHRise/MHRS-Apex_Zinogre_Icon.png","MHRise/MHRS-Arzuros_Icon.png","MHRise/MHRS-Baggi_Icon.png","MHRise/MHRS-Barioth_Icon.png","MHRise/MHRS-Barroth_Icon.png","MHRise/MHRS-Basarios_Icon.png","MHRise/MHRS-Bazelgeuse_Icon.png","MHRise/MHRS-Bishaten_Icon.png","MHRise/MHRS-Bnahabra_Icon.png","MHRise/MHRS-Bombadgy_Icon.png","MHRise/MHRS-Bullfango_Icon.png","MHRise/MHRS-Chameleos_Icon.png","MHRise/MHRS-Crimson_Glow_Valstrax_Icon.png","MHRise/MHRS-Delex_Icon.png","MHRise/MHRS-Diablos_Icon.png","MHRise/MHRS-Felyne_Icon.png","MHRise/MHRS-Gajau_Icon.png","MHRise/MHRS-Gargwa_Icon.png","MHRise/MHRS-Goss_Harag_Icon.png","MHRise/MHRS-Great_Baggi_Icon.png","MHRise/MHRS-Great_Izuchi_Icon.png","MHRise/MHRS-Great_Wroggi_Icon.png","MHRise/MHRS-Izuchi_Icon.png","MHRise/MHRS-Jaggi_Icon.png","MHRise/MHRS-Jaggia_Icon.png","MHRise/MHRS-Jagras_Icon.png","MHRise/MHRS-Jyuratodus_Icon.png","MHRise/MHRS-Kelbi_Icon.png","MHRise/MHRS-Kestodon_Female_Icon.png","MHRise/MHRS-Kestodon_Male_Icon.png","MHRise/MHRS-Khezu_Icon.png","MHRise/MHRS-Kulu-Ya-Ku_Icon.png","MHRise/MHRS-Kushala_Daora_Icon.png","MHRise/MHRS-Lagombi_Icon.png","MHRise/MHRS-Ludroth_Icon.png","MHRise/MHRS-Magnamalo_Icon.png","MHRise/MHRS-Melynx_Development_Icon.png","MHRise/MHRS-Melynx_Icon.png","MHRise/MHRS-Mizutsune_Icon.png","MHRise/MHRS-Nargacuga_Icon.png","MHRise/MHRS-Narwa_the_Allmother_Icon.png","MHRise/MHRS-Popo_Icon.png","MHRise/MHRS-Pukei-Pukei_Icon.png","MHRise/MHRS-Rachnoid_Icon.png","MHRise/MHRS-Rajang_Icon.png","MHRise/MHRS-Rakna-Kadaki_Icon.png","MHRise/MHRS-Rathalos_Icon.png","MHRise/MHRS-Rathian_Icon.png","MHRise/MHRS-Remobra_Icon.png","MHRise/MHRS-Rhenoplos_Icon.png","MHRise/MHRS-Royal_Ludroth_Icon.png","MHRise/MHRS-Slagtoth_Icon.png","MHRise/MHRS-Somnacanth_Icon.png","MHRise/MHRS-Teostra_Icon.png","MHRise/MHRS-Tetranadon_Icon.png","MHRise/MHRS-Thunder_Serpent_Narwa_Icon.png","MHRise/MHRS-Tigrex_Icon.png","MHRise/MHRS-Tobi-Kadachi_Icon.png","MHRise/MHRS-Uroktor_Icon.png","MHRise/MHRS-Volvidon_Icon.png","MHRise/MHRS-Wind_Serpent_Ibushi_Icon.png","MHRise/MHRS-Wroggi_Icon.png","MHRise/MHRS-Zamite_Icon.png","MHRise/MHRS-Zinogre_Icon.png","MHRise/test_out.png","MHWI/MHWI-Acidic_Glavenus_Icon.png","MHWI/MHWI-Alatreon_Icon.png","MHWI/MHWI-Anteka_Icon.png","MHWI/MHWI-Banbaro_Icon.png","MHWI/MHWI-Barioth_Icon.png","MHWI/MHWI-Beotodus_Icon.png","MHWI/MHWI-Blackveil_Vaal_Hazak_Icon.png","MHWI/MHWI-Boaboa_Icon.png","MHWI/MHWI-Brachydios_Icon.png","MHWI/MHWI-Brute_Tigrex_Icon.png","MHWI/MHWI-Coral_Pukei-Pukei_Icon.png","MHWI/MHWI-Cortos_Icon.png","MHWI/MHWI-Ebony_Odogaron_Icon.png","MHWI/MHWI-Fatalis_Icon.png","MHWI/MHWI-Frostfang_Barioth_Icon.png","MHWI/MHWI-Fulgur_Anjanath_Icon.png","MHWI/MHWI-Furious_Rajang_Icon.png","MHWI/MHWI-Glavenus_Icon.png","MHWI/MHWI-Gold_Rathian_Icon.png","MHWI/MHWI-Namielle_Icon.png","MHWI/MHWI-Nargacuga_Icon.png","MHWI/MHWI-Nightshade_Paolumu_Icon.png","MHWI/MHWI-Popo_Icon.png","MHWI/MHWI-Raging_Brachydios_Icon.png","MHWI/MHWI-Rajang_Icon.png","MHWI/MHWI-Ruiner_Nergigante_Icon.png","MHWI/MHWI-Safijiiva_Icon.png","MHWI/MHWI-Savage_Deviljho_Icon.png","MHWI/MHWI-Scarred_Yian_Garuga_Icon.png","MHWI/MHWI-Seething_Bazelgeuse_Icon.png","MHWI/MHWI-Shara_Ishvalda_Icon.png","MHWI/MHWI-Shrieking_Legiana_Icon.png","MHWI/MHWI-Silver_Rathalos_Icon.png","MHWI/MHWI-Stygian_Zinogre_Icon.png","MHWI/MHWI-Tigrex_Icon.png","MHWI/MHWI-Velkhana_Icon.png","MHWI/MHWI-Viper_Tobi-Kadachi_Icon.png","MHWI/MHWI-Wulg_Icon.png","MHWI/MHWI-Yian_Garuga_Icon.png","MHWI/MHWI-Zinogre_Icon.png","MHWI_ArchTempered/MHWI-Arch_Tempered_Namielle_Icon.png","MHWI_ArchTempered/MHWI-Arch_Tempered_Velkhana_Icon.png","MHWI_Tempered/MHWI-Tempered_Acidic_Glavenus_Icon.png","MHWI_Tempered/MHWI-Tempered_Banbaro_Icon.png","MHWI_Tempered/MHWI-Tempered_Barioth_Icon.png","MHWI_Tempered/MHWI-Tempered_Beotodus_Icon.png","MHWI_Tempered/MHWI-Tempered_Blackveil_Vaal_Hazak_Icon.png","MHWI_Tempered/MHWI-Tempered_Brachydios_Icon.png","MHWI_Tempered/MHWI-Tempered_Brute_Tigrex_Icon.png","MHWI_Tempered/MHWI-Tempered_Coral_Pukei-Pukei_Icon.png","MHWI_Tempered/MHWI-Tempered_Ebony_Odogaron_Icon.png","MHWI_Tempered/MHWI-Tempered_Frostfang_Barioth_Icon.png","MHWI_Tempered/MHWI-Tempered_Fulgur_Anjanath_Icon.png","MHWI_Tempered/MHWI-Tempered_Furious_Rajang_Icon.png","MHWI_Tempered/MHWI-Tempered_Glavenus_Icon.png","MHWI_Tempered/MHWI-Tempered_Gold_Rathian_Icon.png","MHWI_Tempered/MHWI-Tempered_Namielle_Icon.png","MHWI_Tempered/MHWI-Tempered_Nargacuga_Icon.png","MHWI_Tempered/MHWI-Tempered_Nightshade_Paolumu_Icon.png","MHWI_Tempered/MHWI-Tempered_Rajang_Icon.png","MHWI_Tempered/MHWI-Tempered_Ruiner_Nergigante_Icon.png","MHWI_Tempered/MHWI-Tempered_Savage_Deviljho_Icon.png","MHWI_Tempered/MHWI-Tempered_Scarred_Yian_Garuga_Icon.png","MHWI_Tempered/MHWI-Tempered_Seething_Bazelgeuse_Icon.png","MHWI_Tempered/MHWI-Tempered_Shrieking_Legiana_Icon.png","MHWI_Tempered/MHWI-Tempered_Silver_Rathalos_Icon.png","MHWI_Tempered/MHWI-Tempered_Stygian_Zinogre_Icon.png","MHWI_Tempered/MHWI-Tempered_Tigrex_Icon.png","MHWI_Tempered/MHWI-Tempered_Velkhana_Icon.png","MHWI_Tempered/MHWI-Tempered_Viper_Tobi-Kadachi_Icon.png","MHWI_Tempered/MHWI-Tempered_Zinogre_Icon.png","MHWilds/MHWilds-Ajarakan_Icon.png","MHWilds/MHWilds-Alpha_Doshaguma_Icon.png","MHWilds/MHWilds-Arkveld_Icon.png","MHWilds/MHWilds-Balahara_Icon.png","MHWilds/MHWilds-Baunos_Icon.png","MHWilds/MHWilds-Blango_Icon.png","MHWilds/MHWilds-Blangonga_Icon.png","MHWilds/MHWilds-Bulaqchi_Icon.png","MHWilds/MHWilds-Ceratonoth_Icon.png","MHWilds/MHWilds-Chatacabra_Icon.png","MHWilds/MHWilds-Comaqchi_Icon.png","MHWilds/MHWilds-Conga_Icon.png","MHWilds/MHWilds-Congalala_Icon.png","MHWilds/MHWilds-Dalthydon_Icon.png","MHWilds/MHWilds-Doshaguma_Icon.png","MHWilds/MHWilds-Gajios_Icon.png","MHWilds/MHWilds-Gelidron_Icon.png","MHWilds/MHWilds-Gogmazios_Icon.png","MHWilds/MHWilds-Gore_Magala_Icon.png","MHWilds/MHWilds-Gravios_Icon.png","MHWilds/MHWilds-Guardian_Arkveld_Icon.png","MHWilds/MHWilds-Guardian_Doshaguma_Icon.png","MHWilds/MHWilds-Guardian_Ebony_Odogaron_Icon.png","MHWilds/MHWilds-Guardian_Fulgur_Anjanath_Icon.png","MHWilds/MHWilds-Guardian_Rathalos_Icon.png","MHWilds/MHWilds-Guardian_Seikret_Icon.png","MHWilds/MHWilds-Gypceros_Icon.png","MHWilds/MHWilds-Harpios_Icon.png","MHWilds/MHWilds-Hirabami_Icon.png","MHWilds/MHWilds-Jin_Dahaad_Icon.png","MHWilds/MHWilds-Kranodath_Icon.png","MHWilds/MHWilds-Lagiacrus_Icon.png","MHWilds/MHWilds-Lala_Barina_Icon.png","MHWilds/MHWilds-Mizutsune_Icon.png","MHWilds/MHWilds-Nerscylla_Hatchling_Icon.png","MHWilds/MHWilds-Nerscylla_Icon.png","MHWilds/MHWilds-Nu_Udra_Icon.png","MHWilds/MHWilds-Omega_Micros_Icon.png","MHWilds/MHWilds-Omega_Planetes_Icon.png","MHWilds/MHWilds-Piragill_Icon.png","MHWilds/MHWilds-Porkeplume_Icon.png","MHWilds/MHWilds-Quematrice_Icon.png","MHWilds/MHWilds-Question_Mark_Icon.png","MHWilds/MHWilds-Rafma_Icon.png","MHWilds/MHWilds-Rathalos_Icon.png","MHWilds/MHWilds-Rathian_Icon.png","MHWilds/MHWilds-Rey_Dau_Icon.png","MHWilds/MHWilds-Rompopolo_Icon.png","MHWilds/MHWilds-Seregios_Icon.png","MHWilds/MHWilds-Talioth_Icon.png","MHWilds/MHWilds-Uth_Duna_Icon.png","MHWilds/MHWilds-Vespoid_Icon.png","MHWilds/MHWilds-Xu_Wu_Icon.png","MHWilds/MHWilds-Yian_Kut-Ku_Icon.png","MHWilds/MHWilds-Zoh_Shia_Icon.png","MHWilds_ArchTempered/MHWilds-Arch_Tempered_Arkveld.png","MHWilds_ArchTempered/MHWilds-Arch_Tempered_Jin_Dahaad.png","MHWilds_ArchTempered/MHWilds-Arch_Tempered_Nu_Udra.png","MHWilds_ArchTempered/MHWilds-Arch_Tempered_Rey_Dau.png","MHWilds_ArchTempered/MHWilds-Arch_Tempered_Uth_Duna.png","MHWilds_Frenzied/MHWilds-Frenzied_Blangonga.png","MHWilds_Frenzied/MHWilds-Frenzied_Gypceros.png","MHWilds_Frenzied/MHWilds-Frenzied_Hirabami.png","MHWilds_Frenzied/MHWilds-Frenzied_Nerscylla.png","MHWilds_Frenzied/MHWilds-Frenzied_Yian_Kut-Ku.png","MHWilds_Tempered/MHWilds-Tempered_Ajarakan.png","MHWilds_Tempered/MHWilds-Tempered_Arkveld.png","MHWilds_Tempered/MHWilds-Tempered_Balahara.png","MHWilds_Tempered/MHWilds-Tempered_Blangonga.png","MHWilds_Tempered/MHWilds-Tempered_Chatacabra.png","MHWilds_Tempered/MHWilds-Tempered_Congalala.png","MHWilds_Tempered/MHWilds-Tempered_Doshaguma.png","MHWilds_Tempered/MHWilds-Tempered_Gore_Magala.png","MHWilds_Tempered/MHWilds-Tempered_Gravios.png","MHWilds_Tempered/MHWilds-Tempered_Guardian_Arkveld.png","MHWilds_Tempered/MHWilds-Tempered_Guardian_Doshaguma.png","MHWilds_Tempered/MHWilds-Tempered_Guardian_Ebony_Odogaron.png","MHWilds_Tempered/MHWilds-Tempered_Guardian_Fulgur_Anjanath.png","MHWilds_Tempered/MHWilds-Tempered_Guardian_Rathalos.png","MHWilds_Tempered/MHWilds-Tempered_Gypceros.png","MHWilds_Tempered/MHWilds-Tempered_Hirabami.png","MHWilds_Tempered/MHWilds-Tempered_Jin_Dahaad.png","MHWilds_Tempered/MHWilds-Tempered_Lagiacrus.png","MHWilds_Tempered/MHWilds-Tempered_Lala_Barina.png","MHWilds_Tempered/MHWilds-Tempered_Mizutsune.png","MHWilds_Tempered/MHWilds-Tempered_Nerscylla.png","MHWilds_Tempered/MHWilds-Tempered_Nu_Udra.png","MHWilds_Tempered/MHWilds-Tempered_Omega_Planetes.png","MHWilds_Tempered/MHWilds-Tempered_Quematrice.png","MHWilds_Tempered/MHWilds-Tempered_Rathalos.png","MHWilds_Tempered/MHWilds-Tempered_Rathian.png","MHWilds_Tempered/MHWilds-Tempered_Rey_Dau.png","MHWilds_Tempered/MHWilds-Tempered_Rompopolo.png","MHWilds_Tempered/MHWilds-Tempered_Seregios.png","MHWilds_Tempered/MHWilds-Tempered_Uth_Duna.png","MHWilds_Tempered/MHWilds-Tempered_Xu_Wu.png","MHWilds_Tempered/MHWilds-Tempered_Yian_Kut-Ku.png","MHWorld/MHWI-Ancient_Leshen_Icon.png","MHWorld/MHWI-Anjanath_Icon.png","MHWorld/MHWI-Apceros_Icon.png","MHWorld/MHWI-Aptonoth_Icon.png","MHWorld/MHWI-Azure_Rathalos_Icon.png","MHWorld/MHWI-Barnos_Icon.png","MHWorld/MHWI-Barroth_Icon.png","MHWorld/MHWI-Bazelgeuse_Icon.png","MHWorld/MHWI-Behemoth_Icon.png","MHWorld/MHWI-Black_Diablos_Icon.png","MHWorld/MHWI-Deviljho_Icon.png","MHWorld/MHWI-Diablos_Icon.png","MHWorld/MHWI-Dodogama_Icon.png","MHWorld/MHWI-Gajalaka_Icon.png","MHWorld/MHWI-Gajau_Icon.png","MHWorld/MHWI-Gastodon_Icon.png","MHWorld/MHWI-Girros_Icon.png","MHWorld/MHWI-Great_Girros_Icon.png","MHWorld/MHWI-Great_Jagras_Icon.png","MHWorld/MHWI-Grimalkyne_Icon.png","MHWorld/MHWI-Hornetaur_Icon.png","MHWorld/MHWI-Jagras_Icon.png","MHWorld/MHWI-Jyuratodus_Icon.png","MHWorld/MHWI-Kelbi_Icon.png","MHWorld/MHWI-Kestodon_Female_Icon.png","MHWorld/MHWI-Kestodon_Male_Icon.png","MHWorld/MHWI-Kirin_Icon.png","MHWorld/MHWI-Kulu-Ya-Ku_Icon.png","MHWorld/MHWI-Kulve_Taroth_Icon.png","MHWorld/MHWI-Kushala_Daora_Icon.png","MHWorld/MHWI-Lavasioth_Icon.png","MHWorld/MHWI-Legiana_Icon.png","MHWorld/MHWI-Leshen_Icon.png","MHWorld/MHWI-Lunastra_Icon.png","MHWorld/MHWI-Mernos_Icon.png","MHWorld/MHWI-Mosswine_Icon.png","MHWorld/MHWI-Nergigante_Icon.png","MHWorld/MHWI-Noios_Icon.png","MHWorld/MHWI-Odogaron_Icon.png","MHWorld/MHWI-Paolumu_Icon.png","MHWorld/MHWI-Pink_Rathian_Icon.png","MHWorld/MHWI-Pukei-Pukei_Icon.png","MHWorld/MHWI-Question_Mark_Icon.png","MHWorld/MHWI-Radobaan_Icon.png","MHWorld/MHWI-Raphinos_Icon.png","MHWorld/MHWI-Rathalos_Icon.png","MHWorld/MHWI-Rathian_Icon.png","MHWorld/MHWI-Shamos_Icon.png","MHWorld/MHWI-Teostra_Icon.png","MHWorld/MHWI-Tobi-Kadachi_Icon.png","MHWorld/MHWI-Tzitzi-Ya-Ku_Icon.png","MHWorld/MHWI-Uragaan_Icon.png","MHWorld/MHWI-Vaal_Hazak_Icon.png","MHWorld/MHWI-Vespoid_Icon.png","MHWorld/MHWI-Xenojiiva_Icon.png","MHWorld/MHWI-Zorah_Magdaros_Icon.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Kirin.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Kulve_Taroth.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Kushala_Daora.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Lunastra.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Nergigante.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Teostra.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Vaal_Hazak.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Xenojiiva.png","MHWorld_ArchTempered/MHWI-Arch_Tempered_Zorah_Magdaros.png","MHWorld_Tempered/MHWI-Tempered_Anjanath.png","MHWorld_Tempered/MHWI-Tempered_Azure_Rathalos.png","MHWorld_Tempered/MHWI-Tempered_Barroth.png","MHWorld_Tempered/MHWI-Tempered_Bazelgeuse.png","MHWorld_Tempered/MHWI-Tempered_Behemoth.png","MHWorld_Tempered/MHWI-Tempered_Black_Diablos.png","MHWorld_Tempered/MHWI-Tempered_Deviljho.png","MHWorld_Tempered/MHWI-Tempered_Diablos.png","MHWorld_Tempered/MHWI-Tempered_Jyuratodus.png","MHWorld_Tempered/MHWI-Tempered_Kirin.png","MHWorld_Tempered/MHWI-Tempered_Kushala_Daora.png","MHWorld_Tempered/MHWI-Tempered_Lavasioth.png","MHWorld_Tempered/MHWI-Tempered_Legiana.png","MHWorld_Tempered/MHWI-Tempered_Lunastra.png","MHWorld_Tempered/MHWI-Tempered_Nergigante.png","MHWorld_Tempered/MHWI-Tempered_Odogaron.png","MHWorld_Tempered/MHWI-Tempered_Paolumu.png","MHWorld_Tempered/MHWI-Tempered_Pink_Rathian.png","MHWorld_Tempered/MHWI-Tempered_Pukei-Pukei.png","MHWorld_Tempered/MHWI-Tempered_Radobaan.png","MHWorld_Tempered/MHWI-Tempered_Rathalos.png","MHWorld_Tempered/MHWI-Tempered_Rathian.png","MHWorld_Tempered/MHWI-Tempered_Teostra.png","MHWorld_Tempered/MHWI-Tempered_Tobi-Kadachi.png","MHWorld_Tempered/MHWI-Tempered_Uragaan.png","MHWorld_Tempered/MHWI-Tempered_Vaal_Hazak.png"]</script>
+<script id="seed-data" type="application/json">["嗟怨震天怨虎龙","凶爪龙","黑龙","钢龙","风暴的棺材","泡狐龙","雷狼龙","金狮子"]</script>
+<script>
+/* =============================================================================
+   设计稿交互（纯前端演示，不涉及真实后端）
+   ============================================================================= */
+const D = JSON.parse(document.getElementById('monster-data').textContent);
+const ICONS = JSON.parse(document.getElementById('icon-data').textContent);
+const SEED = JSON.parse(document.getElementById('seed-data').textContent);
+const ICON_BASE = '../../public/monster_icons/';
+
+const GAME_NAME = { all:'全部', MHWilds:'荒野', MHWorld:'世界', MHWI:'冰原', MHRise:'崛起', MHRS:'曙光' };
+const LV_NAME = ['普通','历战','历战王'];
+
+/* 图标目录 → 作品分组（与 monster_list.json 的图标地址前缀一致） */
+function iconGroup(path){
+  const p = path.split('/')[0];
+  if (p.startsWith('MHWilds')) return 'MHWilds';
+  if (p.startsWith('MHWI')) return 'MHWI';
+  if (p.startsWith('MHWorld')) return 'MHWorld';
+  if (p.startsWith('MHRS')) return 'MHRS';
+  if (p.startsWith('MHRise')) return 'MHRise';
+  return 'other';
+}
+
+/* 全字典别称归属表：用于「字典序优先命中」冲突提示 */
+const aliasOwners = new Map();
+for (const m of D){
+  const words = new Set([...(m.a||[]).map(s=>s.trim()).filter(Boolean), m.n]);
+  for (const w of words){
+    if (!aliasOwners.has(w)) aliasOwners.set(w, []);
+    aliasOwners.get(w).push(m.n);
+  }
+}
+const conflictWords = new Set([...aliasOwners].filter(([,v])=>v.length>1).map(([k])=>k));
+const hasConflict = (m)=>(m.a||[]).some(a=>conflictWords.has(a.trim()));
+
+/* 运行态：可选名单（有序） */
+const byName = new Map(D.map(m=>[m.n, m]));
+let roster = [...new Set(SEED)].filter(n=>byName.has(n));
+const inRoster = (n)=>roster.includes(n);
+
+let libKw='', libGame='all', libState='all';
+let pkGame='all', pkKw='';
+let opKw='', opGame='all', opSel=roster[0] || null;
+
+const esc = (s)=>String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const iconSrc = (path)=>ICON_BASE + path;
+
+/** 操作反馈浮层（设计稿演示用） */
+let toastTimer = null;
+function toast(msg){
+  let el = document.getElementById('mockToast');
+  if (!el){ el = document.createElement('div'); el.id='mockToast'; el.className='toast'; document.body.appendChild(el); }
+  el.textContent = msg;
+  requestAnimationFrame(()=>el.classList.add('show'));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>el.classList.remove('show'), 1900);
+}
+
+/** 选怪面板底部状态提示：传参显示临时提示，不传参恢复为白名单状态文案 */
+function footTip(msg){
+  const tip = document.getElementById('opFootTip');
+  if (msg){ tip.textContent = msg; return; }
+  tip.textContent = document.getElementById('wlSwitch').classList.contains('off')
+    ? '白名单已关闭 · 弹幕可点全部字典怪物'
+    : '名单外的怪物已置灰不可点 · 弹幕白名单生效中';
+}
+
+/* ---------- 视图 01：怪物图鉴库 ---------- */
+function libList(){
+  const kw = libKw.trim().toLowerCase();
+  return D.filter(m=>{
+    if (libGame!=='all' && m.g!==libGame) return false;
+    if (libState==='in' && !inRoster(m.n)) return false;
+    if (libState==='out' && inRoster(m.n)) return false;
+    if (!kw) return true;
+    const hay = [m.n, ...(m.a||[])].join(' ').toLowerCase();
+    return hay.includes(kw);
+  });
+}
+
+function cardHTML(m){
+  const on = inRoster(m.n);
+  const dup = hasConflict(m);
+  return `<div class="mcard${on?' picked':''}" data-name="${esc(m.n)}" title="${esc(m.n)}${dup?' · 含冲突别称':''}">
+    <button class="edit-btn" data-edit="${esc(m.n)}" title="编辑条目">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+    </button>
+    <span class="pick-dot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></span>
+    <img class="ic" src="${iconSrc(m.i)}" alt="${esc(m.n)}" loading="lazy">
+    <div class="nm">${esc(m.n)}</div>
+    <div class="meta">
+      <span class="lv l${m.t}">${LV_NAME[m.t]||'普通'}</span>
+      <span>${(m.a||[]).length} 别称</span>
+      ${dup?'<span style="color:#fca5a5" title="别称与其它条目冲突">◆</span>':''}
+    </div>
+  </div>`;
+}
+
+function renderGrid(){
+  const list = libList();
+  const grid = document.getElementById('monsterGrid');
+  grid.innerHTML = list.length ? list.map(cardHTML).join('')
+    : `<div class="grid-empty" style="grid-column:1/-1">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+        <div>没有匹配的怪物 · 换个关键词或别称试试</div>
+       </div>`;
+  document.getElementById('libCount').textContent = `${list.length} 项`;
+
+  grid.querySelectorAll('.mcard').forEach(el=>{
+    el.addEventListener('click', ()=>togglePick(el.dataset.name));
+    el.querySelector('.edit-btn').addEventListener('click', (e)=>{
+      e.stopPropagation();
+      openDrawer(el.dataset.name);
+    });
+  });
+}
+
+function togglePick(name){
+  if (inRoster(name)) roster = roster.filter(n=>n!==name);
+  else roster = [...roster, name];
+  renderGrid(); renderRoster(); renderStats(); renderPicker();
+}
+
+/* ---------- 视图 01：可选名单 ---------- */
+function renderRoster(){
+  const box = document.getElementById('rosterList');
+  if (!roster.length){
+    box.innerHTML = `<div class="grid-empty" style="padding:32px 0">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></svg>
+      <div>尚未选择任何怪物<br>从左库点击卡片即可入选</div></div>`;
+    return;
+  }
+  box.innerHTML = roster.map((n,i)=>{
+    const m = byName.get(n);
+    return `<div class="rrow" draggable="true" data-name="${esc(n)}" data-idx="${i}">
+      <span class="grip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/></svg></span>
+      <span class="seq">${String(i+1).padStart(2,'0')}</span>
+      <img class="ric" src="${iconSrc(m.i)}" alt="">
+      <span class="rn">${esc(n)}</span>
+      <span class="ra">${(m.a||[]).length} 别称</span>
+      <button class="rm" data-rm="${esc(n)}" title="移出名单">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>`;
+  }).join('');
+
+  box.querySelectorAll('.rm').forEach(b=>{
+    b.addEventListener('click', (e)=>{ e.stopPropagation(); togglePick(b.dataset.rm); });
+  });
+
+  let dragName = null;
+  box.querySelectorAll('.rrow').forEach(row=>{
+    row.addEventListener('dragstart', (e)=>{
+      dragName = row.dataset.name;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    row.addEventListener('dragend', ()=>row.classList.remove('dragging'));
+    row.addEventListener('dragover', (e)=>{ e.preventDefault(); row.classList.add('drop-target'); });
+    row.addEventListener('dragleave', ()=>row.classList.remove('drop-target'));
+    row.addEventListener('drop', (e)=>{
+      e.preventDefault();
+      row.classList.remove('drop-target');
+      if (!dragName || dragName===row.dataset.name) return;
+      const next = roster.filter(n=>n!==dragName);
+      next.splice(next.indexOf(row.dataset.name), 0, dragName);
+      roster = next;
+      renderRoster(); renderPicker();
+    });
+  });
+}
+
+function renderStats(){
+  document.getElementById('statPicked').innerHTML = `${roster.length}<small> / ${D.length}</small>`;
+  document.getElementById('rosterCnt').textContent = roster.length;
+}
+/* ---------- 视图 02：条目编辑抽屉 ---------- */
+let editTarget = null;
+
+function openDrawer(name){
+  editTarget = name;
+  const m = byName.get(name);
+  document.getElementById('editIcon').src = iconSrc(m.i);
+  document.getElementById('editIconPath').textContent = m.i;
+  document.getElementById('editName').value = m.n;
+  document.querySelectorAll('#editLv button').forEach(b=>{
+    b.classList.toggle('active', Number(b.dataset.lv)===m.t);
+  });
+  renderAliasBox(m);
+  switchView('viewB');
+}
+
+function renderAliasBox(m){
+  const box = document.getElementById('aliasBox');
+  const input = document.getElementById('aliasInput');
+  box.innerHTML = `<span class="chip orig">${esc(m.n)}<span style="font-size:9px;opacity:.6;margin-left:2px">原名</span></span>`;
+  (m.a||[]).forEach(a=>{
+    const dup = conflictWords.has(a.trim());
+    const owners = (aliasOwners.get(a.trim())||[]).filter(n=>n!==m.n);
+    const chip = document.createElement('span');
+    chip.className = 'chip' + (dup?' dup':'');
+    chip.title = dup ? `与「${owners.join('、')}」冲突：字典序优先命中` : '';
+    chip.innerHTML = `${esc(a)}<button class="x" title="删除别称"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>`;
+    chip.querySelector('.x').addEventListener('click', ()=>{
+      m.a = m.a.filter(x=>x!==a);
+      renderAliasBox(m);
+    });
+    box.appendChild(chip);
+  });
+  box.appendChild(input);
+
+  const dupAlias = (m.a||[]).find(a=>conflictWords.has(a.trim()));
+  const alert = document.getElementById('dupAlert');
+  if (dupAlias){
+    alert.style.display = 'flex';
+    document.getElementById('dupWord').textContent = dupAlias;
+    document.getElementById('dupOwner').textContent = (aliasOwners.get(dupAlias.trim())||[]).filter(n=>n!==m.n).join('、');
+  } else {
+    alert.style.display = 'none';
+  }
+}
+
+document.getElementById('aliasInput').addEventListener('keydown', (e)=>{
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const v = e.target.value.trim();
+  if (!v || !editTarget) return;
+  const m = byName.get(editTarget);
+  if (!(m.a||[]).includes(v)) { m.a = [...(m.a||[]), v]; renderAliasBox(m); }
+  e.target.value = '';
+});
+
+document.querySelectorAll('#editLv button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('#editLv button').forEach(x=>x.classList.toggle('active', x===b));
+  });
+});
+
+document.getElementById('drawerClose').addEventListener('click', ()=>switchView('viewA'));
+document.getElementById('drawerCancel').addEventListener('click', ()=>switchView('viewA'));
+document.getElementById('drawerSave').addEventListener('click', ()=>toast('设计稿演示：条目已写入 monster_list.json，匹配器热重载'));
+document.getElementById('delEntry').addEventListener('click', ()=>toast('设计稿演示：删除条目需二次确认（破坏性操作保护）'));
+document.getElementById('listImport').addEventListener('click', ()=>toast('设计稿演示：从 JSON 导入名单（覆盖 / 合并二选一）'));
+document.getElementById('listExport').addEventListener('click', ()=>toast('设计稿演示：导出当前名单为 JSON 文件'));
+
+/* ---------- 视图 02：图标选择器 ---------- */
+function pkList(){
+  const kw = pkKw.trim().toLowerCase();
+  return ICONS.filter(p=>{
+    if (pkGame!=='all' && iconGroup(p)!==pkGame) return false;
+    if (!kw) return true;
+    return p.toLowerCase().includes(kw);
+  });
+}
+
+function renderPk(){
+  const list = pkList();
+  const grid = document.getElementById('pkGrid');
+  grid.innerHTML = list.map(p=>`<div class="ipick" data-p="${esc(p)}" title="${esc(p)}"><img src="${iconSrc(p)}" loading="lazy" alt=""></div>`).join('');
+  document.getElementById('pkCount').textContent = `${list.length} 张`;
+  grid.querySelectorAll('.ipick').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      grid.querySelectorAll('.ipick').forEach(x=>x.classList.toggle('sel', x===el));
+      const m = byName.get(editTarget);
+      if (!m) return;
+      m.i = el.dataset.p;
+      document.getElementById('editIcon').src = iconSrc(m.i);
+      document.getElementById('editIconPath').textContent = m.i;
+      renderGrid();
+    });
+  });
+}
+
+document.getElementById('pkSearch').addEventListener('input', (e)=>{ pkKw = e.target.value; renderPk(); });
+document.querySelectorAll('#pkSeg button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('#pkSeg button').forEach(x=>x.classList.toggle('active', x===b));
+    pkGame = b.dataset.p;
+    renderPk();
+  });
+});
+
+/* ---------- 视图 03：点单排队管理 · 选怪面板 ---------- */
+function renderPicker(){
+  const kw = opKw.trim().toLowerCase();
+  const hits = D.filter(m=>{
+    if (opGame!=='all' && m.g!==opGame) return false;
+    if (kw){ const hay=[m.n, ...(m.a||[])].join(' ').toLowerCase(); if (!hay.includes(kw)) return false; }
+    return true;
+  });
+  /* 名单内按顺位置前，名单外置灰殿后 */
+  hits.sort((a,b)=>{
+    const ia = roster.indexOf(a.n), ib = roster.indexOf(b.n);
+    return (ia<0?9999:ia) - (ib<0?9999:ib);
+  });
+  const grid = document.getElementById('opGrid');
+  grid.innerHTML = hits.map(m=>{
+    const on = inRoster(m.n);
+    return `<div class="oc${on?'':' locked'}${opSel===m.n?' sel':''}" data-name="${esc(m.n)}" title="${on?esc(m.n):'不在可选名单：先到主窗口「怪物名单」中加入'}">
+      <span class="lv l${m.t}">${LV_NAME[m.t]||'普通'}</span>
+      ${on?'':'<svg class="lock-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>'}
+      <img src="${iconSrc(m.i)}" loading="lazy" alt="">
+      <div class="nm">${esc(m.n)}</div>
+    </div>`;
+  }).join('');
+
+  grid.querySelectorAll('.oc').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const name = el.dataset.name;
+      if (!inRoster(name)){
+        footTip(`「${name}」不在可选名单，已拦截 · 请到主窗口「怪物名单」加入`);
+        return;
+      }
+      opSel = name;
+      footTip();
+      renderPicker();
+    });
+  });
+  updateOpConfirm();
+}
+
+function updateOpConfirm(){
+  const m = byName.get(opSel);
+  if (!m) return;
+  document.getElementById('opSelIcon').src = iconSrc(m.i);
+  document.getElementById('opSelName').textContent = m.n;
+  document.getElementById('opSelAlias').textContent = `别称：${(m.a||[]).filter(a=>a!==m.n).slice(0,4).join(' · ')||'（无）'}`;
+}
+
+document.getElementById('opSearch').addEventListener('input', (e)=>{ opKw = e.target.value; renderPicker(); });
+document.querySelectorAll('#opSegs button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('#opSegs button').forEach(x=>x.classList.toggle('active', x===b));
+    opGame = b.dataset.g;
+    renderPicker();
+  });
+});
+
+/* ---------- 视图 03：右侧实时队列（演示「加入排队」联动） ---------- */
+const GUARD_NAME = { 1:'总督', 2:'提督', 3:'舰长' };
+let queueDemo = [
+  { name:'嗟怨震天怨虎龙', user:'大锤侠', lv:0, guard:3, prio:false },
+  { name:'黑龙', user:'长枪老哥', lv:0, guard:0, prio:false },
+  { name:'风暴的棺材', user:'片手剑萌新', lv:1, guard:0, prio:true },
+];
+
+function renderQueue(){
+  const box = document.getElementById('qList');
+  box.innerHTML = queueDemo.map((q,i)=>{
+    const m = byName.get(q.name);
+    const lv = q.lv;
+    return `<div class="q-row" data-rarity="${lv}" data-prio="${q.prio?1:0}">
+      <div class="q-left">
+        <span class="q-grip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 5h.01M9 12h.01M9 19h.01M15 5h.01M15 12h.01M15 19h.01"/></svg></span>
+        <span class="q-seq">#${i+1}</span>
+        <img class="q-ic" src="${m?iconSrc(m.i):''}" alt="">
+        <div class="q-info">
+          <div class="q-name">${esc(q.name)}
+            ${lv===1?'<span class="q-badge l1">历战</span>':''}
+            ${lv===2?'<span class="q-badge l2">历战王</span>':''}
+            ${q.guard?'<span class="q-badge g'+q.guard+'">'+GUARD_NAME[q.guard]+'</span>':''}
+            ${q.prio?'<span class="q-badge prio">优先</span>':''}
+          </div>
+          <div class="q-user">水友: ${esc(q.user)}</div>
+        </div>
+      </div>
+      <button class="q-done" data-deq="${i}">完成并出队</button>
+    </div>`;
+  }).join('');
+  document.getElementById('qCount').textContent = queueDemo.length;
+  box.querySelectorAll('.q-done').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      const [done] = queueDemo.splice(Number(b.dataset.deq), 1);
+      renderQueue();
+      toast(`「${done.name}」已完成并出队`);
+    });
+  });
+}
+
+/* 加入排队：读取确认卡四项属性，写入队列（优先则置前） */
+document.getElementById('opGo').addEventListener('click', ()=>{
+  if (!opSel){ toast('请先在上方点选一个怪物'); return; }
+  const m = byName.get(opSel);
+  const user = document.getElementById('opUser').value.trim() || '房管';
+  const guard = Number(document.getElementById('opGuard').value) || 0;
+  const t = document.getElementById('opTempered').value;
+  const prio = document.getElementById('opPrio').checked;
+  const entry = { name: opSel, user, lv: t==='default' ? (m?m.t:0) : Number(t), guard, prio };
+  if (prio) queueDemo.unshift(entry); else queueDemo.push(entry);
+  renderQueue();
+  toast(`${user} 点怪 ${opSel} 已入队${prio?'（优先置前）':''}`);
+});
+
+/* ---------- 视图 01 工具栏 ---------- */
+document.getElementById('libSearch').addEventListener('input', (e)=>{ libKw = e.target.value; renderGrid(); });
+document.querySelectorAll('#segGame button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('#segGame button').forEach(x=>x.classList.toggle('active', x===b));
+    libGame = b.dataset.g; renderGrid();
+  });
+});
+document.querySelectorAll('#segState button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    document.querySelectorAll('#segState button').forEach(x=>x.classList.toggle('active', x===b));
+    libState = b.dataset.s; renderGrid();
+  });
+});
+document.getElementById('rosterClear').addEventListener('click', ()=>{
+  roster = []; opSel = null; renderGrid(); renderRoster(); renderStats(); renderPicker();
+});
+/* 全选：名单面板一键纳入全部字典怪物 */
+document.getElementById('rosterAll').addEventListener('click', ()=>{
+  roster = D.map(m=>m.n);
+  if (!opSel) opSel = roster[0];
+  renderGrid(); renderRoster(); renderStats(); renderPicker();
+});
+/* 全选结果：把当前筛选命中的怪物追加进名单（不改变已有顺位） */
+document.getElementById('pickAllResult').addEventListener('click', ()=>{
+  const add = libList().filter(m=>!inRoster(m.n)).map(m=>m.n);
+  if (!add.length) return;
+  roster = [...roster, ...add];
+  if (!opSel) opSel = roster[0];
+  renderGrid(); renderRoster(); renderStats(); renderPicker();
+});
+document.getElementById('addCustom').addEventListener('click', ()=>{
+  toast('设计稿演示：新建空白条目（此处以已有条目展示编辑形态）');
+  openDrawer(roster[0] || D[0].n);
+});
+document.getElementById('wlSwitch').addEventListener('click', ()=>{
+  document.getElementById('wlSwitch').classList.toggle('off');
+  document.getElementById('wlPill').classList.toggle('off');
+  footTip();
+});
+document.getElementById('pkClose').addEventListener('click', ()=>{ document.querySelector('.icon-picker').style.display='none'; });
+document.getElementById('changeIcon').addEventListener('click', ()=>{ document.querySelector('.icon-picker').style.display='flex'; });
+
+/* ---------- 视图切换 ---------- */
+function switchView(id){
+  document.querySelectorAll('.mock-tab').forEach(b=>b.classList.toggle('active', b.dataset.view===id));
+  document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active', v.id===id));
+  window.scrollTo({ top:0, behavior:'smooth' });
+}
+document.querySelectorAll('.mock-tab').forEach(b=>{
+  b.addEventListener('click', ()=>switchView(b.dataset.view));
+});
+
+/* ---------- 初始化 ---------- */
+renderGrid(); renderRoster(); renderStats(); renderPk(); renderPicker(); renderQueue();
+openDrawerInit();
+
+function openDrawerInit(){
+  /* 抽屉预置为字典中别称最多的条目，展示完整编辑态 */
+  const target = roster.find(n=>n==='嗟怨震天怨虎龙') ? '嗟怨震天怨虎龙'
+    : D.reduce((a,b)=>((b.a||[]).length>(a.a||[]).length?b:a)).n;
+  openDrawer(target);
+  switchView('viewA');
+}
+
+/* 视图 02 背景：克隆视图 01 的窗口（静态），保证抽屉叠加在真实界面上 */
+(function cloneBackdrop(){
+  const src = document.getElementById('appWin');
+  const clone = src.cloneNode(true);
+  clone.removeAttribute('id');
+  clone.querySelectorAll('[id]').forEach(el=>el.removeAttribute('id'));
+  clone.style.pointerEvents = 'none';
+  document.getElementById('drawerStage').prepend(clone);
+})();
+</script>
+</body>
+</html>

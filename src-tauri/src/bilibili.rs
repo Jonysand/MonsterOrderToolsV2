@@ -613,6 +613,8 @@ pub struct DanmuProcessResult {
     pub user_name: String,
     pub monster_name: String,
     pub tempered_level: i32,
+    /// 禁点名单拦截：命中字典但该怪已被禁点（此时不入队，由调用方就地提示）
+    pub blocked_by_roster: bool,
 }
 
 /// 10 万条 LRU 消息 ID 去重缓存
@@ -794,6 +796,7 @@ impl DanmuProcessor {
         &self,
         danmu: &DanmuData,
         monster_matcher: &crate::monster::MonsterDataManager,
+        roster: &crate::roster::MonsterRoster,
         queue_mgr: &mut crate::queue::QueueManager,
     ) -> DanmuProcessResult {
         let mut result = DanmuProcessResult {
@@ -855,6 +858,12 @@ impl DanmuProcessor {
                     result.matched = true;
                     result.monster_name = match_res.monster_name.clone();
                     result.tempered_level = match_res.tempered_level;
+
+                    // 5.1 禁点名单拦截：该怪在禁点名单内时直接拒绝（不入队）
+                    if roster.is_blocked(&match_res.monster_name) {
+                        result.blocked_by_roster = true;
+                        break;
+                    }
 
                     let has_priority = self.has_priority_keyword(&normalized) && danmu.guard_level > 0;
                     let item_id = if !danmu.msg_id.is_empty() {
@@ -1415,6 +1424,15 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
 mod tests {
     use super::*;
 
+    /// 测试用名单：默认空名单（不限制任何点怪），路径指向临时目录以免触碰真实配置
+    fn test_roster() -> crate::roster::MonsterRoster {
+        crate::roster::MonsterRoster::load(Some(
+            &std::env::temp_dir()
+                .join("mh_test_bilibili_roster")
+                .join(crate::roster::ROSTER_FILE_NAME),
+        ))
+    }
+
     #[test]
     fn test_connection_status_five_states_and_reasons() {
         // 五态展示文案（对齐原工程 C# SetStatus 与「重连中(N)」诉求）
@@ -1567,6 +1585,7 @@ mod tests {
         let _ = matcher.load_from_file(None);
         let processor = DanmuProcessor::new();
         let mut queue_mgr = crate::queue::QueueManager::new();
+        let roster = test_roster();
 
         // 1. 点单弹幕
         let dm1 = DanmuData {
@@ -1581,7 +1600,7 @@ mod tests {
             is_paid_gift: false,
         };
 
-        let res1 = processor.process_danmu(&dm1, &matcher, &mut queue_mgr);
+        let res1 = processor.process_danmu(&dm1, &matcher, &roster, &mut queue_mgr);
         assert!(res1.matched);
         assert_eq!(res1.monster_name, "霸主雌火龙");
         assert_eq!(queue_mgr.items.len(), 1);
@@ -1599,7 +1618,7 @@ mod tests {
             msg_id: "msg_chat".into(),
             is_paid_gift: false,
         };
-        let res_chat = processor.process_danmu(&dm_chat, &matcher, &mut queue_mgr);
+        let res_chat = processor.process_danmu(&dm_chat, &matcher, &roster, &mut queue_mgr);
         assert!(!res_chat.priority_updated, "句中含优先词不应触发提权");
         assert!(!queue_mgr.items[0].is_priority, "排队项仍应保持非优先状态");
 
@@ -1616,7 +1635,7 @@ mod tests {
             is_paid_gift: false,
         };
 
-        let res2 = processor.process_danmu(&dm2, &matcher, &mut queue_mgr);
+        let res2 = processor.process_danmu(&dm2, &matcher, &roster, &mut queue_mgr);
         assert!(res2.priority_updated);
         assert!(queue_mgr.items[0].is_priority);
         println!("[PASS] test_danmu_processor_flow passed");
@@ -1628,6 +1647,7 @@ mod tests {
         let _ = matcher.load_from_file(None);
         let processor = DanmuProcessor::new();
         let mut queue_mgr = crate::queue::QueueManager::new();
+        let roster = test_roster();
 
         let make_no_medal_danmu = |msg_id: &str| DanmuData {
             user_id: "user_nm".into(),
@@ -1643,14 +1663,14 @@ mod tests {
 
         // 运行期开启"仅粉丝牌可点怪"：无粉丝牌弹幕不入队
         processor.update_filters(true, false, 0);
-        let res = processor.process_danmu(&make_no_medal_danmu("msg_nm_1"), &matcher, &mut queue_mgr);
+        let res = processor.process_danmu(&make_no_medal_danmu("msg_nm_1"), &matcher, &roster, &mut queue_mgr);
         assert!(!res.matched);
         assert!(!res.added_to_queue);
         assert_eq!(queue_mgr.items.len(), 0);
 
         // 运行期关闭过滤（无需重启）：随后的新弹幕立即可入队
         processor.update_filters(false, false, 0);
-        let res2 = processor.process_danmu(&make_no_medal_danmu("msg_nm_2"), &matcher, &mut queue_mgr);
+        let res2 = processor.process_danmu(&make_no_medal_danmu("msg_nm_2"), &matcher, &roster, &mut queue_mgr);
         assert!(res2.matched);
         assert!(res2.added_to_queue);
         assert_eq!(queue_mgr.items.len(), 1);
@@ -1675,8 +1695,9 @@ mod tests {
         let mut matcher = crate::monster::MonsterDataManager::new();
         let _ = matcher.load_from_file(None);
         let mut queue_mgr = crate::queue::QueueManager::new();
+        let roster = test_roster();
 
-        let res = processor.process_danmu(&dm, &matcher, &mut queue_mgr);
+        let res = processor.process_danmu(&dm, &matcher, &roster, &mut queue_mgr);
         assert!(res.matched);
         assert_eq!(queue_mgr.items.len(), 1);
         // 总督水友的优先请求应被成功批准
@@ -1691,6 +1712,7 @@ mod tests {
         let mut matcher = crate::monster::MonsterDataManager::new();
         let _ = matcher.load_from_file(None);
         let mut queue_mgr = crate::queue::QueueManager::new();
+        let roster = test_roster();
 
         // 普通水友（guard_level = 0）发送点怪并要求优先
         let dm = DanmuData {
@@ -1705,7 +1727,7 @@ mod tests {
             is_paid_gift: false,
         };
 
-        let res = processor.process_danmu(&dm, &matcher, &mut queue_mgr);
+        let res = processor.process_danmu(&dm, &matcher, &roster, &mut queue_mgr);
         assert!(res.matched);
         assert_eq!(queue_mgr.items.len(), 1);
         // 关键断言：非舰长水友的优先请求必须被驳回！
@@ -1724,11 +1746,113 @@ mod tests {
             is_paid_gift: false,
         };
 
-        let res_prio = processor.process_danmu(&dm_prio, &matcher, &mut queue_mgr);
+        let res_prio = processor.process_danmu(&dm_prio, &matcher, &roster, &mut queue_mgr);
         // 关键断言：两段式提权同样必须驳回！
         assert!(!res_prio.priority_updated);
         assert!(!queue_mgr.items[0].is_priority);
         println!("[PASS] test_non_guard_cannot_claim_priority passed");
+    }
+
+    /// 禁点名单：空名单不限制任何点怪；名单内的怪被拒绝入队（含繁体前缀与优先词组合）
+    #[test]
+    fn test_roster_blacklist_blocks_listed_monster() {
+        use crate::roster::RosterData;
+
+        let mut matcher = crate::monster::MonsterDataManager::new();
+        let _ = matcher.load_from_file(None);
+        let processor = DanmuProcessor::new();
+        let mut queue_mgr = crate::queue::QueueManager::new();
+
+        let dir = std::env::temp_dir().join("mh_test_bilibili_roster_blacklist");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let roster =
+            crate::roster::MonsterRoster::load(Some(&dir.join(crate::roster::ROSTER_FILE_NAME)));
+
+        let make = |uid: &str, msg_id: &str, message: &str, guard: i32| DanmuData {
+            user_id: uid.into(),
+            user_name: format!("水友{}", uid),
+            message: message.into(),
+            timestamp: 4000,
+            has_medal: true,
+            medal_level: 10,
+            guard_level: guard,
+            msg_id: msg_id.into(),
+            is_paid_gift: false,
+        };
+
+        // 1. 空名单：不限制任何点怪
+        let res = processor.process_danmu(
+            &make("u_free", "msg_free", "点怪金狮子", 0),
+            &matcher,
+            &roster,
+            &mut queue_mgr,
+        );
+        assert!(res.matched);
+        assert!(!res.blocked_by_roster);
+        assert!(res.added_to_queue);
+        assert_eq!(queue_mgr.items.len(), 1);
+
+        // 2. 把「金狮子」加入禁点名单：该怪被拒绝，队列不变
+        roster
+            .replace(RosterData {
+                items: vec!["金狮子".into()],
+            })
+            .unwrap();
+        let res = processor.process_danmu(
+            &make("u_blk", "msg_blk", "点怪金狮子", 0),
+            &matcher,
+            &roster,
+            &mut queue_mgr,
+        );
+        assert!(res.matched, "字典命中信息需保留，供前端就地提示");
+        assert!(res.blocked_by_roster);
+        assert!(!res.added_to_queue);
+        assert_eq!(res.monster_name, "金狮子");
+        assert_eq!(queue_mgr.items.len(), 1, "被拦截的点怪不得进入队列");
+
+        // 3. 名单外的怪物照常入队
+        let res = processor.process_danmu(
+            &make("u_ok", "msg_ok", "点怪黑龙", 0),
+            &matcher,
+            &roster,
+            &mut queue_mgr,
+        );
+        assert!(res.matched);
+        assert!(!res.blocked_by_roster);
+        assert!(res.added_to_queue);
+        assert_eq!(queue_mgr.items.len(), 2);
+
+        // 4. 繁体前缀 + 优先词 + 名单外：剥离优先词后命中并入队，优先词仍生效
+        let res = processor.process_danmu(
+            &make("u_tw", "msg_tw", "點怪優先黑龙", 3),
+            &matcher,
+            &roster,
+            &mut queue_mgr,
+        );
+        assert!(!res.blocked_by_roster);
+        assert!(res.added_to_queue);
+        let item = queue_mgr
+            .items
+            .iter()
+            .find(|i| i.user_id == "u_tw")
+            .expect("繁体点怪应入队");
+        assert!(item.is_priority, "舰长的优先词应生效");
+
+        // 5. 繁体前缀 + 历战修饰词 + 名单内：修饰词剥离后仍按金狮子拦截
+        let res = processor.process_danmu(
+            &make("u_tw2", "msg_tw2", "點隻歷戰金狮子", 3),
+            &matcher,
+            &roster,
+            &mut queue_mgr,
+        );
+        assert!(res.matched);
+        assert!(res.blocked_by_roster);
+        assert_eq!(res.tempered_level, 1, "历战修饰词仍应解析出等级");
+        assert!(!queue_mgr.items.iter().any(|i| i.user_id == "u_tw2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_roster_blacklist_blocks_listed_monster passed");
     }
 
     #[test]

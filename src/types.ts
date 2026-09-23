@@ -130,12 +130,37 @@ export interface ConnectionStatusPayload {
   display: string;
 }
 
+// ---------- 怪物字典与禁点名单 ----------
+/** 字典条目（键名与 monster_list.json 一致：中文键，前端不做字段映射） */
+export interface MonsterConfig {
+  /** 默认历战等级：0=普通, 1=历战, 2=历战王 */
+  默认历战等级: number;
+  图标地址: string;
+  别称: string[];
+}
+
+/** 全量字典：{ 怪物原名: 条目 } */
+export type MonsterDict = Record<string, MonsterConfig>;
+
+/** 点怪禁点名单（名单内的怪物不可被点单：弹幕点怪与选怪面板同时生效；空名单 = 不限制） */
+export interface RosterData {
+  /** 禁点怪物原名列表 */
+  items: string[];
+}
+
 // ---------- D3 跑马灯 ----------
 export interface OrderPlacedPayload {
   user_id: string;
   user_name: string;
   monster_name: string;
   is_priority: boolean;
+}
+
+/** 禁点名单拦截：命中字典但该怪已被禁点（不入队，仅就地提示） */
+export interface OrderBlockedPayload {
+  user_id: string;
+  user_name: string;
+  monster_name: string;
 }
 
 // ---------- D4 业务事件气泡 / 动态 ----------

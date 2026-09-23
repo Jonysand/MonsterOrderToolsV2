@@ -7,6 +7,7 @@ import {
   AppConfig,
   AIBubblePayload,
   OrderPlacedPayload,
+  OrderBlockedPayload,
   CheckinReplyPayload,
   RetroactivePayload,
   LikeRewardPayload,
@@ -303,6 +304,12 @@ export const OverlayWindow: React.FC = () => {
       pushMarquee(text);
     });
 
+    // 禁点名单拦截：命中字典但该怪已在禁点名单内 —— 不入队，跑马灯就地提示原因
+    const unlistenBlocked = listen<OrderBlockedPayload>("order-blocked", (event) => {
+      const { user_name, monster_name } = event.payload;
+      pushMarquee(`${user_name} 点怪 ${monster_name} 未生效（已在禁点名单）`);
+    });
+
     // D4 AI 气泡（思考中 → 回答）
     const unlistenAi = listen<AIBubblePayload>("ai-bubble", (event) => {
       const payload = event.payload;
@@ -419,6 +426,7 @@ export const OverlayWindow: React.FC = () => {
       clearInterval(interval);
       unlistenQueue.then((f) => f());
       unlistenOrder.then((f) => f());
+      unlistenBlocked.then((f) => f());
       unlistenAi.then((f) => f());
       unlistenCheckin.then((f) => f());
       unlistenRetro.then((f) => f());
