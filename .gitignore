@@ -38,3 +38,7 @@ dist-ssr
 *.sln
 *.sw?
 .zcodeignore
+
+# 字体子集化用的本地 Python 环境（脚本见 scripts/fonts/subset_fonts.py）
+.venv
+__pycache__/

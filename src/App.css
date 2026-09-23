@@ -1,8 +1,111 @@
 ﻿@import "tailwindcss";
 
+/* =============================================================================
+   随包字体（子集化产物，见 scripts/fonts/subset_fonts.py）
+   家族名沿用设计稿的 MH 前缀，避免与系统已装的同名思源字体混淆
+   ============================================================================= */
+
+/* 思源宋体：只服务怪物名与固定衬线文案，字表受怪物别名表约束 */
+@font-face {
+  font-family: "MH Serif SC";
+  src: url("./assets/fonts/MH-Serif-SC-MonsterNames.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* 思源黑体：昵称 / 徽章 / 正文，含 GB2312 一级常用字，冷僻字回落系统字体 */
+@font-face {
+  font-family: "MH Sans SC";
+  src: url("./assets/fonts/MH-Sans-SC-Common.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* DM Serif Display：顺位数字与拉丁标题 */
+@font-face {
+  font-family: "MH DM Serif";
+  src: url("./assets/fonts/DMSerifDisplay-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* =============================================================================
+   悬浮窗主题变量层
+   配色取自官方素材：MH Wilds 官网样式表（荒野）+ 凌越官网样式表（凌越）
+   稀有度与大航海等级两套主题共用同一语义，换主题不换含义
+   ============================================================================= */
+
 :root {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  /* 全应用字体栈：主窗口与悬浮窗统一走内嵌黑体（设计稿 body 即 MH Sans SC） */
+  font-family: var(--font-sans);
   color-scheme: dark;
+
+  /* 字体三元组：沿用 Tailwind 主题变量名，故 font-sans / font-serif 工具类一并生效 */
+  --font-sans: "MH Sans SC", "Noto Sans SC", "Source Han Sans SC", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  /* 怪物名 / 面板标题 / 钤印；字表未覆盖的怪物名回落内嵌黑体，不落到系统字体上 */
+  --font-serif: "MH Serif SC", "MH Sans SC", "Noto Serif SC", "Source Han Serif SC", "Songti SC",
+    serif;
+  /* 顺位数字与计数：碑刻感数字 */
+  --font-num: "MH DM Serif", "MH Serif SC", serif;
+
+  /* 面板底色必须是 RGB 三元组：透明度滑杆通过 --panel-alpha 参与渐变合成，
+     否则不透明渐变（background-image）会盖住仅改 background-color 的内联样式 */
+  --panel-alpha: 1;
+
+  /* 荒野（默认） */
+  --panel-a: 34 27 15;
+  --panel-b: 25 19 8;
+  --line: #5c4a15;
+  --line-soft: rgba(146, 120, 40, 0.34);
+  --ink: #f2ead4;
+  --ink-dim: #b8ae93;
+  --ink-faint: #7d7460;
+  --cream: #fcf5de;
+  --hl: #ddc94a;
+  --hl2: #ff7200;
+  --glow: rgba(221, 201, 74, 0.35);
+  /* 环境闪频色：荒野偏暖（热浪掠光），凌越偏冷（雷光） */
+  --flash: rgba(255, 238, 200, 0.9);
+  /* 环境雾霭底色：比 --glow 更淡，只铺氛围不抢内容 */
+  --decor-glow: rgba(221, 201, 74, 0.2);
+  --row-bg: rgba(0, 0, 0, 0.34);
+  --row-bg-hover: rgba(0, 0, 0, 0.52);
+  /* 浮起条目底色：不透光，压在别的行上也要清晰可读 */
+  --row-bg-lift: rgba(30, 24, 13, 0.97);
+
+  /* 稀有度（主题无关） */
+  --r-normal: #c7c0ab;
+  --r-tempered: #a78bfa;
+  --r-arch: #ffa02e;
+  --r-priority: #ffd66b;
+
+  /* 大航海等级 */
+  --g1: #fed100;
+  --g2: #b48cf2;
+  --g3: #76dcff;
+
+  --stamp: #e0472f;
+  --danger: #c0392b;
+}
+
+[data-theme="asc"] {
+  --panel-a: 13 33 56;
+  --panel-b: 8 25 44;
+  --line: #2f6d94;
+  --line-soft: rgba(118, 220, 255, 0.26);
+  --ink: #eef6fb;
+  --ink-dim: #9dc4dd;
+  --ink-faint: #5f7f96;
+  --hl: #76dcff;
+  --hl2: #8891f3;
+  --glow: rgba(118, 220, 255, 0.4);
+  --flash: rgba(180, 235, 255, 0.9);
+  --decor-glow: rgba(118, 220, 255, 0.2);
+  --row-bg-lift: rgba(9, 24, 40, 0.97);
 }
 
 body {
@@ -10,6 +113,10 @@ body {
   padding: 0;
   user-select: none;
 }
+
+/* =============================================================================
+   跑马灯
+   ============================================================================= */
 
 @keyframes marquee {
   0% { transform: translateX(100%); }
@@ -37,10 +144,606 @@ body {
   animation-play-state: paused;
 }
 
+/* 主窗口点单排队管理 tab 仍在引用 */
 .tempered-glow {
   box-shadow: 0 0 10px rgba(168, 85, 247, 0.45);
 }
 
 .arch-tempered-glow {
   box-shadow: 0 0 14px rgba(249, 115, 22, 0.65);
+}
+
+/* =============================================================================
+   悬浮窗面板与顶栏
+   ============================================================================= */
+
+.overlay-panel {
+  /* 透明度由 overlay 内联注入的 --panel-alpha 决定（原工程 MainGrid 背景 alpha 语义） */
+  background: linear-gradient(
+    160deg,
+    rgb(var(--panel-a) / var(--panel-alpha)),
+    rgb(var(--panel-b) / var(--panel-alpha))
+  );
+  border: 1px solid var(--line);
+  transition: border-color 0.5s;
+}
+
+.overlay-title {
+  font-family: var(--font-serif);
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--cream);
+}
+
+.overlay-count {
+  /* 计数与顺位数字统一用 DM Serif Display（设计说明 §1.4「顺位数字」） */
+  font-family: var(--font-num);
+  font-size: 11px;
+  color: var(--hl);
+  border: 1px solid var(--line-soft);
+  padding: 1px 7px;
+  border-radius: 2px;
+}
+
+/* 顶栏回纹饰带：几何回纹为 MH 系列品牌纹样 */
+.overlay-band {
+  display: block;
+  width: 100%;
+  height: 9px;
+  color: var(--line);
+  opacity: 0.85;
+}
+
+/* =============================================================================
+   队列行结构
+   槽位：手柄 ｜ 顺位 ｜ 昵称 ｜ 图鉴卡 ｜ 怪物名 ｜ 徽章组
+   行高 60 = 条目 56 + 间距 4（对齐原工程 ListViewItem Height=60）
+   ============================================================================= */
+
+.queue-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  /* 间距与内边距收 2px：把空间让给放大后的昵称与怪物名 */
+  gap: 6px;
+  height: 56px;
+  margin-bottom: 4px;
+  padding: 0 10px 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: var(--row-bg);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.16s, background 0.16s;
+  --rc: var(--r-normal);
+}
+
+.queue-row:hover {
+  background: var(--row-bg-hover);
+  border-color: var(--rc);
+}
+
+.queue-row[data-rarity="1"] { --rc: var(--r-tempered); }
+.queue-row[data-rarity="2"] { --rc: var(--r-arch); }
+.queue-row[data-priority="1"] { --rc: var(--r-priority); }
+
+/* 拖拽占位：被抓起条目在列表里让出的空位（内容在浮起层） */
+.queue-row-placeholder {
+  border-style: dashed;
+  border-color: var(--line-soft);
+  background: transparent;
+}
+
+.queue-row-placeholder .queue-spine { opacity: 0.25; }
+
+/* 浮起层：脱离列表流的被拖条目，跟手移动（位置由 style.transform 直接写） */
+.queue-float {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 30;
+  pointer-events: none;
+  will-change: transform;
+}
+
+.queue-row-lifted {
+  border-color: var(--hl);
+  background: var(--row-bg-lift);
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.7), 0 2px 6px rgba(0, 0, 0, 0.5);
+  transform: scale(1.015);
+  cursor: grabbing;
+}
+
+/* 稀有度脊线：行首竖脊 + 辉光 */
+.queue-spine {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--rc);
+}
+
+.queue-spine::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--rc);
+  filter: blur(6px);
+  opacity: 0.55;
+}
+
+/* 四角角标：对应游戏内锁定框 */
+.queue-corner {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--rc);
+  opacity: 0.5;
+  pointer-events: none;
+  transition: opacity 0.15s;
+}
+
+.queue-corner.tl { left: 5px; top: 5px; border-right: 0; border-bottom: 0; }
+.queue-corner.br { right: 5px; bottom: 5px; border-left: 0; border-top: 0; }
+
+.queue-row:hover .queue-corner { opacity: 1; }
+
+/* 行首手柄热区：手柄图标与顺位号一起可按下，到昵称之前结束。
+   width 恰好等于「图标 14 + 间距 6 + 顺位号 20」，故行内其余槽位位置不变 */
+.queue-handle {
+  flex: none;
+  width: 40px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.queue-handle:active { cursor: grabbing; }
+
+.queue-grip {
+  flex: none;
+  width: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-faint);
+  opacity: 0.55;
+  transition: opacity 0.15s, color 0.15s;
+}
+
+.queue-handle:hover .queue-grip {
+  opacity: 1;
+  color: var(--hl);
+}
+
+.queue-seq {
+  flex: none;
+  width: 20px;
+  text-align: center;
+  font-family: var(--font-num);
+  font-size: 12px;
+  letter-spacing: -0.02em;
+  color: var(--ink-faint);
+}
+
+.queue-nick {
+  flex: none;
+  width: 110px;
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--ink-dim);
+}
+
+/* 图鉴卡：稀有度描边 + 内衬底色 + 上下菱形 */
+.queue-iconcard {
+  position: relative;
+  flex: none;
+  width: 38px;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--rc);
+  border-radius: 2px;
+  background: radial-gradient(circle at 50% 35%, rgba(255, 255, 255, 0.1), rgba(0, 0, 0, 0.5));
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.6);
+}
+
+.queue-iconcard::before,
+.queue-iconcard::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 5px;
+  height: 5px;
+  background: var(--rc);
+  transform: translateX(-50%) rotate(45deg);
+  opacity: 0.8;
+}
+
+.queue-iconcard::before { top: -3.5px; }
+.queue-iconcard::after { bottom: -3.5px; }
+
+.queue-iconcard img {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+}
+
+.queue-iconcard .icon-fallback {
+  color: var(--rc);
+  opacity: 0.72;
+}
+
+/* 怪物名：镌刻质感，行内主视觉 */
+.queue-mon {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-serif);
+  font-size: 16px;
+  /* 可变字重取 650：明显比 600 更实，同时不踩设计说明「深底浅字不上 700」的红线 */
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  color: var(--cream);
+  filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.85));
+}
+
+/* 金属镌刻：上白下暗的渐变裁进字里（不支持的浏览器保留 --cream 实色） */
+@supports ((background-clip: text) or (-webkit-background-clip: text)) {
+  .queue-mon-text {
+    background: linear-gradient(#ffffff, var(--cream) 46%, #b9b09a);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+.queue-badges {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  transition: opacity 0.16s;
+}
+
+.queue-chip {
+  font-size: 9.5px;
+  padding: 2px 6px;
+  border-radius: 1px;
+  border: 1px solid currentColor;
+  letter-spacing: 0.06em;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.queue-chip.g1 { color: var(--g1); }
+.queue-chip.g2 { color: var(--g2); }
+.queue-chip.g3 { color: var(--g3); }
+.queue-chip.prio { color: var(--r-priority); animation: prioP 1.5s ease-in-out infinite; }
+
+@keyframes prioP {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 214, 107, 0); }
+  50% { box-shadow: 0 0 9px 1px rgba(255, 214, 107, 0.5); }
+}
+
+/* 大航海等级双斜杠标记 */
+.queue-chev {
+  display: inline-flex;
+  gap: 1.5px;
+}
+
+.queue-chev i {
+  width: 3px;
+  height: 7px;
+  background: currentColor;
+  display: block;
+  transform: skewX(-18deg);
+  opacity: 0.9;
+}
+
+/* 悬停提示：整行可点击完成 */
+.queue-hint {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 11px;
+  color: var(--hl);
+  opacity: 0;
+  transition: opacity 0.2s;
+  white-space: nowrap;
+  pointer-events: none;
+  letter-spacing: 0.08em;
+}
+
+.queue-row:hover .queue-hint { opacity: 0.92; }
+.queue-row:hover .queue-badges { opacity: 0; }
+
+/* 悬浮在行首手柄热区上时按「要拖拽」处理，不是要完成：
+   不提示点击完成，右侧徽章也让回来可读（提示与徽章同一位置，本来互相顶掉） */
+.queue-row:has(.queue-handle:hover) .queue-hint { opacity: 0; }
+.queue-row:has(.queue-handle:hover) .queue-badges { opacity: 1; }
+
+/* =============================================================================
+   队列行动效
+   ============================================================================= */
+
+/* 入场：侧移归位 */
+.queue-row-enter {
+  animation: queueRowIn 0.42s cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+
+@keyframes queueRowIn {
+  from { opacity: 0; transform: translateX(34px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+/* 完成：钤印 500ms 与离场 420ms（延迟 500ms）重叠，总时长 950ms */
+.queue-row-completing {
+  pointer-events: none;
+  animation: queueRowOut 0.42s 0.5s ease forwards;
+}
+
+@keyframes queueRowOut {
+  to { opacity: 0; transform: scale(0.97); }
+}
+
+.queue-stamp {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  font-family: var(--font-serif);
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: 0.14em;
+  color: var(--stamp);
+  border: 2px solid var(--stamp);
+  border-radius: 3px;
+  padding: 2px 9px;
+  background: rgba(10, 8, 6, 0.35);
+  transform: translate(-50%, -50%) rotate(-11deg) scale(2.4);
+  opacity: 0;
+  pointer-events: none;
+  text-shadow: 0 0 6px rgba(224, 71, 47, 0.5);
+}
+
+.queue-row-completing .queue-stamp {
+  animation: queueStampIn 0.5s cubic-bezier(0.2, 1.5, 0.4, 1) forwards;
+}
+
+@keyframes queueStampIn {
+  0% { opacity: 0; transform: translate(-50%, -50%) rotate(-11deg) scale(2.4); filter: blur(4px); }
+  60% { opacity: 1; transform: translate(-50%, -50%) rotate(-11deg) scale(1); filter: blur(0); }
+  100% { opacity: 1; transform: translate(-50%, -50%) rotate(-11deg) scale(1); }
+}
+
+.queue-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(224, 71, 47, 0.85);
+  transform: translate(-50%, -50%) scale(0.4);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.queue-row-completing .queue-ring {
+  animation: queueRingOut 0.6s 0.05s ease-out forwards;
+}
+
+@keyframes queueRingOut {
+  0% { opacity: 0.9; transform: translate(-50%, -50%) scale(0.4); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(9); }
+}
+
+/* 装饰动效：默认关闭，设置开启后挂载（data-decor="on"） */
+.queue-sheen {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 90px;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+  transform: translateX(-120px);
+}
+
+[data-decor="on"] .queue-row[data-priority="1"] .queue-sheen {
+  animation: queueSheen 5.6s ease-in-out infinite;
+}
+
+@keyframes queueSheen {
+  0% { transform: translateX(-120px); }
+  60%, 100% { transform: translateX(560px); }
+}
+
+/* 脊线呼吸：每行相位错开，避免整列同步闪烁 */
+[data-decor="on"] .queue-spine::after {
+  animation: queueBreath 7s ease-in-out infinite;
+}
+
+[data-decor="on"] .queue-row:nth-child(2n) .queue-spine::after {
+  animation-delay: 2.3s;
+}
+
+[data-decor="on"] .queue-row:nth-child(3n) .queue-spine::after {
+  animation-delay: 4.6s;
+}
+
+@keyframes queueBreath {
+  0%, 100% { opacity: 0.28; }
+  50% { opacity: 0.92; }
+}
+
+/* 环境装饰（默认关闭，data-decor="on" 时挂载）：两套主题共用结构，仅换色与节奏。
+   荒野＝沙霾浮尘，凌越＝云雾雷光 —— 色彩统一取 --decor-glow / --glow，换主题即换氛围 */
+.overlay-sky {
+  position: absolute;
+  inset: -40%;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.overlay-sky i {
+  position: absolute;
+  border-radius: 50%;
+  display: block;
+}
+
+.overlay-sky i:nth-child(1) {
+  width: 320px; height: 190px; left: -70px; top: 0;
+  background: radial-gradient(closest-side, var(--decor-glow), transparent 72%);
+}
+.overlay-sky i:nth-child(2) {
+  width: 280px; height: 210px; right: -60px; bottom: -30px;
+  background: radial-gradient(closest-side, var(--decor-glow), transparent 72%);
+}
+
+[data-decor="on"] .overlay-sky i:nth-child(1) {
+  animation: skyDrift1 48s ease-in-out infinite;
+}
+[data-decor="on"] .overlay-sky i:nth-child(2) {
+  animation: skyDrift2 64s ease-in-out infinite;
+}
+
+@keyframes skyDrift1 {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(52px, -18px); }
+}
+
+@keyframes skyDrift2 {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(-46px, 22px); }
+}
+
+/* 斜掠灵光：一次 12s，两端留白，扫过时有明显但不刺眼的过渡 */
+.overlay-drift {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(102deg, transparent 36%, var(--glow) 50%, transparent 64%);
+}
+
+[data-decor="on"] .overlay-drift {
+  animation: overlayDrift 12s ease-in-out infinite;
+}
+
+@keyframes overlayDrift {
+  0%, 16% { opacity: 0; transform: translateX(-16%); }
+  40% { opacity: 0.5; }
+  62% { opacity: 0.5; }
+  86%, 100% { opacity: 0; transform: translateX(16%); }
+}
+
+.overlay-flash {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0;
+  background: var(--flash);
+}
+
+[data-decor="on"] .overlay-flash {
+  animation: overlayBolt 24s linear infinite;
+}
+
+@keyframes overlayBolt {
+  0%, 91%, 100% { opacity: 0; }
+  92% { opacity: 0.14; }
+  92.6% { opacity: 0; }
+  93.4% { opacity: 0.24; }
+  94% { opacity: 0; }
+}
+
+/* =============================================================================
+   撤销垫
+   ============================================================================= */
+
+.queue-undo {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  border-radius: 3px;
+  background: rgba(12, 10, 8, 0.94);
+  border: 1px solid var(--danger);
+  color: #ffb3a3;
+  font-size: 11.5px;
+  transform: translateX(-50%) translateY(10px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s, transform 0.22s;
+}
+
+.queue-undo.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}
+
+.queue-undo button {
+  font-size: 11.5px;
+  padding: 3px 10px;
+  border-radius: 2px;
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid #ff8b7a;
+  color: #ff8b7a;
+  transition: background 0.16s;
+}
+
+.queue-undo button:hover {
+  background: rgba(192, 57, 43, 0.22);
+}
+
+/* =============================================================================
+   空状态
+   ============================================================================= */
+
+.queue-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--ink-faint);
+  font-size: 12.5px;
+  letter-spacing: 0.12em;
+}
+
+/* =============================================================================
+   动效降级：系统偏好减少动效时全部关闭
+   ============================================================================= */
+
+@media (prefers-reduced-motion: reduce) {
+  .queue-row,
+  .queue-row *,
+  .overlay-sky i,
+  .overlay-drift,
+  .overlay-flash,
+  .queue-chip {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* 离场动画被禁用时立即呈现终态，避免行残留 */
+  .queue-row-completing {
+    opacity: 0;
+  }
 }

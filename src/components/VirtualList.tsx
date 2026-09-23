@@ -24,13 +24,24 @@ export function VirtualList<T>({
 }: VirtualListProps<T>) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [range, setRange] = useState({ start: 0, end: 0 });
+  /**
+   * 最新输入快照：ResizeObserver 只挂载一次，其回调永远闭包着首帧的 items，
+   * 若直接读闭包内的 items.length 会把可视区回滚成旧长度、导致新入队条目不再渲染
+   * —— 故一律经此 ref 读实时值。
+   */
+  const inputRef = useRef({ items, rowHeight, overscan });
+
+  useEffect(() => {
+    inputRef.current = { items, rowHeight, overscan };
+  });
 
   const recompute = () => {
     const el = containerRef.current;
     if (!el) return;
-    const visibleCount = Math.ceil(el.clientHeight / rowHeight) + overscan * 2;
-    const start = Math.max(0, Math.floor(el.scrollTop / rowHeight) - overscan);
-    const end = Math.min(items.length, start + visibleCount);
+    const { items: list, rowHeight: rh, overscan: os } = inputRef.current;
+    const visibleCount = Math.ceil(el.clientHeight / rh) + os * 2;
+    const start = Math.max(0, Math.floor(el.scrollTop / rh) - os);
+    const end = Math.min(list.length, start + visibleCount);
     setRange((prev) => (prev.start === start && prev.end === end ? prev : { start, end }));
   };
 

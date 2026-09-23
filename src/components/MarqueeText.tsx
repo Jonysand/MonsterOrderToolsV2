@@ -3,6 +3,8 @@
 interface MarqueeTextProps {
   text: string;
   className?: string;
+  /** 内层滚动 span 的类名（渐变裁字等需挂在文字本体上） */
+  textClassName?: string;
 }
 
 /**
@@ -10,7 +12,7 @@ interface MarqueeTextProps {
  * 对齐原工程 OrderedMonsterWindow.OnScrollTextLoaded / OnScrollTextMouseEnter / OnScrollTextMouseLeave
  * （时长按「超出像素 / 25」估算，最少 2 秒）。
  */
-export const MarqueeText: React.FC<MarqueeTextProps> = ({ text, className }) => {
+export const MarqueeText: React.FC<MarqueeTextProps> = ({ text, className, textClassName }) => {
   const boxRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLSpanElement>(null);
   const [shift, setShift] = useState(0);
@@ -43,7 +45,7 @@ export const MarqueeText: React.FC<MarqueeTextProps> = ({ text, className }) => 
 
   return (
     <div ref={boxRef} className={`overflow-hidden marquee-pause ${className ?? ""}`} title={text}>
-      <span ref={textRef} className="inline-block whitespace-nowrap" style={style}>
+      <span ref={textRef} className={`inline-block whitespace-nowrap ${textClassName ?? ""}`} style={style}>
         {text}
       </span>
     </div>

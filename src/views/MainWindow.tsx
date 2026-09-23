@@ -2199,7 +2199,28 @@ export const MainWindow: React.FC = () => {
                       className="w-full accent-amber-500"
                     />
                   </div>
+                  <div>
+                    <label className="block text-[11px] text-neutral-400 mb-1">点怪列表主题</label>
+                    <select
+                      value={config.overlay_theme}
+                      onChange={(e) => applyConfigPatch({ overlay_theme: e.target.value })}
+                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200"
+                    >
+                      <option value="wilds">调查队 · 荒野（沙骨米白 / 橄榄 / 夕阳橙）</option>
+                      <option value="asc">云居遗迹 · 凌越（深夜蓝 / 天青 / 蓝紫）</option>
+                    </select>
+                  </div>
                 </div>
+
+                <label className="flex items-center gap-2 text-xs text-neutral-300 font-bold cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={config.enable_overlay_decor}
+                    onChange={(e) => applyConfigPatch({ enable_overlay_decor: e.target.checked })}
+                    className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
+                  />
+                  <span>环境装饰动效（优先扫光 / 脊线呼吸 / 云雾雷光）</span>
+                </label>
 
                 <div className="bg-neutral-950/80 border border-neutral-800 rounded-xl p-4 space-y-2">
                   <div className="flex items-center gap-3 flex-wrap">

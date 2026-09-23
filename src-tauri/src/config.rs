@@ -46,6 +46,10 @@ pub struct AppConfig {
     pub top_pos_x: f64,
     pub top_pos_y: f64,
     pub default_marquee_text: String,
+    /// 悬浮窗主题：wilds（荒野）/ asc（凌越）
+    pub overlay_theme: String,
+    /// 环境装饰动效（云雾/雷光/扫光/呼吸）开关，默认关闭
+    pub enable_overlay_decor: bool,
 
     // 5. 舰长打卡与 AI 配置
     pub enable_captain_checkin_ai: bool,
@@ -91,6 +95,8 @@ impl Default for AppConfig {
             top_pos_y: 0.0,
             // 原工程默认空串；UI 层（悬浮窗与设置页）以「发送'点怪 xxx'进行点怪」兜底显示
             default_marquee_text: String::new(),
+            overlay_theme: "wilds".into(),
+            enable_overlay_decor: false,
 
             enable_captain_checkin_ai: true,
             checkin_trigger_words: "打卡,签到".into(),

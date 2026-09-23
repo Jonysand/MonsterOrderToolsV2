@@ -66,6 +66,10 @@ export interface AppConfig {
   top_pos_x: number;
   top_pos_y: number;
   default_marquee_text: string;
+  /** 悬浮窗主题：wilds（荒野）/ asc（凌越） */
+  overlay_theme: string;
+  /** 环境装饰动效开关（云雾/雷光/扫光/呼吸），默认关闭 */
+  enable_overlay_decor: boolean;
 
   enable_captain_checkin_ai: boolean;
   checkin_trigger_words: string;

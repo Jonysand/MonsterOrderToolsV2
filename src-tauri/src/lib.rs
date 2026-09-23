@@ -281,6 +281,24 @@ fn reorder_queue(
     Ok(current_items)
 }
 
+/// 撤销完成：把条目原样插回指定下标（保留原 id 与 timestamp）
+#[tauri::command]
+fn restore_order(
+    item: QueueItem,
+    index: usize,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<Vec<QueueItem>, String> {
+    let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+    q.restore(item, index);
+    let items = q.items.clone();
+    drop(q);
+
+    save_queue_now(&state);
+    let _ = app_handle.emit("queue-updated", &items);
+    Ok(items)
+}
+
 /// 匹配怪物名称
 #[tauri::command]
 fn match_monster_name(
@@ -1544,6 +1562,83 @@ fn set_overlay_locked(
     apply_overlay_lock(&app_handle, &state, locked)
 }
 
+/// 悬浮窗位置兜底：记忆位置完全落在所有显示器之外时（换屏、改分辨率、拔掉副屏），
+/// 夹紧到第一个显示器的可见区域内。否则窗口永久不可见，用户除了手改配置文件无法找回。
+/// `monitors` 为逻辑坐标的 (left, top, width, height)，主显示器应排在首位。
+fn clamp_overlay_position(
+    x: f64,
+    y: f64,
+    win_w: f64,
+    win_h: f64,
+    monitors: &[(f64, f64, f64, f64)],
+) -> (f64, f64) {
+    // 至少露出这么多像素才算"找得回来"
+    const MIN_VISIBLE_W: f64 = 80.0;
+    const MIN_VISIBLE_H: f64 = 40.0;
+
+    let visible = monitors.iter().any(|(left, top, w, h)| {
+        let overlap_x = (x + win_w).min(left + w) - x.max(*left);
+        let overlap_y = (y + win_h).min(top + h) - y.max(*top);
+        overlap_x >= MIN_VISIBLE_W && overlap_y >= MIN_VISIBLE_H
+    });
+    if visible || monitors.is_empty() {
+        return (x, y);
+    }
+
+    let (left, top, w, h) = monitors[0];
+    (
+        x.clamp(left, (left + w - win_w).max(left)),
+        y.clamp(top, (top + h - win_h).max(top)),
+    )
+}
+
+/// 应用记忆的悬浮窗位置（越界时夹紧到可见区域），返回实际落点
+fn apply_overlay_position(win: &tauri::WebviewWindow, x: f64, y: f64) -> (f64, f64) {
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let (win_w, win_h) = win
+        .outer_size()
+        .map(|s| (s.width as f64 / scale, s.height as f64 / scale))
+        .unwrap_or((440.0, 360.0));
+
+    let mut monitors: Vec<(f64, f64, f64, f64)> = Vec::new();
+    if let Ok(Some(m)) = win.primary_monitor() {
+        let p = m.position();
+        let s = m.size();
+        monitors.push((
+            p.x as f64 / scale,
+            p.y as f64 / scale,
+            s.width as f64 / scale,
+            s.height as f64 / scale,
+        ));
+    }
+    for m in win.available_monitors().unwrap_or_default() {
+        let p = m.position();
+        let s = m.size();
+        let rect = (
+            p.x as f64 / scale,
+            p.y as f64 / scale,
+            s.width as f64 / scale,
+            s.height as f64 / scale,
+        );
+        if !monitors.contains(&rect) {
+            monitors.push(rect);
+        }
+    }
+
+    let (cx, cy) = clamp_overlay_position(x, y, win_w, win_h, &monitors);
+    if (cx - x).abs() > 0.5 || (cy - y).abs() > 0.5 {
+        crate::log_warn!(
+            "[Overlay] 记忆位置 ({:.0}, {:.0}) 超出可见区域，已夹紧到 ({:.0}, {:.0})",
+            x,
+            y,
+            cx,
+            cy
+        );
+    }
+    let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(cx, cy)));
+    (cx, cy)
+}
+
 /// 记录悬浮窗拖动后的新位置（防抖落盘到配置 top_pos_x/y，由后台任务写文件）
 #[tauri::command]
 fn save_overlay_position(
@@ -1603,6 +1698,14 @@ fn toggle_window(app_handle: AppHandle, label: String) -> Result<bool, String> {
             window.hide().map_err(|e| e.to_string())?;
             Ok(false)
         } else {
+            // 显示前先校正位置：位置若在屏幕外（换屏/改分辨率），用户点"桌面点怪悬浮窗"也找不回来
+            let (px, py) = app_handle
+                .state::<AppState>()
+                .config
+                .lock()
+                .map(|c| (c.top_pos_x, c.top_pos_y))
+                .unwrap_or((0.0, 0.0));
+            apply_overlay_position(&window, px, py);
             window.show().map_err(|e| e.to_string())?;
             let _ = window.set_focus();
             Ok(true)
@@ -1745,10 +1848,20 @@ pub fn run() {
                     .map(|c| (c.top_pos_x, c.top_pos_y))
                     .unwrap_or((0.0, 0.0));
                 if let Some(win) = app.get_webview_window("overlay") {
-                    // 原工程无条件应用 TopPos（默认 0,0 即屏幕左上），此处同样不做哨兵判断
-                    let _ = win.set_position(tauri::Position::Logical(
-                        tauri::LogicalPosition::new(px, py),
-                    ));
+                    // 原工程无条件应用 TopPos（默认 0,0 即屏幕左上），此处同样不做哨兵判断；
+                    // 但越界位置会导致窗口永久不可见，故统一经可见区域夹紧
+                    let (cx, cy) = apply_overlay_position(&win, px, py);
+                    // 夹紧结果回写配置：否则 set_position 不触发 onMoved，配置里会一直留着
+                    // 那个无效位置，每次启动都要重新夹紧并告警
+                    if (cx - px).abs() > 0.5 || (cy - py).abs() > 0.5 {
+                        if let Ok(mut cfg) = app.state::<AppState>().config.lock() {
+                            cfg.top_pos_x = cx;
+                            cfg.top_pos_y = cy;
+                            if let Err(e) = cfg.save(None) {
+                                crate::log_warn!("[Overlay] 夹紧后的位置回写失败: {}", e);
+                            }
+                        }
+                    }
                 }
 
                 #[cfg(not(test))]
@@ -1871,6 +1984,7 @@ pub fn run() {
             dequeue_by_user_id,
             clear_queue,
             reorder_queue,
+            restore_order,
             toggle_window,
             hide_window,
             get_credentials_status,
@@ -1953,6 +2067,36 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 悬浮窗位置夹紧：换屏/改分辨率后记忆位置可能完全落在屏外，
+    /// 必须夹回可见区，否则窗口永久不可见（2026-09-23 实测 top_pos_x=1976 于 1920 屏）
+    #[test]
+    fn test_clamp_overlay_position_keeps_window_reachable() {
+        let screen = (0.0, 0.0, 1920.0, 1080.0);
+        let (w, h) = (440.0, 360.0);
+
+        // 屏内 → 原样
+        assert_eq!(clamp_overlay_position(100.0, 100.0, w, h, &[screen]), (100.0, 100.0));
+        // 贴右下角 → 原样（完全可见）
+        assert_eq!(clamp_overlay_position(1480.0, 720.0, w, h, &[screen]), (1480.0, 720.0));
+        // 右侧完全越界（实测值）→ 夹到右边缘
+        assert_eq!(clamp_overlay_position(1976.0, 574.0, w, h, &[screen]), (1480.0, 574.0));
+        // 下方完全越界 → 夹到底边缘
+        assert_eq!(clamp_overlay_position(100.0, 1200.0, w, h, &[screen]), (100.0, 720.0));
+        // 负坐标（显示器移到左侧后残留）→ 夹回 0
+        assert_eq!(clamp_overlay_position(-500.0, -300.0, w, h, &[screen]), (0.0, 0.0));
+        // 露出一角（120×80，达到 80×40 门限）→ 视为用户找得回来，不动它
+        assert_eq!(
+            clamp_overlay_position(1800.0, 1000.0, w, h, &[screen]),
+            (1800.0, 1000.0)
+        );
+        // 落在副屏内 → 不动（副屏放第一位时以副屏为夹紧基准）
+        let dual = [(1920.0, 0.0, 1920.0, 1080.0), screen];
+        assert_eq!(clamp_overlay_position(2000.0, 200.0, w, h, &dual), (2000.0, 200.0));
+        // 显示器信息缺失 → 不夹紧（不能凭猜测挪窗口）
+        assert_eq!(clamp_overlay_position(1976.0, 574.0, w, h, &[]), (1976.0, 574.0));
+        println!("[PASS] test_clamp_overlay_position_keeps_window_reachable passed");
+    }
 
     #[test]
     fn test_app_state_initialization() {

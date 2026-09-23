@@ -28,3 +28,7 @@
 *.dll   binary
 *.so    binary
 *.dylib binary
+*.woff    binary
+*.woff2   binary
+*.ttf     binary
+*.otf     binary

@@ -178,6 +178,21 @@ impl QueueManager {
         self.dirty = true;
     }
 
+    /// 撤销完成：把条目**原样**插回指定下标。
+    /// 保留原 id 与 timestamp —— 若改用 add_order 重建，新时间戳会让该条目在后续
+    /// 优先条目插入时排到错误位置（优先级相同时按 timestamp 先来后到）。
+    /// 与 reorder 一致不做重排，保留主播的手动次序。返回 false 表示该用户已在队中。
+    pub fn restore(&mut self, item: QueueItem, index: usize) -> bool {
+        if self.user_index.contains(&item.user_id) {
+            return false;
+        }
+        let at = index.min(self.items.len());
+        self.user_index.insert(item.user_id.clone());
+        self.items.insert(at, item);
+        self.dirty = true;
+        true
+    }
+
     /// 稳定排序（保证相同优先级下的先后次序）
     pub fn sort_queue(&mut self) {
         self.items.sort_by(|a, b| a.compare_priority(b));
@@ -744,5 +759,75 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);
         println!("[PASS] test_dirty_flag_lifecycle passed");
+    }
+
+    /// 撤销完成（restore_order）：原样插回原下标，保留 id 与 timestamp
+    fn mk_item(uid: &str, prio: bool, ts: i64) -> QueueItem {
+        QueueItem {
+            id: format!("item-{}", uid),
+            user_id: uid.into(),
+            user_name: format!("水友{}", uid),
+            monster_name: "火龙".into(),
+            is_priority: prio,
+            guard_level: 0,
+            tempered_level: 0,
+            timestamp: ts,
+            icon_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_restore_preserves_index_and_identity() {
+        let mut q = QueueManager::new();
+        for (i, uid) in ["a", "b", "c", "d"].iter().enumerate() {
+            q.add_or_update(mk_item(uid, false, (i as i64 + 1) * 10));
+        }
+        let removed = q.dequeue_by_user_id("c").unwrap();
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "d"]
+        );
+
+        // 按删除时的下标 2 原样插回
+        assert!(q.restore(removed.clone(), 2));
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"],
+            "应插回原下标而非队尾"
+        );
+        // id 与 timestamp 均不得被改写
+        assert_eq!(q.items[2].id, removed.id);
+        assert_eq!(q.items[2].timestamp, removed.timestamp);
+        assert!(q.contains("c"), "索引应同步恢复");
+        assert!(q.dirty);
+        println!("[PASS] test_restore_preserves_index_and_identity passed");
+    }
+
+    #[test]
+    fn test_restore_timestamp_semantics_for_later_priority() {
+        // 撤销不得改变时间戳语义：插回后新来的优先条目仍应排在其后
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", false, 100));
+        q.add_or_update(mk_item("b", false, 200));
+        let removed = q.dequeue_by_user_id("a").unwrap();
+        assert!(q.restore(removed, 0));
+
+        // 同优先级（均非优先）按 timestamp 先来后到：a(100) 仍应排在 b(200) 之前
+        q.add_or_update(mk_item("c", false, 300));
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let restamp = q.items[0].timestamp;
+        assert_eq!(restamp, 100, "恢复项时间戳必须保持原值，否则后续插入位置会错");
+
+        // 重复恢复同一用户应被拒绝
+        assert!(!q.restore(q.items[0].clone(), 0));
+        // 下标越界时夹紧到队尾
+        let mut q2 = QueueManager::new();
+        q2.add_or_update(mk_item("x", false, 1));
+        assert!(q2.restore(mk_item("y", false, 2), 99));
+        assert_eq!(q2.items[1].user_id, "y");
+        println!("[PASS] test_restore_timestamp_semantics_for_later_priority passed");
     }
 }
