@@ -8,6 +8,11 @@ import io
 import os
 import sys
 
+# Windows 上 stdout 被重定向（CI 日志、管道）时默认用 cp1252，中文 print 会抛 UnicodeEncodeError
+# 把构建整个带崩；py2 无 reconfigure，hasattr 兜住。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ICON_DIR = os.path.join(ROOT, "public", "monster_icons")
 OUT_FILE = os.path.join(ROOT, "src", "generated", "iconManifest.ts")
