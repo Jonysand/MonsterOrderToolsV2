@@ -104,6 +104,8 @@ npm run tauri build
 * **标准 NSIS 安装包**：`src-tauri/target/release/bundle/nsis/MonsterOrderWilds-Ascendance_0.1.3_x64-setup.exe` (~3.3MB)
 * **MSI 安装包**：`src-tauri/target/release/bundle/msi/MonsterOrderWilds-Ascendance_0.1.3_x64_en-US.msi` (~4.0MB)
 
+> macOS 本地构建（`.app` + `.dmg`）的产物路径、核验方法与平台注意事项见 [docs/DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md) 第五节。
+
 ---
 
 ## 📖 详细文档导航
