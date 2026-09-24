@@ -1,4 +1,4 @@
-﻿# MHDanmuToolsV2 开发与维护指南
+﻿# MonsterOrderWilds-Ascendance 开发与维护指南
 
 本文档为开发者提供本地环境配置、调试开发、单元测试与构建发布的完整操作指引。
 
@@ -52,7 +52,7 @@ npm run verify
 npm run tauri build
 ```
 执行后会在 `src-tauri/target/release/` 下生成：
-* `mhdanmutoolsv2.exe`：独立的单个 EXE 文件（~4.07MB），可直接拷贝分发；
+* `MonsterOrderWilds-Ascendance.exe`：独立的单个 EXE 文件（~4MB），可直接拷贝分发；
 * `bundle/nsis/`：标准 Windows 安装向导安装包。
 
 ---

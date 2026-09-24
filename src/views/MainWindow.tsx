@@ -11,7 +11,6 @@ import {
   AIBubblePayload,
   CredentialsStatus,
   ConnectionStatusPayload,
-  DanmuReceivedPayload,
   LogsSnapshot,
   MonsterDict,
   RosterData,
@@ -101,7 +100,6 @@ export const MainWindow: React.FC = () => {
   const [simGuardEventLevel, setSimGuardEventLevel] = useState(3);
   const [simGuardEventNum, setSimGuardEventNum] = useState(1);
   const [simGuardEventUnit, setSimGuardEventUnit] = useState("月");
-  const [recentDanmu, setRecentDanmu] = useState<DanmuReceivedPayload[]>([]);
   const [recentCheckins, setRecentCheckins] = useState<UserProfile[]>([]);
 
   // 语音设置（D1）
@@ -259,10 +257,7 @@ export const MainWindow: React.FC = () => {
       setAiResult(event.payload);
     });
 
-    // D4/D5 主播控制台动态：原始弹幕与打卡记录
-    const unlistenDanmu = listen<DanmuReceivedPayload>("danmu-received", (event) => {
-      setRecentDanmu((prev) => [event.payload, ...prev].slice(0, 20));
-    });
+    // D4/D5 主播控制台动态：打卡记录
     const unlistenCheckin = listen<UserProfile>("checkin-recorded", (event) => {
       setRecentCheckins((prev) => [event.payload, ...prev].slice(0, 10));
     });
@@ -293,7 +288,6 @@ export const MainWindow: React.FC = () => {
       unlistenQueue.then((f) => f());
       unlistenConn.then((f) => f());
       unlistenAi.then((f) => f());
-      unlistenDanmu.then((f) => f());
       unlistenCheckin.then((f) => f());
       unlistenLock.then((f) => f());
       unlistenMissing.then((f) => f());
@@ -834,9 +828,9 @@ export const MainWindow: React.FC = () => {
               <Shield className="w-5 h-5 text-neutral-950" />
             </div>
             <div>
-              <div className="text-xs font-bold tracking-wider text-amber-300">MH 荒野弹幕</div>
+              <div className="text-xs font-bold tracking-wider text-amber-300">MonsterOrderWilds</div>
               <div className="text-[10px] text-neutral-400 font-mono">
-                Tools V2 旗舰版{appVersion ? ` (v ${appVersion})` : ""}
+                Ascendance{appVersion ? ` (v ${appVersion})` : ""}
               </div>
             </div>
           </div>
@@ -1532,46 +1526,9 @@ export const MainWindow: React.FC = () => {
                 </div>
               </div>
 
-              {/* D4 主播控制台实时动态：原始弹幕 + 打卡记录 */}
+              {/* D4 主播控制台实时动态：打卡记录 */}
               <div className="grid grid-cols-12 gap-6">
-                <div className="col-span-7 bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-3">
-                  <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
-                    <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
-                      <MessageSquare className="w-4 h-4" />
-                      <span>最近弹幕动态</span>
-                    </h3>
-                    <span className="text-[10px] text-neutral-500">最近 20 条</span>
-                  </div>
-                  <div className="max-h-56 overflow-y-auto space-y-1.5 scrollbar-thin scrollbar-thumb-neutral-800">
-                    {recentDanmu.length === 0 ? (
-                      <p className="text-[11px] text-neutral-500 py-4 text-center">
-                        暂无弹幕，连接长连或使用上方模拟通道后此处实时刷新
-                      </p>
-                    ) : (
-                      recentDanmu.map((d, idx) => (
-                        <div
-                          key={`${d.msg_id}-${idx}`}
-                          className="flex items-center gap-2 text-[11px] bg-neutral-950/70 border border-neutral-800/80 rounded px-2 py-1.5"
-                        >
-                          <span className="text-amber-300 font-bold shrink-0">{d.user_name}</span>
-                          {d.guard_level > 0 && (
-                            <span className="text-[9px] bg-blue-600/70 text-white px-1 rounded shrink-0">
-                              舰长{d.guard_level}
-                            </span>
-                          )}
-                          {d.has_medal && d.guard_level === 0 && (
-                            <span className="text-[9px] bg-emerald-700/60 text-white px-1 rounded shrink-0">
-                              粉丝牌
-                            </span>
-                          )}
-                          <span className="text-neutral-300 truncate">{d.message}</span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-
-                <div className="col-span-5 bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-3">
+                <div className="col-span-12 bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-3">
                   <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
                     <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
                       <CalendarCheck className="w-4 h-4" />

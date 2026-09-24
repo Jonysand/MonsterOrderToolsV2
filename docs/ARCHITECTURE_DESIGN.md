@@ -1,6 +1,6 @@
-﻿# MHDanmuToolsV2 系统架构设计说明书
+﻿# MonsterOrderWilds-Ascendance 系统架构设计说明书
 
-本文档描述 `MHDanmuToolsV2` 的总体架构组织、进程间通信模型、窗口机制及业务逻辑设计。
+本文档描述 `MonsterOrderWilds-Ascendance` 的总体架构组织、进程间通信模型、窗口机制及业务逻辑设计。
 
 ---
 
@@ -83,7 +83,6 @@
 | --- | --- | --- |
 | `queue-updated` | `Vec<QueueItem>` | 主窗口 + 悬浮窗队列列表 |
 | `order-placed` | `{user_id, user_name, monster_name, is_priority}` | 悬浮窗跑马灯（D3） |
-| `danmu-received` | `DanmuData` | 主窗口「最近弹幕动态」（D4/D5） |
 | `checkin-recorded` | `UserProfile` | 主窗口「打卡动态」 |
 | `checkin-reply` | `{user_id, user_name, reply, is_ai}` | 悬浮窗打卡气泡 |
 | `retroactive-checkin-recorded` / `retroactive-query` | `{user_id, user_name, reply, …}` | 悬浮窗补签气泡 |

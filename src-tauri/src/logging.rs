@@ -232,7 +232,7 @@ macro_rules! log_debug {
 /// 崩溃报告文本（Rust panic 路径：panic=abort 下 hook 仍会先于 abort 执行）
 pub fn format_crash_report(message: &str, location: &str, backtrace: &str) -> String {
     format!(
-        "================ MHDanmuToolsV2 崩溃报告 ================\n\
+        "=================== MonsterOrderWilds-Ascendance 崩溃报告 ===================\n\
          时间: {}\n\
          消息: {}\n\
          位置: {}\n\

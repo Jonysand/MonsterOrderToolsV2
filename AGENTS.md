@@ -1,7 +1,7 @@
-﻿# Agent Rules for MHDanmuToolsV2
+﻿# Agent Rules for MonsterOrderWilds-Ascendance
 
 ## 项目来源与迁移对照规则
-- **项目前身**：本项目 `MHDanmuToolsV2` 是由原 C++/C# 工程 `D:\VisualStudioProjects\JonysandMHDanmuTools` 完整重构迁移而来。
+- **项目前身**：本项目（发布名 `MonsterOrderWilds-Ascendance`，仓库工程代号 `MHDanmuToolsV2`，Rust crate 名 `mhdanmutoolsv2`）是由原 C++/C# 工程 `D:\VisualStudioProjects\JonysandMHDanmuTools` 完整重构迁移而来。
 - **架构映射**：
   - 原工程后端：C++ (`MonsterOrderWilds`) -> 现迁移为 Rust (`src-tauri/src/`)
   - 原工程前端：C# WPF (`JonysandMHDanmuTools` / `MonsterOrderWildsGUI`) -> 现迁移为 React + TypeScript + Tailwind CSS (`src/`)

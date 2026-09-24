@@ -1,4 +1,4 @@
-﻿# MHDanmuToolsV2 (怪猎荒野 弹幕点怪互动工具 V2)
+﻿# MonsterOrderWilds-Ascendance（怪猎荒野 弹幕点怪互动工具）
 
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2.11-blue.svg)](https://v2.tauri.app/)
 [![React 19](https://img.shields.io/badge/React-19.1-cyan.svg)](https://react.dev/)
@@ -7,13 +7,15 @@
 
 基于 **Tauri v2 + React 19 + TypeScript + Tailwind CSS 4 + Rust** 构建的下一代跨平台怪猎直播弹幕互动工具。
 
+> **命名说明**：对外发布产物统一使用品牌名 `MonsterOrderWilds-Ascendance`（Windows exe、macOS `.app` / `.dmg`、NSIS / MSI 安装包与开始菜单显示名均取此名）；Rust crate 名 `mhdanmutoolsv2`、bundle identifier `com.jonysand.danmutools` 与数据目录 `MonsterOrderWilds_configs` 属技术标识，保持不变。
+
 ---
 
 ## 🌟 核心特性与优势
 
 1. **极致轻量，原生 Standalone 单文件 EXE**：
    - 依赖 Windows 10/11 内置的 WebView2 运行时，无需捆绑庞大的 Chromium 引擎和 Node.js。
-   - 最终输出的生产独立可执行文件 `mhdanmutoolsv2.exe` **体积仅约 4.07 MB**。
+   - 最终输出的生产独立可执行文件 `MonsterOrderWilds-Ascendance.exe` **体积仅约 4 MB**。
    - **真单文件**：零解压、瞬时毫秒级启动、不写 `%TEMP%`，极大降低直播 3A 大作（如《怪物猎人：荒野》）时的 CPU 与内存消耗。
 2. **多窗口协同架构**：
    - **主控制台 (`main`)**：设置直播间参数、实时管理排队队列、手动点单、各功能模块开关与状态监控。
@@ -35,7 +37,7 @@
 ## 📂 目录结构
 
 ```
-MHDanmuToolsV2/
+MonsterOrderWilds-Ascendance/
 ├── src-tauri/                         # Tauri v2 原生宿主 (Rust)
 │   ├── Cargo.toml                     # 依赖与 Release 优化 (LTO, Strip)
 │   ├── tauri.conf.json                # 多窗口、权限、资源打包与构建策略
@@ -98,9 +100,9 @@ npm run verify
 npm run tauri build
 ```
 编译产物位于：
-* **独立单文件 EXE**：`src-tauri/target/release/mhdanmutoolsv2.exe` (~4.07MB)
-* **标准 NSIS 安装包**：`src-tauri/target/release/bundle/nsis/MHDanmuToolsV2_0.1.0_x64-setup.exe` (~3.3MB)
-* **MSI 安装包**：`src-tauri/target/release/bundle/msi/MHDanmuToolsV2_0.1.0_x64_en-US.msi` (~4.0MB)
+* **独立单文件 EXE**：`src-tauri/target/release/MonsterOrderWilds-Ascendance.exe` (~4MB)
+* **标准 NSIS 安装包**：`src-tauri/target/release/bundle/nsis/MonsterOrderWilds-Ascendance_0.1.3_x64-setup.exe` (~3.3MB)
+* **MSI 安装包**：`src-tauri/target/release/bundle/msi/MonsterOrderWilds-Ascendance_0.1.3_x64_en-US.msi` (~4.0MB)
 
 ---
 
@@ -113,3 +115,9 @@ npm run tauri build
 * 调研与对比：请参阅 [docs/MIGRATION_ANALYSIS.md](docs/MIGRATION_ANALYSIS.md)
 * 开发与测试：请参阅 [docs/DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md)
 * 规范与规则：请参阅 [AGENTS.md](AGENTS.md)
+
+---
+
+## 🎨 素材与致谢
+
+* **应用图标**：原创作者为 [B 站空间 20253814](https://space.bilibili.com/20253814)，图标由 **ChatGPT Image** 在其原创图基础上风格化修改而来，用作 `MonsterOrderWilds-Ascendance` 的应用图标。

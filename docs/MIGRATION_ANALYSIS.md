@@ -61,5 +61,5 @@
 
 ## 四、 结论与落地成果
 
-综合体积、冷启动性能、直播资源占用与 Windows 单文件交付需求，**最终决定采用 Tauri v2 作为 MHDanmuToolsV2 的基础技术底座**。
-在实际验证中，生产编译输出的独立 `mhdanmutoolsv2.exe` **仅为 4.07 MB**，完美达成单文件 Standalone 的产品目标。
+综合体积、冷启动性能、直播资源占用与 Windows 单文件交付需求，**最终决定采用 Tauri v2 作为 MonsterOrderWilds-Ascendance 的基础技术底座**。
+在实际验证中，生产编译输出的独立 `MonsterOrderWilds-Ascendance.exe` **仅为 4.07 MB**，完美达成单文件 Standalone 的产品目标。

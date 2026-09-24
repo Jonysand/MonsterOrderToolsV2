@@ -1,6 +1,6 @@
 ﻿# 生产版全功能实测报告（UI Functional Test Report）
 
-- **被测产物**：`src-tauri/target/release/mhdanmutoolsv2.exe`（批次 A~E 全部完成后构建，17.79 MB；安装包 MSI 11.65 MB / NSIS 9.96 MB）
+- **被测产物**：`src-tauri/target/release/MonsterOrderWilds-Ascendance.exe`（批次 A~E 全部完成后构建，17.79 MB；安装包 MSI 11.65 MB / NSIS 9.96 MB）
 - **对应提交**：`f32e310`（标签 `v0.1.0`）
 - **测试日期**：2026-09-19
 - **测试方式**：computer-use 驱动真实桌面 UI（主窗口 + 悬浮窗），以「界面截图 + 落盘文件 + SQLite + 日志 + 注册表 + 子进程探针」多路交叉取证
@@ -164,7 +164,7 @@
 
 ### P3｜文档措辞与实现不符
 
-- `docs/ARCHITECTURE_DESIGN.md:111` 称 Lite 下「控制台标题指示器变更为金黄色『Lite 纯排队模式』」。实际实现为**页面内琥珀徽章**，OS 窗口标题栏始终为「怪猎荒野 弹幕点怪工具 V2 - 控制台」（前端无 `setTitle` 调用）。
+- `docs/ARCHITECTURE_DESIGN.md:111` 称 Lite 下「控制台标题指示器变更为金黄色『Lite 纯排队模式』」。实际实现为**页面内琥珀徽章**，OS 窗口标题栏始终为「MonsterOrderWilds-Ascendance - 控制台」（前端无 `setTitle` 调用）。
 - 建议：把该句改为「页面标题栏指示徽章」，或补 `setTitle` 实现以贴合原工程。
 - **修复状态（2026-09-19）**：✅ 已修订（F6）——`ARCHITECTURE_DESIGN.md` 改为描述实际实现（页内琥珀徽章 + 导航停用标签），并注明原工程 Lite 下不修改窗口标题、V2 不调用 `setTitle`。
 

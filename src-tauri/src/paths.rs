@@ -227,10 +227,10 @@ mod tests {
     #[test]
     fn test_macos_bundle_exe_dir_detection() {
         assert!(is_macos_bundle_exe_dir(Path::new(
-            "/Applications/MHDanmuToolsV2.app/Contents/MacOS"
+            "/Applications/MonsterOrderWilds-Ascendance.app/Contents/MacOS"
         )));
         assert!(is_macos_bundle_exe_dir(Path::new(
-            "/Volumes/MHDanmuToolsV2/MHDanmuToolsV2.app/Contents/MacOS"
+            "/Volumes/MonsterOrderWilds-Ascendance/MonsterOrderWilds-Ascendance.app/Contents/MacOS"
         )));
         // 开发态：cargo test / tauri dev 的 exe 同级
         assert!(!is_macos_bundle_exe_dir(Path::new(
@@ -238,7 +238,7 @@ mod tests {
         )));
         // 仅外层是 .app 但并非可执行目录
         assert!(!is_macos_bundle_exe_dir(Path::new(
-            "/Applications/MHDanmuToolsV2.app/Contents"
+            "/Applications/MonsterOrderWilds-Ascendance.app/Contents"
         )));
         println!("[PASS] test_macos_bundle_exe_dir_detection passed");
     }

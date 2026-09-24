@@ -773,11 +773,6 @@ pub fn handle_incoming_danmu(
         danmu.guard_level = 1;
     }
 
-    // 广播原始弹幕事件供前端监听
-    if let Some(handle) = app_handle {
-        let _ = handle.emit("danmu-received", &danmu);
-    }
-
     let is_lite = {
         state.config.lock().map(|c| c.is_lite_mode).unwrap_or(false)
     };

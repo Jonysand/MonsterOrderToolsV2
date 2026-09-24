@@ -230,16 +230,3 @@ export interface LogsSnapshot {
   dir: string;
   entries: LogEntry[];
 }
-
-/** danmu-received 事件载荷（原始弹幕，供主播控制台实时查看） */
-export interface DanmuReceivedPayload {
-  user_id: string;
-  user_name: string;
-  message: string;
-  timestamp: number;
-  has_medal: boolean;
-  medal_level: number;
-  guard_level: number;
-  msg_id: string;
-  is_paid_gift: boolean;
-}

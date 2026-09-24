@@ -1,4 +1,4 @@
-﻿# MHDanmuToolsV2 迁移完整性修复计划
+﻿# MonsterOrderWilds-Ascendance 迁移完整性修复计划
 
 > 编制日期：2026-09-19
 > 依据：对原工程 `D:\VisualStudioProjects\JonysandMHDanmuTools`（C++ `MonsterOrderWilds` + C# WPF，约 2.4 万行）与 V2（Rust + Tauri v2 + React，约 8 千行）的全量交叉审计
@@ -434,7 +434,7 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 
 ### D4 业务事件提示 ✅
 - **气泡**：`checkin-reply / retroactive-checkin-recorded / retroactive-query / like-reward-granted / gift-received / super-chat-received / guard-received / ai-bubble` 统一进入堆叠气泡；**上限 5 条**（超出移除最旧）、**15s 自动退场**、新消息置顶（对齐 `OrderedMonsterWindow.AddBubble/UpdateBubblePositions`）；配色按业务分类（打卡绿 / 补签紫 / 奖卡橙 / 礼物红 / AI 靛蓝）。
-- **主播控制台动态（新）**：B站 TAB 新增「最近弹幕动态」（`danmu-received`，20 条）与「打卡动态」（`checkin-recorded`，10 条）双卡片，使这两个事件具备消费方（原工程无对应 UI，属增强）。
+- **主播控制台动态（新）**：B站 TAB 新增「最近弹幕动态」（`danmu-received`，20 条）与「打卡动态」（`checkin-recorded`，10 条）双卡片，使这两个事件具备消费方（原工程无对应 UI，属增强）。（2026-09-24 按产品要求移除「最近弹幕动态」面板及 `danmu-received` 事件，仅保留「打卡动态」卡片）
 - **有意差异**：`checkin-recorded` 不再生成气泡（避免与 `checkin-reply` 同帧重复），改由控制台动态列表消费。
 - **验收**：浏览器 mock 实测 —— 5 条气泡上限生效；`retroactive-query` → 「补签查询@水友E …」、`gift-received` → 「礼物@礼物D 赠送 辣条 ×10」、`guard-received` → 「上舰@新舰长C 开通 月 ×1（等级 3）」、`like-reward-granted` → 「点赞奖卡@测试水友 …突破30…」均正确渲染。
 
