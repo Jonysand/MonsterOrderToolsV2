@@ -712,7 +712,10 @@ fn schedule_checkin_reply(
     if danmu.guard_level <= 0 || !state.ai_provider.is_configured() {
         emit_checkin_reply(app_handle, &danmu.user_id, &danmu.user_name, &fallback, false);
         if cfg.enable_voice {
-            queue_tts(state, fallback, &danmu.user_id, true);
+            // 兜底签到播报同样按“打卡_{用户名}_{ts}.mp3”留档（对齐原工程 isCheckinTTS 守卫）
+            state
+                .tts_mgr
+                .enqueue_checkin_speak(&fallback, &danmu.user_id, &danmu.user_name);
         }
         return;
     }
@@ -877,7 +880,12 @@ pub fn handle_incoming_danmu(
                                     false,
                                 );
                                 if cfg.enable_voice {
-                                    queue_tts(state, reply, &danmu.user_id, true);
+                                    // 重复打卡亦属签到播报：按“打卡_{用户名}_{ts}.mp3”留档
+                                    state.tts_mgr.enqueue_checkin_speak(
+                                        &reply,
+                                        &danmu.user_id,
+                                        &danmu.user_name,
+                                    );
                                 }
                             } else {
                                 schedule_checkin_reply(
@@ -924,7 +932,12 @@ pub fn handle_incoming_danmu(
                     );
                 }
                 if cfg.enable_voice {
-                    queue_tts(state, outcome.reply.clone(), &danmu.user_id, true);
+                    // 补签播报同样按签到音频留档（对齐原工程 isCheckinTTS 守卫）
+                    state.tts_mgr.enqueue_checkin_speak(
+                        &outcome.reply,
+                        &danmu.user_id,
+                        &danmu.user_name,
+                    );
                 }
                 return bilibili::DanmuProcessResult {
                     user_id: danmu.user_id,
@@ -2470,6 +2483,8 @@ mod tests {
         let task = state.tts_mgr.dequeue_speak().expect("打卡回复应入队播报");
         assert_eq!(task.text, "大副舰长连续第1天打卡！累计1天");
         assert_eq!(task.user_id, "guard_captain_1");
+        // 签到播报须标记 is_checkin，播放成功后按“打卡_{用户名}_{ts}.mp3”留档
+        assert!(task.is_checkin && task.checkin_username == "大副舰长");
 
         // 同一天再次打卡 → 今日已打卡文案（C5，对齐原工程 repeatedAnswer）
         let dm2 = bilibili::DanmuData {
@@ -2486,6 +2501,7 @@ mod tests {
         let _ = handle_incoming_danmu(None, &state, dm2);
         let task2 = state.tts_mgr.dequeue_speak().expect("重复打卡应有回复");
         assert_eq!(task2.text, "大副舰长今日已打卡，连续1天，累计1天");
+        assert!(task2.is_checkin, "重复打卡播报同样应留档");
 
         // 验证排队列表中无此项
         let q = state.queue_mgr.lock().unwrap();
@@ -2529,6 +2545,8 @@ mod tests {
         let task = state.tts_mgr.dequeue_speak().expect("补签回复应入队播报");
         assert!(task.text.starts_with("补签猎人，已成功补签"), "{}", task.text);
         assert!(task.text.contains("剩余补签卡1张"), "{}", task.text);
+        // 补签播报同样应留档
+        assert!(task.is_checkin && task.checkin_username == "补签猎人");
 
         // 验证昨天日期已被补签
         let records = state
@@ -2566,7 +2584,8 @@ mod tests {
         let _ = handle_incoming_danmu(None, &state, dm);
         let cards = state.checkin_mgr.get_cards("medal_user");
         assert_eq!(cards.card_count, 0, "粉丝牌用户应可补签并扣卡");
-        assert!(state.tts_mgr.dequeue_speak().is_some());
+        let retro_task = state.tts_mgr.dequeue_speak().expect("粉丝牌补签应入队播报");
+        assert!(retro_task.is_checkin && retro_task.checkin_username == "粉丝牌水友");
 
         // 查询词表命中（"我的补签卡"），仅气泡不朗读
         let dm_query = bilibili::DanmuData {

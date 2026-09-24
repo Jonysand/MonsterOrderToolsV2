@@ -151,6 +151,28 @@ pub fn is_retro_query(msg: &str) -> bool {
         .any(|w| w == msg)
 }
 
+/// CSV 字段转义：含逗号/双引号/换行时用双引号包裹并翻倍内部引号；
+/// 对以 = + - @ 开头的字段前置单引号，避免 Excel 等表格软件公式注入
+fn csv_escape(field: &str) -> String {
+    let mut s = field.to_string();
+    if s.chars()
+        .next()
+        .map_or(false, |c| matches!(c, '=' | '+' | '-' | '@'))
+    {
+        s.insert(0, '\'');
+    }
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+/// JSON 字符串字面量（含外层引号），复用 serde_json 保证转义与序列化器一致
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// 舰长周打卡与补签系统管理器
 pub struct CheckinManager {
     conn: Mutex<Connection>,
@@ -492,6 +514,20 @@ impl CheckinManager {
         Self::internal_calc_continuous(&conn, uid).unwrap_or(0)
     }
 
+    /// 从明细表一次性重算 (连续天数, 累计天数)。
+    /// 补签有效性判定统一走此入口，避免多处口径漂移
+    fn calc_streak_and_cumulative(conn: &Connection, uid: &str) -> Result<(i32, i32), String> {
+        let continuous = Self::internal_calc_continuous(conn, uid)?;
+        let cumulative: i32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT checkin_date) FROM checkin_records WHERE uid = ?1",
+                params![uid],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok((continuous, cumulative))
+    }
+
     /// 自然周点赞满 30 奖卡逻辑
     /// 点赞累加与奖卡逻辑：
     /// 规则 1：连续 7 天点赞，奖励 1 张补签卡
@@ -682,14 +718,8 @@ impl CheckinManager {
             };
         }
 
-        let continuous = Self::internal_calc_continuous(&conn, uid).unwrap_or(0);
-        let cumulative: i32 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT checkin_date) FROM checkin_records WHERE uid = ?1",
-                params![uid],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let (continuous, cumulative) =
+            Self::calc_streak_and_cumulative(&conn, uid).unwrap_or((0, 0));
         if continuous >= cumulative {
             return RetroCommandOutcome {
                 reply: format!(
@@ -806,14 +836,7 @@ impl CheckinManager {
     /// 实时从 checkin_records 重算，当连续打卡天数 >= 累计打卡天数时，说明用户从未漏打，无需补签，予以拦截
     pub fn check_retroactive_validity(&self, uid: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        let continuous = Self::internal_calc_continuous(&conn, uid)?;
-        let cumulative: i32 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT checkin_date) FROM checkin_records WHERE uid = ?1",
-                params![uid],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let (continuous, cumulative) = Self::calc_streak_and_cumulative(&conn, uid)?;
 
         if continuous >= cumulative {
             return Err("拦截校验失败：连续打卡天数已达到或超过累计打卡天数，当前没有断签断档，无需补签".into());
@@ -866,24 +889,32 @@ impl CheckinManager {
     ) -> Result<i32, String> {
         let mut conn = self.conn.lock().unwrap();
 
-        // 1. 补签有效性校验（实时从记录动态重算，防脏数据或并发误差）
-        let cur_continuous = Self::internal_calc_continuous(&conn, uid)?;
-        let cur_cumulative: i32 = conn
+        // 1. 目标日期已存在打卡记录时直接拒绝：原 INSERT OR REPLACE 会重写该行 id/created_at，
+        //    且在无效补签上白白扣卡（正常入口由 find_last_missing_checkin_date 保证缺失，
+        //    此处兜底直接调用本 API 的场景）
+        let target_date_int = Self::date_to_int(target_date);
+        let already_exists: i32 = conn
             .query_row(
-                "SELECT COUNT(DISTINCT checkin_date) FROM checkin_records WHERE uid = ?1",
-                params![uid],
+                "SELECT COUNT(1) FROM checkin_records WHERE uid = ?1 AND checkin_date = ?2",
+                params![uid, target_date_int],
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        if already_exists > 0 {
+            return Err(format!("目标日期 {} 已存在打卡记录，无需补签", target_date_int));
+        }
+
+        // 2. 补签有效性校验（实时从记录动态重算，防脏数据或并发误差）
+        let (cur_continuous, cur_cumulative) = Self::calc_streak_and_cumulative(&conn, uid)?;
 
         if cur_continuous >= cur_cumulative {
             return Err("拦截：连续打卡天数已等于累计打卡天数，无需补签".into());
         }
 
-        // 2. 开启原子事务
+        // 3. 开启原子事务
         let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-        // 3. 校验卡片数量
+        // 4. 校验卡片数量
         let card_count: i32 = tx
             .query_row(
                 "SELECT card_count FROM retroactive_cards WHERE uid = ?1",
@@ -896,7 +927,7 @@ impl CheckinManager {
             return Err("补签卡不足，无法补签".into());
         }
 
-        // 4. 扣除 1 张卡
+        // 5. 扣除 1 张卡
         let new_card_count = card_count - 1;
         tx.execute(
             "UPDATE retroactive_cards SET card_count = ?1 WHERE uid = ?2",
@@ -904,25 +935,17 @@ impl CheckinManager {
         )
         .map_err(|e| e.to_string())?;
 
-        // 5. 插入目标打卡记录
-        let target_date_int = Self::date_to_int(target_date);
+        // 6. 插入目标打卡记录（前置校验已确认该日期缺失，故用普通 INSERT 而非 OR REPLACE）
         let now = Utc::now().timestamp();
         tx.execute(
-            "INSERT OR REPLACE INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![uid, username, target_date_int, now],
         ).map_err(|e| format!("插入补签记录失败: {}", e))?;
 
-        // 6. 重算连续天数与累计天数
-        let new_continuous = Self::internal_calc_continuous(&tx, uid)?;
-        let new_cumulative: i32 = tx
-            .query_row(
-                "SELECT COUNT(DISTINCT checkin_date) FROM checkin_records WHERE uid = ?1",
-                params![uid],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        // 7. 重算连续天数与累计天数
+        let (new_continuous, new_cumulative) = Self::calc_streak_and_cumulative(&tx, uid)?;
 
-        // 7. 更新 UserProfile（补签日期若大于原打卡日则推进 last_checkin_date，对齐原工程 ProfileManager.cpp:1453）
+        // 8. 更新 UserProfile（补签日期若大于原打卡日则推进 last_checkin_date，对齐原工程 ProfileManager.cpp:1453）
         tx.execute(
             r#"
             UPDATE user_profiles SET
@@ -936,7 +959,7 @@ impl CheckinManager {
         )
         .map_err(|e| e.to_string())?;
 
-        // 8. 提交事务
+        // 9. 提交事务
         tx.commit().map_err(|e| e.to_string())?;
 
         Ok(new_card_count)
@@ -1137,10 +1160,12 @@ impl CheckinManager {
                 "UPDATE user_profiles SET last_checkin_date = ?1, continuous_days = ?2, updated_at = ?3 WHERE uid = ?4",
                 params![new_last_checkin, new_continuous, now, uid],
             );
-            patched_users += 1;
 
+            // 统计口径：有缺口才计入「补签用户数」，无缺口计入「跳过用户数」（两者互斥，不重叠）
             if missing.is_empty() {
                 skipped_users += 1;
+            } else {
+                patched_users += 1;
             }
         }
 
@@ -1187,7 +1212,13 @@ impl CheckinManager {
             "csv" => {
                 let mut s = String::from("uid,username,continuous_days,cumulative_days\n");
                 for (uid, name, continuous, cumulative) in &users {
-                    s.push_str(&format!("{},{},{},{}\n", uid, name, continuous, cumulative));
+                    s.push_str(&format!(
+                        "{},{},{},{}\n",
+                        csv_escape(uid),
+                        csv_escape(name),
+                        continuous,
+                        cumulative
+                    ));
                 }
                 s
             }
@@ -1195,8 +1226,8 @@ impl CheckinManager {
                 let mut s = String::from("[\n");
                 for (i, (uid, name, continuous, cumulative)) in users.iter().enumerate() {
                     s.push_str("  {\n");
-                    s.push_str(&format!("    \"uid\": \"{}\",\n", uid));
-                    s.push_str(&format!("    \"username\": \"{}\",\n", name));
+                    s.push_str(&format!("    \"uid\": {},\n", json_string(uid)));
+                    s.push_str(&format!("    \"username\": {},\n", json_string(name)));
                     s.push_str(&format!("    \"continuousDays\": {},\n", continuous));
                     s.push_str(&format!("    \"cumulativeDays\": {}\n", cumulative));
                     s.push_str("  }");
@@ -1285,7 +1316,13 @@ impl CheckinManager {
             "csv" => {
                 let mut s = String::from("uid,username,checkin_date,created_at\n");
                 for (uid, name, date, created) in &records {
-                    s.push_str(&format!("{},{},{},{}\n", uid, name, date, created));
+                    s.push_str(&format!(
+                        "{},{},{},{}\n",
+                        csv_escape(uid),
+                        csv_escape(name),
+                        date,
+                        created
+                    ));
                 }
                 s
             }
@@ -1293,8 +1330,8 @@ impl CheckinManager {
                 let mut s = String::from("[\n");
                 for (i, (uid, name, date, created)) in records.iter().enumerate() {
                     s.push_str("  {\n");
-                    s.push_str(&format!("    \"uid\": \"{}\",\n", uid));
-                    s.push_str(&format!("    \"username\": \"{}\",\n", name));
+                    s.push_str(&format!("    \"uid\": {},\n", json_string(uid)));
+                    s.push_str(&format!("    \"username\": {},\n", json_string(name)));
                     s.push_str(&format!("    \"checkinDate\": {},\n", date));
                     s.push_str(&format!("    \"createdAt\": {}\n", created));
                     s.push_str("  }");
@@ -2046,5 +2083,94 @@ mod tests {
         assert_eq!(retro2, vec!["补签"]);
         assert_eq!(query2, vec!["补签查询"]);
         println!("[PASS] test_retro_trigger_words_parsing passed");
+    }
+
+    /// 批量补签统计口径回归：patched 与 skipped 互斥、不重叠，且合计等于总用户数
+    #[test]
+    fn test_batch_checkin_reports_patched_and_skipped_counts() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let d3 = today - Duration::days(3);
+
+        // 用户 A：3 天前与今天打卡 → 中间缺 2 天，应计入 patched
+        let _ = mgr.record_checkin("u_batch_gap", "断签水友", d3).unwrap();
+        let _ = mgr.record_checkin("u_batch_gap", "断签水友", today).unwrap();
+        // 用户 B：昨天与今天打卡 → 已连续，应计入 skipped
+        let _ = mgr.record_checkin("u_batch_full", "满勤水友", today - Duration::days(1)).unwrap();
+        let _ = mgr.record_checkin("u_batch_full", "满勤水友", today).unwrap();
+
+        let res = mgr.batch_checkin().unwrap();
+        assert_eq!(res.total_users, 2);
+        assert_eq!(res.patched_users, 1, "仅存在断签的用户应计入补签用户数");
+        assert_eq!(res.skipped_users, 1, "已连续到今天的用户应计入跳过数");
+        assert_eq!(
+            res.patched_users + res.skipped_users,
+            res.total_users,
+            "两个口径必须互斥且覆盖全部用户"
+        );
+        assert_eq!(res.total_inserted, 2, "A 需补前天与昨天两条");
+
+        let a = mgr.get_profile("u_batch_gap").unwrap();
+        assert_eq!(a.continuous_days, a.cumulative_days, "补签后连续天数应拉平到累计天数");
+        println!("[PASS] test_batch_checkin_reports_patched_and_skipped_counts passed");
+    }
+
+    /// 导出字段转义回归：昵称含逗号/双引号/换行时 CSV 不串列、JSON 仍可被标准解析
+    #[test]
+    fn test_export_escapes_special_usernames() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 9, 19).unwrap();
+        let tricky = "逗号,引号\"换行\n水友";
+        let _ = mgr.record_checkin("u_esc", tricky, date).unwrap();
+
+        // CSV：逗号/引号/换行字段必须被双引号包裹且内部引号翻倍
+        let csv = mgr.export_records_content("csv", None, None, None).unwrap();
+        let csv_body = csv.trim_start_matches('\u{feff}');
+        assert!(
+            csv_body.contains("\"逗号,引号\"\"换行\n水友\""),
+            "CSV 未正确转义: {}",
+            csv_body
+        );
+
+        // JSON：明细与汇总都必须能被标准解析器解析，且往返后昵称不变
+        let json = mgr.export_records_content("json", None, None, None).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(json.trim_start_matches('\u{feff}')).expect("明细 JSON 必须合法");
+        assert_eq!(parsed[0]["username"], serde_json::json!(tricky));
+
+        let summary = mgr.export_users_summary("json").unwrap();
+        let parsed_summary: serde_json::Value = serde_json::from_str(
+            summary.trim_start_matches('\u{feff}'),
+        )
+        .expect("汇总 JSON 必须合法");
+        assert_eq!(parsed_summary[0]["username"], serde_json::json!(tricky));
+        println!("[PASS] test_export_escapes_special_usernames passed");
+    }
+
+    /// 补签兜底校验：目标日期已存在记录时拒绝，且不得扣卡、不得覆盖原记录
+    #[test]
+    fn test_execute_retroactive_rejects_existing_date_without_charging_card() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 9, 19).unwrap();
+        let d3 = today - Duration::days(3);
+
+        let _ = mgr.record_checkin("u_exist", "水友", d3).unwrap();
+        let _ = mgr.record_checkin("u_exist", "水友", today - Duration::days(1)).unwrap();
+        let _ = mgr.record_checkin("u_exist", "水友", today).unwrap();
+        assert_eq!(mgr.grant_card("u_exist", 1).unwrap(), 1);
+
+        // 目标日期（昨天）已存在：拒绝且卡数不变
+        let err = mgr
+            .execute_retroactive_checkin("u_exist", "水友", today - Duration::days(1))
+            .unwrap_err();
+        assert!(err.contains("已存在打卡记录"), "{}", err);
+        assert_eq!(mgr.get_cards("u_exist").card_count, 1, "拒绝补签不得扣卡");
+
+        // 真正缺失的前天仍可正常补签并扣 1 张卡
+        let remaining = mgr
+            .execute_retroactive_checkin("u_exist", "水友", today - Duration::days(2))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        println!("[PASS] test_execute_retroactive_rejects_existing_date_without_charging_card passed");
     }
 }
