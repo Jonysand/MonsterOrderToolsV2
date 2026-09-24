@@ -89,7 +89,6 @@
 | `like-reward-granted` | `{uid, user_name, likes, daily_total, replies}` | 悬浮窗奖卡气泡 |
 | `gift-received` | `GiftEvent` | 悬浮窗礼物气泡 |
 | `super-chat-received` / `guard-received` / `room-enter-received` | `LiveEvent`（外部标签枚举，如 `{"SuperChat": {…}}`） | 悬浮窗 SC/上舰气泡 |
-| `ai-bubble` | `AIBubblePayload` | 悬浮窗 AI 气泡 |
 | `config-changed` | 脱敏 `AppConfig` | 悬浮窗跑马灯/透明度热更新 |
 | `overlay-lock-changed` | `bool` | 主窗口 + 悬浮窗锁定态同步（D2） |
 | `connection-state-changed` | `ConnectionStatusPayload` | 主窗口长连面板（D7） |
@@ -107,7 +106,7 @@
 
 ### 2. Lite 模式 (ONLY_ORDER_MONSTER=1)
 * **顶层开关**：系统维护全局 `is_lite_mode` 标识（运行时开关，替代原工程编译期宏 + C# 运行时判断）。
-* **前端响应**：当切换为 Lite 模式时，界面上的“舰长周打卡”、“TTS 语音播报”、“DeepSeek AI 思考”等卡片自动进入冻结/禁用状态，页面标题旁显示琥珀色“Lite 纯排队模式已启用”徽章（注：原工程 Lite 下仅隐藏对应 Tab、不修改窗口标题；V2 以页内徽章指示，不调用 `setTitle`）。
+* **前端响应**：当切换为 Lite 模式时，界面上的“舰长周打卡”、“TTS 语音播报”等卡片自动进入冻结/禁用状态，页面标题旁显示琥珀色“Lite 纯排队模式已启用”徽章（注：原工程 Lite 下仅隐藏对应 Tab、不修改窗口标题；V2 以页内徽章指示，不调用 `setTitle`）。
 * **后端响应（E1 统一守卫）**：非排队功能的命令入口第一行调用 `ensure_not_lite(&state, "模块名")?`（Lite 下返回 `Lite模式下XX已停用`）；
   事件管道类（`handle_incoming_danmu` / `_like` / `_gift` / `_live_event`）在函数首部判定 `is_lite_mode` 直接 return。
   Lite 下仅保留：点怪排队、悬浮窗、B 站长连、身份码、配置、运行日志。

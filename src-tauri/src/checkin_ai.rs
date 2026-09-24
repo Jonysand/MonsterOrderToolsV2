@@ -2,9 +2,12 @@
 //!
 //! - 弹幕学习：仅舰长的弹幕参与学习（ShouldLearn 的 guardLevel > 0 门槛），
 //!   同一用户 5 秒窗口内不重复学习（LEARN_TIME_WINDOW_MS）；
+//!   指令类弹幕（打卡触发词、补签/查询词）由调用方在学习前排除（lib.rs::is_command_message），
+//!   不计入关键词与发言历史，避免污染 AI 提示词（原工程无此过滤，属有意差异）；
 //! - 关键词：jieba 分词（HMM 模式）→ 停用词过滤 → #标签# 排除 → 词频统计（上限 50，按频次降序）；
 //! - 发言历史：最近 100 条（danmu_history_json，JSON 格式与原工程一致）；
-//! - BuildPrompt / 兜底文案：逐字对齐原工程 BuildPrompt / GetFallbackAnswer。
+//! - BuildPrompt / 兜底文案：用户消息与兜底文案逐字对齐原工程 BuildPrompt / GetFallbackAnswer；
+//!   本工程另由 `ai::SYSTEM_PROMPT_CHECKIN` 注入随从猫人设系统提示词（有意增强，非原工程行为）。
 
 use crate::checkin::{CheckinManager, KeywordRecord, LearningProfile};
 use jieba_rs::Jieba;

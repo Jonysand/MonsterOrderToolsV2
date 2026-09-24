@@ -35,7 +35,6 @@
 | 打卡 | 关键词学习 + AI 个性化回复 | 同第 2 节（`!is_lite`） | 置灰 | ❌ 停用 |
 | 补签 | 补签/查询指令、补签卡结算 | 第 2 节（`!is_lite`） | 横幅提示 + 按钮禁用 | ❌ 停用 |
 | GM 运维 | 批量补签、用户搜索、手动发卡、记录导出 | `gm_batch_checkin` / `gm_search_users` / `gm_grant_card` / `gm_export_checkin_records` 守卫 | 横幅提示 + 按钮禁用 | ❌ 停用 |
-| AI 思考 | `ask_ai_thinking` | `ask_ai_thinking` 守卫 | 横幅提示 + 按钮禁用 | ❌ 停用 |
 | 调试通道 | `simulate_danmu`（弹幕模拟，含舰长等级/粉丝牌选择器） | 经 `handle_incoming_danmu` 管道自然拦截（Lite 下仅点怪/优先生效，其余静默） | 弹幕模拟表单可用（核心链路） | ⚪ 核心可用 |
 | 调试通道 | `simulate_gift` / `simulate_live_event`（礼物 / SC / 上舰模拟按钮） | 经 `handle_incoming_gift` / `handle_incoming_live_event` 首部守卫（静默） | 三按钮 `disabled={isLite}` | ❌ 停用 |
 | 调试通道 | `simulate_like` | `simulate_like` 守卫（显式报错） | 调试入口置灰 | ❌ 停用 |

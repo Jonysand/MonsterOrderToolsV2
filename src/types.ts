@@ -78,14 +78,6 @@ export interface AppConfig {
   is_lite_mode: boolean;
 }
 
-export interface AIBubblePayload {
-  username: string;
-  prompt: string;
-  reasoning: string;
-  answer: string;
-  is_thinking: boolean;
-}
-
 export interface BatchCheckinResult {
   success: boolean;
   total_users: number;

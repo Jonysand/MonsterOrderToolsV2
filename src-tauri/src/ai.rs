@@ -10,17 +10,18 @@ pub struct AIChatRequest {
     pub system_prompt: Option<String>,
 }
 
-/// AI 悬浮气泡状态负载
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AIBubblePayload {
-    pub username: String,
-    pub prompt: String,
-    pub reasoning: String,
-    pub answer: String,
-    pub is_thinking: bool,
-}
+/// 打卡回复系统提示词：随从猫人设 + 播报硬约束（回复会进 TTS 队列，必须是纯口语短句）
+pub const SYSTEM_PROMPT_CHECKIN: &str = concat!(
+    "你是直播间里的「随从猫」：一只跟着主播混迹《怪物猎人：荒野》的猫，机灵、话痨、爱贫嘴，",
+    "偶尔自嘲翻车，嘴上傲娇但真心捧场，说话口语化、轻松诙谐。\n",
+    "现在的任务是给刚打卡的舰长喊一句捧场话：\n",
+    "1. 必须喊出舰长名字，一句话讲完，不超过 20 字。\n",
+    "2. 只夸不损：可以俏皮、可以拿猫的身份自嘲，但不调侃身体、外貌、隐私，不阴阳怪气。\n",
+    "3. 纯口语，像直播里脱口而出的一句话；不要表情符号、颜文字、动作描写（例如「（摇尾巴）」）",
+    "和生僻字，方便语音播报。",
+);
 
-/// DeepSeek-v4-flash 思考模式客户端
+/// DeepSeek 思考模式客户端（模型 deepseek-flash）
 pub struct DeepSeekAIChatProvider {
     pub api_key: Mutex<String>,
     pub endpoint: String,
@@ -38,7 +39,7 @@ impl DeepSeekAIChatProvider {
         Self {
             api_key: Mutex::new(api_key),
             endpoint: "https://api.deepseek.com/chat/completions".to_string(),
-            model: "deepseek-v4-flash".to_string(),
+            model: "deepseek-flash".to_string(),
         }
     }
 
@@ -53,9 +54,9 @@ impl DeepSeekAIChatProvider {
     }
 
     /// 构造依据 DeepSeek 官方规范《思考模式》的请求体：
-    /// model: deepseek-v4-flash
+    /// model: deepseek-flash（2026-09-10 随 V4.1-Flash 发布改为此名，旧名 deepseek-v4-flash 已下线）
     /// thinking: {"type": "enabled"}
-    /// reasoning_effort: "low"
+    /// reasoning_effort: "high"（官方取值 low/high/max；思考模式默认即开启且默认 high）
     pub fn build_request_body(&self, prompt: &str, system_prompt: Option<&str>) -> serde_json::Value {
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -74,7 +75,7 @@ impl DeepSeekAIChatProvider {
             "thinking": {
                 "type": "enabled"
             },
-            "reasoning_effort": "low",
+            "reasoning_effort": "high",
             "messages": messages
         })
     }
@@ -163,11 +164,31 @@ mod tests {
         let provider = DeepSeekAIChatProvider::new("test_key".into());
         let body = provider.build_request_body("怪猎荒野大剑怎么配装？", Some("你是怪猎荒野AI助手"));
 
-        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["model"], "deepseek-flash");
         assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["reasoning_effort"], "low");
+        assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         println!("[PASS] test_deepseek_request_body_thinking_mode passed");
+    }
+
+    #[test]
+    fn test_checkin_system_prompt_persona_and_constraints() {
+        // 打卡回复：随从猫人设 + 播报硬约束
+        assert!(SYSTEM_PROMPT_CHECKIN.contains("随从猫"), "{}", SYSTEM_PROMPT_CHECKIN);
+        assert!(SYSTEM_PROMPT_CHECKIN.contains("舰长名字"));
+        assert!(SYSTEM_PROMPT_CHECKIN.contains("20 字"));
+        assert!(SYSTEM_PROMPT_CHECKIN.contains("只夸不损"));
+        assert!(SYSTEM_PROMPT_CHECKIN.contains("语音播报"));
+        assert!(SYSTEM_PROMPT_CHECKIN.contains("表情符号"));
+        assert!(SYSTEM_PROMPT_CHECKIN.contains("动作描写"));
+
+        // 系统提示词确实进入请求体，且排在 user 消息之前
+        let provider = DeepSeekAIChatProvider::new("test_key".into());
+        let body = provider.build_request_body("打卡啦", Some(SYSTEM_PROMPT_CHECKIN));
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], SYSTEM_PROMPT_CHECKIN);
+        assert_eq!(body["messages"][1]["role"], "user");
+        println!("[PASS] test_checkin_system_prompt_persona_and_constraints passed");
     }
 
     #[test]

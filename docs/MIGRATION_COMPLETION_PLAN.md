@@ -341,10 +341,10 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **实施**：新增 `src-tauri/src/checkin_ai.rs`（`CheckinLearner`：内嵌 jieba 主词典 + `dict/user.dict.utf8` 自定义词 + `dict/stop_words.utf8` 停用词；`learn / should_skip_duplicate / extract_keywords / build_prompt / fallback_answer`）；`checkin.rs` 新增 `KeywordRecord / LearningProfile` 与 `load_learning / save_learning`（`keywords_json` 为 `[{"word","freq","ts"}]`、`danmu_history_json` 为 `[[ts,"内容"]]`，与原工程 `ProfileManager::KeywordsToJson / DanmuHistoryToJson` 逐字对齐，旧库历史学习数据可直接反序列化）；`lib.rs` 接入学习与打卡回复链路。
 - **素材随包**：`MonsterOrderWilds_configs/dict/{stop_words.utf8,user.dict.utf8}` 随安装包分发（`paths::ensure_seeded` 播种到可写数据目录，A3 资源清单 14 → 16 项）。
 - **词典容错**：用户词典按「词语 [词频] [词性]」解析，词频缺省/非法回退 10（对齐原工程《弹幕习惯词黑白名单配置.txt》约定）、词频钳制最小 1（0 在动态规划分词中等价禁用）、兼容 CRLF 与 BOM、逐词 `add_word` 不受单行格式错误中断。
-- **AI 调用**：复用 `DeepSeekAIChatProvider`（思考模式 `deepseek-v4-flash`），仅舰长且已配置 API Key 时发起；异步 `tauri::async_runtime::spawn` 生成回复，失败即回退兜底文案；未启用语音时不影响气泡事件。
+- **AI 调用**：复用 `DeepSeekAIChatProvider`（思考模式 `deepseek-flash`，`reasoning_effort: high`），仅舰长且已配置 API Key 时发起；异步 `tauri::async_runtime::spawn` 生成回复，失败即回退兜底文案；未启用语音时不影响气泡事件。
 - **开关语义核查**：原工程 `enableCaptainCheckinAI` 实际控制 `CaptainCheckInModule::SetEnabled`（**打卡模块总开关**：关闭后打卡指令与弹幕学习全部停用，补签模块不受影响）；V2 按此语义接入，不再是孤儿字段。
-- **有意差异**：① 原 `ShouldLearn` 用「本地毫秒 − 服务器秒」比较导致 5s 节流实际永不生效，V2 统一为弹幕时间戳秒级比较，实现该常量的既定语义；② 原 `BuildPrompt` 在跨月且非 1 日时不显示间隔天数（缺陷），V2 用日期差精确计算（覆盖跨月/跨年）；③ 原 `IsAvailable()` 首次恒为 false 导致 AI 实际从不被调用（隐患），V2 改为「已配置 Key 即尝试，失败回退」；④ 新增 `checkin-reply` 事件（回复文本 + `is_ai`）供气泡展示（D4 消费）。
-- **验收**：`test_learn_gate_window_and_history_cap`、`test_stopword_min_length_and_hashtag_exclusion`、`test_same_content_skip`、`test_build_prompt_and_fallback`、`test_learning_profile_json_format_matches_legacy`、`test_danmu_learning_pipeline_and_duplicate_skip`。
+- **有意差异**：① 原 `ShouldLearn` 用「本地毫秒 − 服务器秒」比较导致 5s 节流实际永不生效，V2 统一为弹幕时间戳秒级比较，实现该常量的既定语义；② 原 `BuildPrompt` 在跨月且非 1 日时不显示间隔天数（缺陷），V2 用日期差精确计算（覆盖跨月/跨年）；③ 原 `IsAvailable()` 首次恒为 false 导致 AI 实际从不被调用（隐患），V2 改为「已配置 Key 即尝试，失败回退」；④ 新增 `checkin-reply` 事件（回复文本 + `is_ai`）供气泡展示（D4 消费）；⑤ 指令类弹幕（打卡触发词、补签/查询词）在学习前排除（`lib.rs::is_command_message`），不计入关键词与发言历史，避免「打卡」这类操作词污染 AI 提示词的「最近发言」；⑥ 打卡 AI 调用额外注入 `ai::SYSTEM_PROMPT_CHECKIN` 随从猫人设系统提示词（用户消息仍与原工程 `BuildPrompt` 逐字一致）。
+- **验收**：`test_learn_gate_window_and_history_cap`、`test_stopword_min_length_and_hashtag_exclusion`、`test_same_content_skip`、`test_build_prompt_and_fallback`、`test_learning_profile_json_format_matches_legacy`、`test_danmu_learning_pipeline_and_duplicate_skip`、`test_is_command_message_recognizes_commands`、`test_command_danmu_excluded_from_learning`。
 - **Lite**：不支持。
 
 ### C2 补签查询回复 ✅
@@ -433,7 +433,7 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **验收**：浏览器内注入 Tauri 事件 mock 实测 —— 默认文本 → 派发 `order-placed` → 文本变为 `测试水友 点怪 煌黑龙 成功！`；再派发优先事件 → `+2` 待播计数 → 播完自动切换为 `测试水友 优先 雷狼龙 成功，已置前！`。
 
 ### D4 业务事件提示 ✅
-- **气泡**：`checkin-reply / retroactive-checkin-recorded / retroactive-query / like-reward-granted / gift-received / super-chat-received / guard-received / ai-bubble` 统一进入堆叠气泡；**上限 5 条**（超出移除最旧）、**15s 自动退场**、新消息置顶（对齐 `OrderedMonsterWindow.AddBubble/UpdateBubblePositions`）；配色按业务分类（打卡绿 / 补签紫 / 奖卡橙 / 礼物红 / AI 靛蓝）。
+- **气泡**：`checkin-reply / retroactive-checkin-recorded / retroactive-query / like-reward-granted / gift-received / super-chat-received / guard-received` 统一进入堆叠气泡；**上限 5 条**（超出移除最旧）、**15s 自动退场**、新消息置顶（对齐 `OrderedMonsterWindow.AddBubble/UpdateBubblePositions`）；配色按业务分类（打卡绿 / 补签紫 / 奖卡橙 / 礼物红）。
 - **主播控制台动态（新）**：B站 TAB 新增「最近弹幕动态」（`danmu-received`，20 条）与「打卡动态」（`checkin-recorded`，10 条）双卡片，使这两个事件具备消费方（原工程无对应 UI，属增强）。（2026-09-24 按产品要求移除「最近弹幕动态」面板及 `danmu-received` 事件，仅保留「打卡动态」卡片）
 - **有意差异**：`checkin-recorded` 不再生成气泡（避免与 `checkin-reply` 同帧重复），改由控制台动态列表消费。
 - **验收**：浏览器 mock 实测 —— 5 条气泡上限生效；`retroactive-query` → 「补签查询@水友E …」、`gift-received` → 「礼物@礼物D 赠送 辣条 ×10」、`guard-received` → 「上舰@新舰长C 开通 月 ×1（等级 3）」、`like-reward-granted` → 「点赞奖卡@测试水友 …突破30…」均正确渲染。

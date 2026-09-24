@@ -8,7 +8,6 @@ import {
   UserSearchItem,
   UserProfile,
   BatchCheckinResult,
-  AIBubblePayload,
   CredentialsStatus,
   ConnectionStatusPayload,
   LogsSnapshot,
@@ -24,7 +23,6 @@ import {
   Sparkles,
   Radio,
   Sliders,
-  Bot,
   Users,
   CalendarCheck,
   Download,
@@ -67,7 +65,7 @@ const QUEUE_ROW_HEIGHT = 54;
 
 export const MainWindow: React.FC = () => {
   const [activeTab, setActiveTab] = useState<
-    "queue" | "monster" | "bili" | "gm" | "ai" | "settings" | "logs"
+    "queue" | "monster" | "bili" | "gm" | "settings" | "logs"
   >("queue");
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [isLite, setIsLite] = useState(false);
@@ -128,11 +126,6 @@ export const MainWindow: React.FC = () => {
   const [exportUsername, setExportUsername] = useState("");
   const [exportStartDate, setExportStartDate] = useState("");
   const [exportEndDate, setExportEndDate] = useState("");
-
-  // AI 对话测试
-  const [aiPrompt, setAiPrompt] = useState("");
-  const [aiResult, setAiResult] = useState<AIBubblePayload | null>(null);
-  const [aiLoading, setAiLoading] = useState(false);
 
   // 敏感凭证加密托管状态
   const [credStatus, setCredStatus] = useState<CredentialsStatus | null>(null);
@@ -253,10 +246,6 @@ export const MainWindow: React.FC = () => {
       setConn(event.payload);
     });
 
-    const unlistenAi = listen<AIBubblePayload>("ai-bubble", (event) => {
-      setAiResult(event.payload);
-    });
-
     // D4/D5 主播控制台动态：打卡记录
     const unlistenCheckin = listen<UserProfile>("checkin-recorded", (event) => {
       setRecentCheckins((prev) => [event.payload, ...prev].slice(0, 10));
@@ -287,7 +276,6 @@ export const MainWindow: React.FC = () => {
       }
       unlistenQueue.then((f) => f());
       unlistenConn.then((f) => f());
-      unlistenAi.then((f) => f());
       unlistenCheckin.then((f) => f());
       unlistenLock.then((f) => f());
       unlistenMissing.then((f) => f());
@@ -760,26 +748,6 @@ export const MainWindow: React.FC = () => {
     }
   };
 
-  // AI 提问
-  const handleAskAi = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!aiPrompt.trim()) return;
-    setAiLoading(true);
-    try {
-      const res = await invoke<AIBubblePayload>("ask_ai_thinking", {
-        prompt: aiPrompt.trim(),
-        username: "主播控制台",
-      });
-      setAiResult(res);
-      setAiPrompt("");
-      showToast("AI 回答已生成并推送到悬浮窗！");
-    } catch (err) {
-      showToast(`AI 请求失败: ${err}`);
-    } finally {
-      setAiLoading(false);
-    }
-  };
-
   // 保存设置
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -915,19 +883,6 @@ export const MainWindow: React.FC = () => {
             </button>
 
             <button
-              onClick={() => setActiveTab("ai")}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
-                activeTab === "ai"
-                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
-                  : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
-              } ${isLite ? "opacity-40" : ""}`}
-            >
-              <Bot className="w-4 h-4" />
-              <span>AI 思考互动</span>
-              {isLite && <span className="ml-auto text-[9px] text-amber-400">停用</span>}
-            </button>
-
-            <button
               onClick={() => setActiveTab("logs")}
               className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
                 activeTab === "logs"
@@ -999,7 +954,6 @@ export const MainWindow: React.FC = () => {
               {activeTab === "monster" && "怪物名单与禁点配置"}
               {activeTab === "bili" && "B 站开放平台直播间连接与监控"}
               {activeTab === "gm" && "舰长周打卡系统与 GM 运维管理"}
-              {activeTab === "ai" && "DeepSeek-v4-flash 思考模式 AI 对话"}
               {activeTab === "settings" && "系统全局持久化参数设置"}
               {activeTab === "logs" && "运行日志与可观测诊断"}
             </h1>
@@ -1742,60 +1696,6 @@ export const MainWindow: React.FC = () => {
                     </div>
                   )}
                 </div>
-              </div>
-            </div>
-          )}
-
-          {/* 5. AI 思考互动 TAB */}
-          {activeTab === "ai" && (
-            <div className="max-w-3xl space-y-6">
-              {isLite && (
-                <div className="bg-amber-950/40 border border-amber-500/50 rounded-xl p-4 flex items-center gap-3 text-amber-200 text-xs">
-                  <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
-                  <span>当前处于 ONLY_ORDER_MONSTER (Lite 模式)，AI 思考交互模块已停用。</span>
-                </div>
-              )}
-
-              <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
-                <div className="flex items-center gap-2 pb-2 border-b border-neutral-800">
-                  <Bot className="w-5 h-5 text-cyan-400" />
-                  <h3 className="text-xs font-bold text-neutral-200">DeepSeek-v4-flash 思考模式问答</h3>
-                </div>
-
-                <form onSubmit={handleAskAi} className="space-y-3">
-                  <textarea
-                    value={aiPrompt}
-                    onChange={(e) => setAiPrompt(e.target.value)}
-                    placeholder="向随从猫 AI 专家发起提问（例如：荒野片手剑怎么开荒？太刀见切时机？）..."
-                    disabled={isLite || aiLoading}
-                    rows={3}
-                    className="w-full bg-neutral-950 border border-neutral-800 rounded-lg p-3 text-xs text-neutral-100 placeholder-neutral-600 focus:outline-none focus:border-cyan-500/50 disabled:opacity-40"
-                  />
-
-                  <button
-                    type="submit"
-                    disabled={isLite || aiLoading}
-                    className="bg-cyan-600 hover:bg-cyan-500 text-black font-bold px-5 py-2 rounded-lg text-xs flex items-center gap-2 shadow-lg shadow-cyan-600/20 transition disabled:opacity-40"
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    <span>{aiLoading ? "正在沉思中..." : "启动思考并推送到悬浮窗"}</span>
-                  </button>
-                </form>
-
-                {aiResult && (
-                  <div className="mt-4 p-4 bg-neutral-950 rounded-xl border border-cyan-500/40 space-y-2">
-                    {aiResult.reasoning && (
-                      <div className="text-[11px] text-cyan-300/70 bg-neutral-900/80 p-2.5 rounded border border-neutral-800 italic">
-                        <div className="font-bold mb-1">思考过程 (Reasoning):</div>
-                        {aiResult.reasoning}
-                      </div>
-                    )}
-                    <div className="text-xs text-neutral-100 font-medium leading-relaxed">
-                      <div className="text-cyan-400 font-bold mb-1">最终回答:</div>
-                      {aiResult.answer}
-                    </div>
-                  </div>
-                )}
               </div>
             </div>
           )}

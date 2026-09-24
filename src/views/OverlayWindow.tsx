@@ -5,7 +5,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   QueueItem,
   AppConfig,
-  AIBubblePayload,
   OrderPlacedPayload,
   OrderBlockedPayload,
   CheckinReplyPayload,
@@ -18,7 +17,7 @@ import {
 } from "../types";
 import { VirtualList } from "../components/VirtualList";
 import { MarqueeText } from "../components/MarqueeText";
-import { Shield, X, GripVertical, Volume2, Bot, Lock, Bell } from "lucide-react";
+import { Shield, X, GripVertical, Volume2, Lock, Bell } from "lucide-react";
 
 const FALLBACK_MARQUEE = "发送'点怪 xxx'进行点怪";
 /** 单条跑马灯滚动时长（原工程固定 10s） */
@@ -32,7 +31,7 @@ const COMPLETE_ANIM_MS = 950;
 /** 撤销垫保留时长 */
 const UNDO_TTL_MS = 5200;
 
-type BubbleTone = "ai" | "checkin" | "retro" | "like" | "gift" | "system";
+type BubbleTone = "checkin" | "retro" | "like" | "gift" | "system";
 
 /** 大航海等级名（与原工程一致：1=总督, 2=提督, 3=舰长） */
 const GUARD_NAMES: Record<number, string> = { 1: "总督", 2: "提督", 3: "舰长" };
@@ -83,11 +82,9 @@ interface OverlayBubble {
   username: string;
   content: string;
   tone: BubbleTone;
-  reasoning?: string;
 }
 
 const BUBBLE_TONES: Record<BubbleTone, string> = {
-  ai: "bg-indigo-950/95 border-cyan-400/60 text-cyan-300",
   checkin: "bg-emerald-950/95 border-emerald-400/60 text-emerald-300",
   retro: "bg-purple-950/95 border-purple-400/60 text-purple-300",
   like: "bg-amber-950/95 border-amber-400/70 text-amber-300",
@@ -310,27 +307,6 @@ export const OverlayWindow: React.FC = () => {
       pushMarquee(`${user_name} 点怪 ${monster_name} 未生效（已在禁点名单）`);
     });
 
-    // D4 AI 气泡（思考中 → 回答）
-    const unlistenAi = listen<AIBubblePayload>("ai-bubble", (event) => {
-      const payload = event.payload;
-      if (payload.is_thinking) {
-        pushBubble({
-          title: "随从猫 AI 正在沉思中...",
-          username: payload.username,
-          content: "思考中...",
-          tone: "ai",
-        });
-        return;
-      }
-      pushBubble({
-        title: "随从猫 AI 回答",
-        username: payload.username,
-        content: payload.answer,
-        tone: "ai",
-        reasoning: payload.reasoning,
-      });
-    });
-
     // D4 舰长打卡回复气泡（原工程 CheckinTTSPlay 回调）
     const unlistenCheckin = listen<CheckinReplyPayload>("checkin-reply", (event) => {
       const { user_name, reply, is_ai } = event.payload;
@@ -427,7 +403,6 @@ export const OverlayWindow: React.FC = () => {
       unlistenQueue.then((f) => f());
       unlistenOrder.then((f) => f());
       unlistenBlocked.then((f) => f());
-      unlistenAi.then((f) => f());
       unlistenCheckin.then((f) => f());
       unlistenRetro.then((f) => f());
       unlistenQuery.then((f) => f());
@@ -945,22 +920,12 @@ export const OverlayWindow: React.FC = () => {
                   className={`rounded-lg p-2.5 shadow-2xl backdrop-blur-md animate-in fade-in zoom-in duration-200 cursor-default border ${BUBBLE_TONES[bubble.tone]}`}
                 >
                   <div className="flex items-center gap-1.5 text-xs font-bold mb-1">
-                    {bubble.tone === "ai" ? (
-                      <Bot className="w-3.5 h-3.5 animate-bounce" />
-                    ) : (
-                      <Bell className="w-3.5 h-3.5" />
-                    )}
+                    <Bell className="w-3.5 h-3.5" />
                     <span>{bubble.title}</span>
                     <span className="text-[10px] text-gray-400 font-normal">
                       @{bubble.username}
                     </span>
                   </div>
-
-                  {bubble.reasoning && (
-                    <div className="text-[10px] text-cyan-200/70 bg-black/40 rounded p-1.5 mb-1 max-h-16 overflow-y-auto italic">
-                      {bubble.reasoning}
-                    </div>
-                  )}
 
                   <div className="text-xs text-white font-medium break-words leading-relaxed whitespace-pre-line">
                     {bubble.content}

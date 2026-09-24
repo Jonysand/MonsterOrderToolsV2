@@ -737,7 +737,10 @@ fn schedule_checkin_reply(
     let user_name = danmu.user_name.clone();
 
     tauri::async_runtime::spawn(async move {
-        let (text, is_ai) = match provider.call_api(&prompt, None).await {
+        let (text, is_ai) = match provider
+            .call_api(&prompt, Some(ai::SYSTEM_PROMPT_CHECKIN))
+            .await
+        {
             Ok((answer, _reasoning)) => (answer, true),
             Err(err) => {
                 crate::log_warn!("[CheckinAI] AI 回复失败，使用兜底文案: {}", err);
@@ -760,6 +763,15 @@ fn schedule_checkin_reply(
             tts.enqueue_checkin_speak(&text, &user_id, &user_name);
         }
     });
+}
+
+/// 指令类弹幕判定：打卡触发词（含用户自定义）与补签/补签查询指令。
+/// 这类消息是操作指令而非发言内容，不参与发言习惯学习，
+/// 否则会污染关键词与 AI 提示词的「最近发言」（原工程无此过滤，属有意差异）
+fn is_command_message(msg: &str, checkin_triggers: &[String]) -> bool {
+    checkin_triggers.iter().any(|t| msg.eq_ignore_ascii_case(t))
+        || checkin::is_retro_command(msg)
+        || checkin::is_retro_query(msg)
 }
 
 /// 核心业务总线：统一处理接收到的直播/模拟弹幕
@@ -789,19 +801,35 @@ pub fn handle_incoming_danmu(
         //     关闭时打卡指令与弹幕学习全部停用；补签模块独立，不受该开关影响）
         let checkin_module_enabled = cfg.enable_captain_checkin_ai;
 
+        // 触发词提前解析：后续步骤 2.2 判指令、步骤 2.3 判打卡都要用。
+        // 触发词清空后打卡功能即完全停用，不得内置兜底词，否则用户无法通过配置关闭打卡。
+        let checkin_triggers: Vec<String> = cfg
+            .checkin_trigger_words
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let is_checkin_command = checkin_triggers
+            .iter()
+            .any(|t| msg_trim.eq_ignore_ascii_case(t));
+
         // 2.2 舰长弹幕学习 + 同内容防刷屏
         //     （原工程 NotifyCaptainDanmu 门槛 guardLevel != 0 || hasMedal → ShouldLearn 仅舰长学习）
+        //     指令类弹幕只参与防刷屏计数、不写入发言习惯：它们会被当成关键词与「最近发言」
+        //     喂给打卡 AI 提示词（如只打卡不聊天的观众，Top5 习惯词里会出现「打卡」）
         let mut skip_commands = false;
         if checkin_module_enabled && (danmu.guard_level != 0 || danmu.has_medal) {
             if let Some(learner) = &state.checkin_learner {
-                learner.learn(
-                    &state.checkin_mgr,
-                    &danmu.user_id,
-                    &danmu.user_name,
-                    danmu.guard_level,
-                    &danmu.message,
-                    danmu.timestamp,
-                );
+                if !is_command_message(msg_trim, &checkin_triggers) {
+                    learner.learn(
+                        &state.checkin_mgr,
+                        &danmu.user_id,
+                        &danmu.user_name,
+                        danmu.guard_level,
+                        &danmu.message,
+                        danmu.timestamp,
+                    );
+                }
                 skip_commands = learner.should_skip_duplicate(&danmu.user_id, &danmu.message);
             }
         }
@@ -811,18 +839,8 @@ pub fn handle_incoming_danmu(
             let danmu_date = bilibili::server_date(danmu.timestamp)
                 .unwrap_or_else(|| chrono::Local::now().date_naive());
 
-            // 2.3 判定打卡：仅以配置的触发词为准（对齐原工程 CaptainCheckInModule::IsCheckinMessage）。
-            // 触发词清空后打卡功能即完全停用，不得内置兜底词，否则用户无法通过配置关闭打卡。
-            let checkin_triggers: Vec<String> = cfg
-                .checkin_trigger_words
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let is_checkin = checkin_module_enabled
-                && checkin_triggers
-                    .iter()
-                    .any(|t| msg_trim.eq_ignore_ascii_case(t));
+            // 2.3 判定打卡：仅以配置的触发词为准（对齐原工程 CaptainCheckInModule::IsCheckinMessage）
+            let is_checkin = checkin_module_enabled && is_checkin_command;
 
             if is_checkin {
                 // 原工程触发条件：舰长 或 佩戴粉丝牌的用户均可打卡
@@ -1861,44 +1879,6 @@ fn save_overlay_position(
     Ok(())
 }
 
-/// AI 对话思考（受 Lite 模式控制）
-#[tauri::command]
-async fn ask_ai_thinking(
-    prompt: String,
-    username: String,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> Result<ai::AIBubblePayload, String> {
-    ensure_not_lite(&state, "AI思考模块")?;
-
-    // 广播 AI 正在思考中事件
-    let mut payload = ai::AIBubblePayload {
-        username: username.clone(),
-        prompt: prompt.clone(),
-        reasoning: String::new(),
-        answer: String::new(),
-        is_thinking: true,
-    };
-    let _ = app_handle.emit("ai-bubble", &payload);
-
-    let res = state.ai_provider.call_api(&prompt, Some("你是一个风趣幽默的怪猎荒野专家兼主播随从猫，回答简明扼要。")).await;
-    match res {
-        Ok((answer, reasoning)) => {
-            payload.answer = answer;
-            payload.reasoning = reasoning;
-            payload.is_thinking = false;
-            let _ = app_handle.emit("ai-bubble", &payload);
-            Ok(payload)
-        }
-        Err(err) => {
-            payload.answer = format!("思考遇到阻碍：{}", err);
-            payload.is_thinking = false;
-            let _ = app_handle.emit("ai-bubble", &payload);
-            Err(err)
-        }
-    }
-}
-
 /// 切换窗口显隐状态
 #[tauri::command]
 fn toggle_window(app_handle: AppHandle, label: String) -> Result<bool, String> {
@@ -2229,8 +2209,7 @@ pub fn run() {
             clear_recent_logs,
             get_overlay_locked,
             set_overlay_locked,
-            save_overlay_position,
-            ask_ai_thinking
+            save_overlay_position
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2383,7 +2362,6 @@ mod tests {
             "GM运维打卡功能",
             "GM功能",
             "打卡导出功能",
-            "AI思考模块",
             "音效模块",
             "点赞奖卡模块",
             "TTS语音模块",
@@ -2773,6 +2751,89 @@ mod tests {
         let disabled_task = state.tts_mgr.dequeue_speak().expect("停用后应仅剩普通朗读");
         assert_eq!(disabled_task.text, "停用测试舰长 说：打卡");
         println!("[PASS] test_danmu_learning_pipeline_and_duplicate_skip passed");
+    }
+
+    /// 指令类弹幕判定：触发词精确匹配（含自定义触发词），不误伤普通发言
+    #[test]
+    fn test_is_command_message_recognizes_commands() {
+        let triggers = vec!["打卡".to_string(), "签到".to_string()];
+        assert!(is_command_message("打卡", &triggers));
+        assert!(is_command_message("签到", &triggers));
+        assert!(is_command_message("补签", &triggers), "补签操作词应判定为指令");
+        assert!(is_command_message("我的补签卡", &triggers), "补签查询词应判定为指令");
+
+        assert!(!is_command_message("今天打了卡", &triggers), "包含触发词的普通发言照常学习");
+        assert!(!is_command_message("太刀真好玩", &triggers));
+        assert!(!is_command_message("打卡", &[]), "未配置触发词时打卡只是普通发言");
+        println!("[PASS] test_is_command_message_recognizes_commands passed");
+    }
+
+    /// 指令类弹幕不写入发言习惯：避免「打卡」「补签」混进关键词与 AI 提示词的「最近发言」
+    #[test]
+    fn test_command_danmu_excluded_from_learning() {
+        let mut state = AppState::new_test();
+        state.checkin_learner = Some(Arc::new(CheckinLearner::from_resources()));
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let make = |msg: &str, ts: i64, id: &str| bilibili::DanmuData {
+            user_id: "cmd_captain".into(),
+            user_name: "指令测试舰长".into(),
+            message: msg.into(),
+            timestamp: ts,
+            has_medal: true,
+            medal_level: 15,
+            guard_level: 3,
+            msg_id: id.into(),
+            is_paid_gift: false,
+        };
+
+        // 普通弹幕正常学习
+        let _ = handle_incoming_danmu(None, &state, make("区块链 云计算", now_ts, "cmd_1"));
+        assert!(state
+            .checkin_mgr
+            .load_learning("cmd_captain")
+            .danmu_history
+            .iter()
+            .any(|(_, c)| c == "区块链 云计算"));
+
+        // 打卡 / 补签 / 补签查询依次入站（间隔避开 5s 节流与同内容防刷屏）
+        for (idx, msg) in ["打卡", "补签", "我的补签卡"].iter().enumerate() {
+            let _ = handle_incoming_danmu(
+                None,
+                &state,
+                make(msg, now_ts + 10 + idx as i64 * 10, &format!("cmd_{}", idx + 2)),
+            );
+        }
+        while state.tts_mgr.dequeue_speak().is_some() {}
+
+        let learned = state.checkin_mgr.load_learning("cmd_captain");
+        let history: Vec<&str> = learned.danmu_history.iter().map(|(_, c)| c.as_str()).collect();
+        assert_eq!(
+            history,
+            vec!["区块链 云计算"],
+            "指令类弹幕不应写入发言历史: {:?}",
+            history
+        );
+        assert!(
+            !learned
+                .keywords
+                .iter()
+                .any(|k| k.word.contains("打卡") || k.word.contains("补签")),
+            "指令词不应进入关键词: {:?}",
+            learned.keywords
+        );
+
+        // 组装的 AI 提示词「最近发言」只含真实发言
+        let prompt = checkin_ai::build_prompt(&checkin_ai::CheckinContext {
+            username: "指令测试舰长",
+            continuous_days: 1,
+            cumulative_days: 1,
+            checkin_date: 20260924,
+            last_checkin_date: 0,
+            profile: &learned,
+        });
+        assert!(prompt.contains("最近发言：区块链 云计算"), "{}", prompt);
+        println!("[PASS] test_command_danmu_excluded_from_learning passed");
     }
 
     #[test]
