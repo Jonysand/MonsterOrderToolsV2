@@ -66,6 +66,7 @@
 * `clear_queue()`: 清空队列。
 * `get_lite_mode()` / `set_lite_mode(enabled)`: 查询与设置 Lite 模式状态。
 * `get_bili_connection_state()`: 返回长连五态快照 `{state, reason, reason_text, attempt, display}`（D7）。
+* `get_id_code()` / `save_id_code(id_code)`: 开播身份码读取（注册表优先，供前端输入框以密码形态回显）与保存（仅注册表，不落 JSON）。
 * `set_overlay_locked(locked)` / `get_overlay_locked()`: 悬浮窗鼠标穿透 + 置顶（D2，运行时状态不持久化）。
 * `save_overlay_position(x, y)`: 悬浮窗拖动位置防抖落盘（→ `top_pos_x/y`，D2）。
 * `get_current_tts_engine()`: 当前实际引擎名 `manbo / xiaomi / sapi`（D1）。
@@ -83,7 +84,7 @@
 | --- | --- | --- |
 | `queue-updated` | `Vec<QueueItem>` | 主窗口 + 悬浮窗队列列表 |
 | `order-placed` | `{user_id, user_name, monster_name, is_priority}` | 悬浮窗跑马灯（D3） |
-| `checkin-recorded` | `UserProfile` | 主窗口「打卡动态」 |
+| `checkin-recorded` | `UserProfile` | 主窗口「舰长打卡 & GM」页的「打卡动态」卡片 |
 | `checkin-reply` | `{user_id, user_name, reply, is_ai}` | 悬浮窗打卡气泡 |
 | `retroactive-checkin-recorded` / `retroactive-query` | `{user_id, user_name, reply, …}` | 悬浮窗补签气泡 |
 | `like-reward-granted` | `{uid, user_name, likes, daily_total, replies}` | 悬浮窗奖卡气泡 |
@@ -91,7 +92,7 @@
 | `super-chat-received` / `guard-received` / `room-enter-received` | `LiveEvent`（外部标签枚举，如 `{"SuperChat": {…}}`） | 悬浮窗 SC/上舰气泡 |
 | `config-changed` | 脱敏 `AppConfig` | 悬浮窗跑马灯/透明度热更新 |
 | `overlay-lock-changed` | `bool` | 主窗口 + 悬浮窗锁定态同步（D2） |
-| `connection-state-changed` | `ConnectionStatusPayload` | 主窗口长连面板（D7） |
+| `connection-state-changed` | `ConnectionStatusPayload` | 主窗口直播连接面板（D7） |
 | `resource-missing` | `string`（相对路径） | 主窗口资源缺失告警（D5） |
 
 ---
@@ -109,7 +110,7 @@
 * **前端响应**：当切换为 Lite 模式时，界面上的“舰长周打卡”、“TTS 语音播报”等卡片自动进入冻结/禁用状态，页面标题旁显示琥珀色“Lite 纯排队模式已启用”徽章（注：原工程 Lite 下仅隐藏对应 Tab、不修改窗口标题；V2 以页内徽章指示，不调用 `setTitle`）。
 * **后端响应（E1 统一守卫）**：非排队功能的命令入口第一行调用 `ensure_not_lite(&state, "模块名")?`（Lite 下返回 `Lite模式下XX已停用`）；
   事件管道类（`handle_incoming_danmu` / `_like` / `_gift` / `_live_event`）在函数首部判定 `is_lite_mode` 直接 return。
-  Lite 下仅保留：点怪排队、悬浮窗、B 站长连、身份码、配置、运行日志。
+  Lite 下仅保留：点怪排队、悬浮窗、B 站长连、身份码、配置、日志落盘。
 * **逐功能覆盖矩阵**：见 `docs/LITE_COVERAGE_MATRIX.md`（含新增功能必须显式声明是否支持 Lite 的规则）。
 
 ---
@@ -229,18 +230,18 @@ run_bili_live_loop
 ```
 
 * 状态载荷：`{state, reason, reason_text, attempt, display}`；`display` 已含「正在重连...(第N次)」「重连失败，原因: 鉴权失败」文案。
-* 前端映射：侧栏状态点（绿 / 琥珀脉冲 / 红 / 灰）+ 按钮文案（断开长连 / 取消连接 / 开启直播长连）。
+* 前端映射：侧栏状态点（绿 / 琥珀脉冲 / 红 / 灰）+ 按钮文案（断开连接 / 取消连接 / 开启直播连接）。
 
 ### 2. 运行日志（D5）
 
 ```
 log_info!/log_warn!/log_error!/log_debug!
-  ├─ 内存环（上限 500 条）── get_recent_logs ──► 主窗口「运行日志」视图（级别过滤/刷新/清空）
+  ├─ 内存环（上限 500 条）── get_recent_logs / clear_recent_logs（IPC 保留，主窗口日志视图已移除）
   └─ Logs/YYYY-MM-DD.txt（UTF-8 BOM，行格式 [时间]:[LEVEL] 消息）
          └─ 仅非测试构建落盘；Debug 级别仅调试构建输出（对齐 Release 下 LOG_DEBUG 空宏）
 ```
 
-* 全仓无裸 `eprintln!`；资源缺失额外广播 `resource-missing` 供前端告警。
+* 全仓无裸 `eprintln!`；资源缺失额外广播 `resource-missing`，主窗口以即时 Toast 告警。
 * 日志目录位于可写数据目录（安装版 exe 目录可能只读，属有意差异）。
 
 ### 3. 悬浮窗交互（`OverlayWindow.tsx`）

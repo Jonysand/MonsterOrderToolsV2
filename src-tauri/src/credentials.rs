@@ -117,13 +117,13 @@ pub fn load_credentials(path: Option<&Path>) -> Result<Credentials, String> {
         .map_err(|e| format!("凭据文件内容非有效 UTF-8: {}", e))?;
 
     if !content.starts_with(FILE_MAGIC) {
-        return Err("无效的凭据文件魔数 (FILE_MAGIC 不匹配)".to_string());
+        return Err("凭据文件格式不正确".to_string());
     }
 
     let after_magic = &content[FILE_MAGIC.len()..];
     const HMAC_HEX_LENGTH: usize = 64;
     if after_magic.len() < HMAC_HEX_LENGTH {
-        return Err("凭据文件长度过短，缺少 HMAC 签名".to_string());
+        return Err("凭据文件不完整".to_string());
     }
 
     let stored_hmac = &after_magic[..HMAC_HEX_LENGTH];
@@ -131,7 +131,7 @@ pub fn load_credentials(path: Option<&Path>) -> Result<Credentials, String> {
 
     let computed_hmac = compute_hmac_hex(json_data, SALT)?;
     if !stored_hmac.eq_ignore_ascii_case(&computed_hmac) {
-        return Err("凭据 HMAC 校验失败：数据可能已被损坏或非法篡改！".to_string());
+        return Err("凭据校验失败：文件可能已损坏或被非法篡改！".to_string());
     }
 
     let creds: Credentials = serde_json::from_str(json_data)
@@ -236,7 +236,7 @@ mod tests {
 
         let res = load_credentials(Some(&path));
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("FILE_MAGIC"));
+        assert!(res.unwrap_err().contains("凭据文件格式不正确"));
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);
@@ -259,7 +259,7 @@ mod tests {
 
         let res = load_credentials(Some(&path));
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("HMAC 校验失败"));
+        assert!(res.unwrap_err().contains("凭据校验失败"));
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);

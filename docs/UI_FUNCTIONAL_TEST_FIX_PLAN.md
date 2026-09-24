@@ -157,7 +157,7 @@ const askConfirm = async (message: string, title = "确认操作") => {
 | 编号 | 缺陷 | 根因 | 处置 |
 |---|---|---|---|
 | L1 | 真实开播长连必败：`start_app` 返回 `code 4013 Accept不为application/json` | V2 `generate_signed_headers` 只带 `Content-Type`；原工程 `Network.cpp:293-295` 以 `WinHttpOpenRequest(..., szAccept={"application/json"}, ...)` 显式声明 Accept。签名串只含 `x-bili-*`，补 `Accept` 不影响签名 | ☑ 已修：`bilibili.rs` 统一补 `Accept: application/json`（start/heartbeat/end 三接口共用同一签名头来源），`test_bili_api_signature` 增加断言 |
-| L2 | 注册表已有身份码时点「开启直播长连」仍被拦「请先输入开播身份码」 | `AppConfig.id_code` 带 `#[serde(skip_serializing)]`（A5 防明文外泄），前端 `config.id_code` 恒为空串，而 `toggleBiliConnect` 以它做前置校验；Rust 侧本就会回退读注册表 | ☑ 已修：留空不再拦截，交由 Rust 读注册表；仅当用户新填时才 `save_id_code`；面板提示补充留空语义 |
+| L2 | 注册表已有身份码时点「开启直播连接」仍被拦「请先输入开播身份码」 | `AppConfig.id_code` 带 `#[serde(skip_serializing)]`（A5 防明文外泄），前端 `config.id_code` 恒为空串，而 `toggleBiliConnect` 以它做前置校验；Rust 侧本就会回退读注册表 | ☑ 已修：留空不再拦截，交由 Rust 读注册表；仅当用户新填时才 `save_id_code`；面板提示补充留空语义 |
 | L3 | **换用有效身份码后 `start_app` 通过，WSS 握手瞬间整进程崩溃**（`Crashes/crash-20260920-225537.txt`、`crash-20260920-225711.txt`） | `tokio-tungstenite 0.24` 以 `default-features = false` 引入 rustls 且不启用任何 crypto provider feature → `rustls 0.23.45` 既无 `ring` 也无 `aws-lc-rs`，握手时 `expect` 失败；`[profile.release] panic = "abort"` 使 panic 直接终止进程。HTTP 侧走 reqwest 默认 native-tls，故此前模拟测试与 4013/7007 阶段都看不到 | ☑ 已修并验证：新增 `rustls = { version = "0.23", default-features = false, features = ["ring","std","tls12"] }` 直接依赖（`cargo tree` 复核解析为 `ring,std,tls12`，唯一 provider），并在 `run()` 安装进程级 provider 防未来再次歧义。23:04 重连后不再崩溃，日志进入 WS 收包阶段 |
 | L4 | 握手成功后无限重连：`收到未知操作码 8，触发重连` 每 1~2 秒一次，弹幕永远进不来 | V2 接收循环把 `op != 5` 一律当未知包（`bilibili.rs` 原 1277 行），而服务端鉴权成功后下发的**第一个包就是 op=8 = OP_AUTH_REPLY**；原工程 `BliveManager.cpp:510-532` 对 2/3/5/7/8 都有分支，只有 switch 落 default 才重连。原注释「未知操作码按原工程重连」是错误类比 | ☑ 已修：新增 `Packet::is_ignorable_control`（8/7/2 直接忽略），未知 op 才重连；补 `test_control_op_classification` |
 
@@ -166,7 +166,7 @@ const askConfirm = async (message: string, title = "确认操作") => {
 回归结果（2026-09-20 22:5x，重打包 exe 22:50）：
 
 1. L1：✅ 已修复生效 —— `code 4013` 彻底消失，服务端开始真正处理请求并返回业务码（`Logs/2026-09-20.txt` 第 18 行起为 `code 7007 身份码错误`）。
-2. L2：✅ 已修复生效 —— 身份码输入框留空点「开启直播长连」不再被拦，请求携带注册表值发出。
+2. L2：✅ 已修复生效 —— 身份码输入框留空点「开启直播连接」不再被拦，请求携带注册表值发出。
 3. 真实弹幕：L3 修复版（23:02 打包）验证握手不再崩溃，随即暴露 L4（op=8 鉴权回复被当未知包 → 无限重连），L4 修复版重打包后继续回归。**修正一条早先误判**：房间 `room/v1/Room/get_info` 返回 `live_status=0`（未开播）时互动应用仍可正常 start，此前的 `7007` 只是上一场遗留的旧身份码，与是否开播无关。
 4. 分类复核：`7007` 在 V2 走 `Other`→持续重连，与原工程 `BliveManager.cpp:353-357` 的 `default:` 分支（`Reconnecting` + `ScheduleReconnect`）一致，按「行为一致性以原工程为准」不改。
 

@@ -10,7 +10,6 @@ import {
   BatchCheckinResult,
   CredentialsStatus,
   ConnectionStatusPayload,
-  LogsSnapshot,
   MonsterDict,
   RosterData,
 } from "../types";
@@ -30,7 +29,6 @@ import {
   Gift,
   Flame,
   Power,
-  MessageSquare,
   AlertCircle,
   GripVertical,
   ListPlus,
@@ -41,7 +39,6 @@ import {
   Save,
   FileCheck,
   Upload,
-  ScrollText,
   Volume2
 } from "lucide-react";
 
@@ -57,7 +54,7 @@ const DEFAULT_CONNECTION: ConnectionStatusPayload = {
 const ENGINE_LABELS: Record<string, string> = {
   manbo: "Manbo",
   xiaomi: "小米MiMo",
-  sapi: "Windows SAPI",
+  sapi: "Windows 本地语音",
 };
 
 /** 主窗口队列行高（条目卡 46px + 间距 8px） */
@@ -65,7 +62,7 @@ const QUEUE_ROW_HEIGHT = 54;
 
 export const MainWindow: React.FC = () => {
   const [activeTab, setActiveTab] = useState<
-    "queue" | "monster" | "bili" | "gm" | "settings" | "logs"
+    "queue" | "monster" | "bili" | "gm" | "settings"
   >("queue");
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [isLite, setIsLite] = useState(false);
@@ -79,25 +76,8 @@ export const MainWindow: React.FC = () => {
   const rosterRef = useRef<RosterData>({ items: [] });
   const rosterSaveTimerRef = useRef<number | null>(null);
 
-  // B站长连五态状态机（D7）
+  // B站直播连接五态状态机（D7）
   const [conn, setConn] = useState<ConnectionStatusPayload>(DEFAULT_CONNECTION);
-  const [simDanmuMsg, setSimDanmuMsg] = useState("");
-  const [simDanmuUser, setSimDanmuUser] = useState("测试水友");
-  // 模拟身份（默认沿用旧硬编码值：舰长 + 佩戴 10 级粉丝牌）
-  const [simGuardLevel, setSimGuardLevel] = useState(3);
-  const [simHasMedal, setSimHasMedal] = useState(true);
-  const [simMedalLevel, setSimMedalLevel] = useState(10);
-  const [simLikeUser, setSimLikeUser] = useState("测试水友");
-  const [simLikeCount, setSimLikeCount] = useState(30);
-  // 直播间事件模拟（B8 礼物连击 / B2 SC·上舰）
-  const [simGiftName, setSimGiftName] = useState("小心心");
-  const [simGiftNum, setSimGiftNum] = useState(1);
-  const [simGiftPaid, setSimGiftPaid] = useState(true);
-  const [simScRmb, setSimScRmb] = useState(30);
-  const [simScMessage, setSimScMessage] = useState("加油！");
-  const [simGuardEventLevel, setSimGuardEventLevel] = useState(3);
-  const [simGuardEventNum, setSimGuardEventNum] = useState(1);
-  const [simGuardEventUnit, setSimGuardEventUnit] = useState("月");
   const [recentCheckins, setRecentCheckins] = useState<UserProfile[]>([]);
 
   // 语音设置（D1）
@@ -108,12 +88,7 @@ export const MainWindow: React.FC = () => {
   // 悬浮窗锁定（D2）
   const [overlayLocked, setOverlayLocked] = useState(false);
 
-  // 运行日志（D5）
-  const [logSnapshot, setLogSnapshot] = useState<LogsSnapshot | null>(null);
-  const [logLevel, setLogLevel] = useState<"DEBUG" | "INFO" | "WARNING" | "ERROR">("INFO");
-  const [resourceWarnings, setResourceWarnings] = useState<string[]>([]);
   const [appVersion, setAppVersion] = useState("");
-  const activeTabRef = useRef(activeTab);
 
   // GM 运维面板状态
   const [searchKeyword, setSearchKeyword] = useState("");
@@ -159,7 +134,9 @@ export const MainWindow: React.FC = () => {
   const fetchConfig = async () => {
     try {
       const cfg = await invoke<AppConfig>("get_app_config");
-      setConfig(cfg);
+      // 已保存的身份码单独读取（配置序列化排除敏感字段），供输入框以密码形态回显
+      const savedCode = await invoke<string>("get_id_code").catch(() => "");
+      setConfig({ ...cfg, id_code: savedCode || cfg.id_code || "" });
       setIsLite(cfg.is_lite_mode);
     } catch (e) {
       console.error(e);
@@ -179,18 +156,6 @@ export const MainWindow: React.FC = () => {
     try {
       const name = await invoke<string>("get_current_tts_engine");
       setCurrentEngine(name);
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  const fetchLogs = async () => {
-    try {
-      const snapshot = await invoke<LogsSnapshot>("get_recent_logs", {
-        limit: 300,
-        minLevel: logLevel,
-      });
-      setLogSnapshot(snapshot);
     } catch (e) {
       console.error(e);
     }
@@ -232,9 +197,6 @@ export const MainWindow: React.FC = () => {
       fetchCredentialsStatus();
       // 「当前引擎」实时刷新（对齐原工程 2s 定时器）
       fetchCurrentEngine();
-      if (activeTabRef.current === "logs") {
-        fetchLogs();
-      }
     }, 2500);
 
     const unlistenQueue = listen<QueueItem[]>("queue-updated", (event) => {
@@ -262,11 +224,9 @@ export const MainWindow: React.FC = () => {
       fetchConfig();
     });
 
-    // D5 资源缺失提示
+    // D5 资源缺失提示（原运行日志页告警卡片改为主窗口即时 Toast）
     const unlistenMissing = listen<string>("resource-missing", (event) => {
-      setResourceWarnings((prev) =>
-        prev.includes(event.payload) ? prev : [...prev, event.payload]
-      );
+      showToast(`资源缺失：${event.payload}（相关功能将降级运行）`);
     });
 
     return () => {
@@ -289,14 +249,6 @@ export const MainWindow: React.FC = () => {
       .then(setAppVersion)
       .catch(() => setAppVersion(""));
   }, []);
-
-  useEffect(() => {
-    activeTabRef.current = activeTab;
-    if (activeTab === "logs") {
-      fetchLogs();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, logLevel]);
 
   /* ---------------- 怪物字典 / 禁点名单 ---------------- */
   const fetchMonsterDict = async () => {
@@ -503,7 +455,7 @@ export const MainWindow: React.FC = () => {
     }
     try {
       await invoke("save_id_code", { idCode: code });
-      showToast("开播身份码已持久化保存至 Windows 注册表！");
+      showToast("开播身份码已保存到本机！");
     } catch (e) {
       showToast(`保存身份码失败: ${e}`);
     }
@@ -515,15 +467,14 @@ export const MainWindow: React.FC = () => {
       const isActive = conn.state === "Connected" || conn.state === "Connecting" || conn.state === "Reconnecting";
       const next = !isActive;
       if (next) {
-        // id_code 不下发前端（skip_serializing），故留空时不拦截：交由 Rust 侧回退读注册表
+        // 回显值未改动时重复写入同值无副作用；留空则交由 Rust 侧回退读注册表
         const currentCode = (config?.id_code || "").trim();
         if (currentCode) {
-          // 自动将当前输入的身份码同步保存至注册表
           await invoke("save_id_code", { idCode: currentCode });
         }
       }
       await invoke("set_bili_connection", { connected: next });
-      showToast(next ? "正在建立 B 站开放平台长连接..." : "已断开直播连接");
+      showToast(next ? "正在建立 B 站直播连接..." : "已断开直播连接");
       fetchBiliStatus();
     } catch (e) {
       showToast(`连接操作失败: ${e}`);
@@ -555,42 +506,6 @@ export const MainWindow: React.FC = () => {
       showToast(next ? "悬浮窗已锁定：鼠标穿透 + 置顶（Alt+, 可解锁）" : "悬浮窗已解锁：可拖拽与点击");
     } catch (e) {
       showToast(`悬浮窗锁定操作失败: ${e}`);
-    }
-  };
-
-  // 清空前端日志视图的内存环
-  const handleClearLogs = async () => {
-    try {
-      await invoke("clear_recent_logs");
-      fetchLogs();
-      showToast("日志视图已清空（已落盘文件保留）");
-    } catch (e) {
-      showToast(`清空日志失败: ${e}`);
-    }
-  };
-
-  // 模拟弹幕发送（通过后端统一业务管道）
-  const handleSimDanmu = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!simDanmuMsg.trim()) return;
-
-    try {
-      const danmuPayload = {
-        user_id: `sim-${simDanmuUser}`,
-        user_name: simDanmuUser,
-        message: simDanmuMsg.trim(),
-        timestamp: Math.floor(Date.now() / 1000),
-        has_medal: simHasMedal,
-        medal_level: simHasMedal ? simMedalLevel : 0,
-        guard_level: simGuardLevel,
-        msg_id: `sim-${Date.now()}`,
-        is_paid_gift: false,
-      };
-      await invoke("simulate_danmu", { danmu: danmuPayload });
-      showToast(`已通过总线发射模拟弹幕：【${simDanmuMsg.trim()}】`);
-      setSimDanmuMsg("");
-    } catch (err) {
-      showToast(`弹幕模拟处理失败: ${err}`);
     }
   };
 
@@ -664,90 +579,6 @@ export const MainWindow: React.FC = () => {
     }
   };
 
-  // 模拟点赞事件（msg_id 去重 + 奖卡播报）
-  const handleSimLike = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      const replies = await invoke<string[]>("simulate_like", {
-        event: {
-          // 与弹幕模拟通道同口径（sim-{昵称}），保证跨链路档案连通
-          uid: `sim-${simLikeUser}`,
-          username: simLikeUser,
-          msg_id: `sim_like_${Date.now()}`,
-          like_count: simLikeCount,
-          timestamp: Math.floor(Date.now() / 1000),
-        },
-      });
-      showToast(
-        replies.length > 0
-          ? `已发放奖卡并播报：${replies.join(" / ")}`
-          : `已记录 ${simLikeUser} 本次点赞 ${simLikeCount} 次（未触发奖卡）`
-      );
-    } catch (err) {
-      showToast(`点赞模拟失败: ${err}`);
-    }
-  };
-
-  // 模拟礼物事件（B8 连击合并 / B11 付费过滤；combo 置空走动态连击跟踪）
-  const handleSimGift = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await invoke("simulate_gift", {
-        event: {
-          open_id: `sim-${simDanmuUser}`,
-          gift_id: `sim_gift_${Date.now()}`,
-          uname: simDanmuUser,
-          gift_name: simGiftName.trim() || "小心心",
-          gift_num: simGiftNum,
-          paid: simGiftPaid,
-          combo: null,
-        },
-      });
-      showToast(`已发射模拟礼物：${simDanmuUser} × ${simGiftName.trim() || "小心心"} ×${simGiftNum}`);
-    } catch (err) {
-      showToast(`礼物模拟失败: ${err}`);
-    }
-  };
-
-  // 模拟 SC 事件（B2 高亮弹幕播报）
-  const handleSimSuperChat = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await invoke("simulate_live_event", {
-        event: {
-          kind: "SuperChat",
-          user_id: `sim-${simDanmuUser}`,
-          uname: simDanmuUser,
-          rmb: simScRmb,
-          message: simScMessage.trim() || "加油！",
-        },
-      });
-      showToast(`已发射模拟 SC：${simDanmuUser} ¥${simScRmb}`);
-    } catch (err) {
-      showToast(`SC 模拟失败: ${err}`);
-    }
-  };
-
-  // 模拟上舰事件（B2 舰长/提督/总督播报）
-  const handleSimGuard = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await invoke("simulate_live_event", {
-        event: {
-          kind: "Guard",
-          user_id: `sim-${simDanmuUser}`,
-          uname: simDanmuUser,
-          guard_level: simGuardEventLevel,
-          guard_num: simGuardEventNum,
-          guard_unit: simGuardEventUnit.trim() || "月",
-        },
-      });
-      showToast(`已发射模拟上舰：${simDanmuUser} 开通 ${simGuardEventNum} ${simGuardEventUnit.trim() || "月"}`);
-    } catch (err) {
-      showToast(`上舰模拟失败: ${err}`);
-    }
-  };
-
   // 保存设置
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -806,6 +637,29 @@ export const MainWindow: React.FC = () => {
           {/* 导航按钮 */}
           <nav className="space-y-1">
             <button
+              onClick={() => setActiveTab("bili")}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
+                activeTab === "bili"
+                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                  : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
+              }`}
+            >
+              <Radio className="w-4 h-4" />
+              <span>直播连接</span>
+              <span
+                className={`ml-auto w-2 h-2 rounded-full ${
+                  conn.state === "Connected"
+                    ? "bg-emerald-400 shadow-emerald-500/50 shadow-sm"
+                    : conn.state === "Connecting" || conn.state === "Reconnecting"
+                    ? "bg-amber-400 animate-pulse"
+                    : conn.state === "ReconnectFailed"
+                    ? "bg-red-500"
+                    : "bg-neutral-600"
+                }`}
+              />
+            </button>
+
+            <button
               onClick={() => setActiveTab("queue")}
               className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
                 activeTab === "queue"
@@ -847,29 +701,6 @@ export const MainWindow: React.FC = () => {
             </button>
 
             <button
-              onClick={() => setActiveTab("bili")}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
-                activeTab === "bili"
-                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
-                  : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
-              }`}
-            >
-              <Radio className="w-4 h-4" />
-              <span>直播长连</span>
-              <span
-                className={`ml-auto w-2 h-2 rounded-full ${
-                  conn.state === "Connected"
-                    ? "bg-emerald-400 shadow-emerald-500/50 shadow-sm"
-                    : conn.state === "Connecting" || conn.state === "Reconnecting"
-                    ? "bg-amber-400 animate-pulse"
-                    : conn.state === "ReconnectFailed"
-                    ? "bg-red-500"
-                    : "bg-neutral-600"
-                }`}
-              />
-            </button>
-
-            <button
               onClick={() => setActiveTab("gm")}
               className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
                 activeTab === "gm"
@@ -880,23 +711,6 @@ export const MainWindow: React.FC = () => {
               <CalendarCheck className="w-4 h-4" />
               <span>舰长打卡 & GM</span>
               {isLite && <span className="ml-auto text-[9px] text-amber-400">停用</span>}
-            </button>
-
-            <button
-              onClick={() => setActiveTab("logs")}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
-                activeTab === "logs"
-                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
-                  : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
-              }`}
-            >
-              <ScrollText className="w-4 h-4" />
-              <span>运行日志</span>
-              {resourceWarnings.length > 0 && (
-                <span className="ml-auto text-[9px] bg-red-500/20 text-red-300 border border-red-500/40 px-1.5 py-0.5 rounded-full">
-                  资源缺失
-                </span>
-              )}
             </button>
 
             <button
@@ -932,7 +746,7 @@ export const MainWindow: React.FC = () => {
               </button>
             </div>
             <p className="text-[10px] text-neutral-500 leading-tight">
-              {isLite ? "已停用 TTS、打卡和 AI 模块，超轻量运行" : "所有功能模块正常运行中"}
+              {isLite ? "已停用语音、打卡和 AI 模块，超轻量运行" : "所有功能模块正常运行中"}
             </p>
           </div>
 
@@ -955,7 +769,6 @@ export const MainWindow: React.FC = () => {
               {activeTab === "bili" && "B 站开放平台直播间连接与监控"}
               {activeTab === "gm" && "舰长周打卡系统与 GM 运维管理"}
               {activeTab === "settings" && "系统全局持久化参数设置"}
-              {activeTab === "logs" && "运行日志与可观测诊断"}
             </h1>
             {isLite && (
               <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold px-2 py-0.5 rounded-full">
@@ -1154,14 +967,13 @@ export const MainWindow: React.FC = () => {
           )}
 
 
-          {/* 3. 直播长连 TAB */}
+          {/* 3. 直播连接 TAB */}
           {activeTab === "bili" && (
             <div className="max-w-3xl space-y-6">
               <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
                 <div className="flex items-center justify-between pb-3 border-b border-neutral-800">
                   <div>
                     <h2 className="text-sm font-bold text-neutral-200">B 站直播开放平台状态</h2>
-                    <p className="text-xs text-neutral-400">实时长连接与 ProtoUtils 双向封包通信</p>
                   </div>
 
                   <div className="flex items-center gap-2">
@@ -1192,26 +1004,24 @@ export const MainWindow: React.FC = () => {
                   </div>
                 </div>
 
-                {/* 开播身份码与开启长连合一控制区 */}
+                {/* 开播身份码与开启连接合一控制区 */}
                 <div className="bg-neutral-950/80 border border-neutral-800 rounded-xl p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <label className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
                       <Key className="w-3.5 h-3.5 text-amber-400" />
-                      <span>开播身份码 (id_code) 与直播长连</span>
+                      <span>开播身份码与直播连接</span>
                     </label>
-                    <span className="text-[10px] text-neutral-500 font-mono">
-                      HKCU\Software\MonsterOrderWilds\IdCode
-                    </span>
+                    <span className="text-[10px] text-neutral-500">本机安全保存</span>
                   </div>
 
-                  {/* 身份码输入框 + 保存 + 开启直播长连按钮紧密并排 */}
+                  {/* 身份码输入框 + 保存 + 开启直播连接按钮紧密并排 */}
                   <div className="flex items-center gap-2.5">
-                    <div className="relative flex-1">
+                    <div className="relative flex-1 min-w-0">
                       <input
                         type="password"
                         value={config?.id_code || ""}
                         onChange={(e) => config && setConfig({ ...config, id_code: e.target.value })}
-                        placeholder="在此输入或粘贴当次开播身份码 (id_code)..."
+                        placeholder="在此输入或粘贴当次开播身份码..."
                         className="w-full bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-xs text-neutral-100 placeholder-neutral-500 focus:border-amber-400 focus:outline-none"
                       />
                     </div>
@@ -1220,7 +1030,7 @@ export const MainWindow: React.FC = () => {
                       type="button"
                       onClick={handleSaveIdCode}
                       className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-bold rounded-lg border border-neutral-700 transition flex items-center gap-1.5 shrink-0"
-                      title="单独将身份码保存至 Windows 注册表"
+                      title="单独将身份码保存到本机"
                     >
                       <Save className="w-3.5 h-3.5 text-amber-400" />
                       <span>保存</span>
@@ -1238,250 +1048,34 @@ export const MainWindow: React.FC = () => {
                       <Power className="w-4 h-4" />
                       <span>
                         {conn.state === "Connected"
-                          ? "断开长连"
+                          ? "断开连接"
                           : conn.state === "Connecting" || conn.state === "Reconnecting"
                           ? "取消连接"
-                          : "开启直播长连"}
+                          : "开启直播连接"}
                       </span>
                     </button>
                   </div>
 
                   <p className="text-[11px] text-neutral-400 leading-relaxed">
-                    提示：填入身份码后点击【开启直播长连】会自动同步保存至 Windows 注册表；此处留空则直接沿用注册表
-                    HKCU\Software\MonsterOrderWilds\IdCode 中已保存的身份码（出于安全不回显）。
+                    提示：点击【开启直播连接】会自动保存到本机；已保存的身份码以密码形式回显，可直接修改或重新粘贴覆盖（留空则沿用本机已保存值）。
                   </p>
                 </div>
               </div>
+            </div>
+          )}
 
-              {/* 弹幕调试与模拟测试器 */}
-              <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
-                <h3 className="text-xs font-bold text-amber-300">本地弹幕模拟测试通道</h3>
-                <form onSubmit={handleSimDanmu} className="space-y-3">
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">模拟昵称</label>
-                      <input
-                        type="text"
-                        value={simDanmuUser}
-                        onChange={(e) => setSimDanmuUser(e.target.value)}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">弹幕内容</label>
-                      <input
-                        type="text"
-                        value={simDanmuMsg}
-                        onChange={(e) => setSimDanmuMsg(e.target.value)}
-                        placeholder="例: 点怪 霸主太太 / 优先 / 打卡..."
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">舰长等级</label>
-                      <select
-                        value={simGuardLevel}
-                        onChange={(e) => setSimGuardLevel(Number(e.target.value))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-200"
-                      >
-                        <option value={0}>无（普通水友）</option>
-                        <option value={1}>总督</option>
-                        <option value={2}>提督</option>
-                        <option value={3}>舰长</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">粉丝牌（佩戴 / 等级）</label>
-                      <div className="flex items-center gap-2">
-                        <label className="flex items-center gap-1.5 text-xs text-neutral-300 shrink-0">
-                          <input
-                            type="checkbox"
-                            checked={simHasMedal}
-                            onChange={(e) => setSimHasMedal(e.target.checked)}
-                            className="accent-amber-500"
-                          />
-                          <span>佩戴</span>
-                        </label>
-                        <input
-                          type="number"
-                          min="0"
-                          max="40"
-                          value={simMedalLevel}
-                          disabled={!simHasMedal}
-                          onChange={(e) => setSimMedalLevel(Math.max(0, Number(e.target.value)))}
-                          className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  <button
-                    type="submit"
-                    className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-4 py-1.5 rounded-lg text-xs flex items-center gap-1.5"
-                  >
-                    <MessageSquare className="w-3.5 h-3.5" />
-                    <span>发射模拟弹幕</span>
-                  </button>
-                </form>
-
-                {/* 点赞奖卡模拟（走同一点赞管道：msg_id 去重 + 奖卡播报） */}
-                <form onSubmit={handleSimLike} className="space-y-3 pt-3 border-t border-neutral-800">
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">点赞昵称</label>
-                      <input
-                        type="text"
-                        value={simLikeUser}
-                        onChange={(e) => setSimLikeUser(e.target.value)}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[11px] font-bold text-neutral-400 mb-1">点赞次数</label>
-                      <input
-                        type="number"
-                        min="1"
-                        max="10000"
-                        value={simLikeCount}
-                        onChange={(e) => setSimLikeCount(Math.max(1, Number(e.target.value)))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                  </div>
-                  <button
-                    type="submit"
-                    disabled={isLite}
-                    className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-4 py-1.5 rounded-lg text-xs flex items-center gap-1.5 disabled:opacity-40"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>发射模拟点赞（30 次触发奖卡）</span>
-                  </button>
-                </form>
-
-                {/* 直播间事件模拟（B8 礼物连击 / B2 SC·上舰；复用「模拟昵称」作为 uname） */}
-                <div className="space-y-2.5 pt-3 border-t border-neutral-800">
-                  <div className="text-[11px] font-bold text-neutral-400">
-                    直播间事件模拟（复用上方「模拟昵称」；Lite 下停用）
-                  </div>
-
-                  <form onSubmit={handleSimGift} className="flex flex-wrap items-end gap-2">
-                    <div className="flex-1 min-w-24">
-                      <label className="block text-[10px] text-neutral-500 mb-1">礼物名</label>
-                      <input
-                        type="text"
-                        value={simGiftName}
-                        onChange={(e) => setSimGiftName(e.target.value)}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <div className="w-20">
-                      <label className="block text-[10px] text-neutral-500 mb-1">数量</label>
-                      <input
-                        type="number"
-                        min="1"
-                        value={simGiftNum}
-                        onChange={(e) => setSimGiftNum(Math.max(1, Number(e.target.value)))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <label className="flex items-center gap-1.5 text-xs text-neutral-300 py-1.5">
-                      <input
-                        type="checkbox"
-                        checked={simGiftPaid}
-                        onChange={(e) => setSimGiftPaid(e.target.checked)}
-                        className="accent-amber-500"
-                      />
-                      <span>付费</span>
-                    </label>
-                    <button
-                      type="submit"
-                      disabled={isLite}
-                      className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1.5 disabled:opacity-40"
-                    >
-                      <Gift className="w-3.5 h-3.5" />
-                      <span>模拟礼物</span>
-                    </button>
-                  </form>
-
-                  <form onSubmit={handleSimSuperChat} className="flex flex-wrap items-end gap-2">
-                    <div className="w-20">
-                      <label className="block text-[10px] text-neutral-500 mb-1">金额 (¥)</label>
-                      <input
-                        type="number"
-                        min="1"
-                        value={simScRmb}
-                        onChange={(e) => setSimScRmb(Math.max(1, Number(e.target.value)))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <div className="flex-1 min-w-24">
-                      <label className="block text-[10px] text-neutral-500 mb-1">内容</label>
-                      <input
-                        type="text"
-                        value={simScMessage}
-                        onChange={(e) => setSimScMessage(e.target.value)}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <button
-                      type="submit"
-                      disabled={isLite}
-                      className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1.5 disabled:opacity-40"
-                    >
-                      <Flame className="w-3.5 h-3.5" />
-                      <span>模拟 SC</span>
-                    </button>
-                  </form>
-
-                  <form onSubmit={handleSimGuard} className="flex flex-wrap items-end gap-2">
-                    <div className="w-28">
-                      <label className="block text-[10px] text-neutral-500 mb-1">舰长等级</label>
-                      <select
-                        value={simGuardEventLevel}
-                        onChange={(e) => setSimGuardEventLevel(Number(e.target.value))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-200"
-                      >
-                        <option value={1}>总督</option>
-                        <option value={2}>提督</option>
-                        <option value={3}>舰长</option>
-                      </select>
-                    </div>
-                    <div className="w-20">
-                      <label className="block text-[10px] text-neutral-500 mb-1">数量</label>
-                      <input
-                        type="number"
-                        min="1"
-                        value={simGuardEventNum}
-                        onChange={(e) => setSimGuardEventNum(Math.max(1, Number(e.target.value)))}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <div className="w-20">
-                      <label className="block text-[10px] text-neutral-500 mb-1">单位</label>
-                      <input
-                        type="text"
-                        value={simGuardEventUnit}
-                        onChange={(e) => setSimGuardEventUnit(e.target.value)}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-2.5 py-1.5 text-xs text-neutral-100"
-                      />
-                    </div>
-                    <button
-                      type="submit"
-                      disabled={isLite}
-                      className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1.5 disabled:opacity-40"
-                    >
-                      <Shield className="w-3.5 h-3.5" />
-                      <span>模拟上舰</span>
-                    </button>
-                  </form>
+          {/* 4. 舰长打卡 & GM 运维 TAB */}
+          {activeTab === "gm" && (
+            <div className="space-y-6">
+              {isLite && (
+                <div className="bg-amber-950/40 border border-amber-500/50 rounded-xl p-4 flex items-center gap-3 text-amber-200 text-xs">
+                  <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
+                  <span>当前处于 Lite 纯排队模式，打卡与 GM 运维模块已冻结。如需使用请在左下角关闭 Lite 模式。</span>
                 </div>
-              </div>
+              )}
 
-              {/* D4 主播控制台实时动态：打卡记录 */}
               <div className="grid grid-cols-12 gap-6">
+                {/* D4 主播控制台实时动态：打卡记录 */}
                 <div className="col-span-12 bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-3">
                   <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
                     <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
@@ -1510,21 +1104,7 @@ export const MainWindow: React.FC = () => {
                     )}
                   </div>
                 </div>
-              </div>
-            </div>
-          )}
 
-          {/* 4. 舰长打卡 & GM 运维 TAB */}
-          {activeTab === "gm" && (
-            <div className="space-y-6">
-              {isLite && (
-                <div className="bg-amber-950/40 border border-amber-500/50 rounded-xl p-4 flex items-center gap-3 text-amber-200 text-xs">
-                  <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
-                  <span>当前处于 ONLY_ORDER_MONSTER (Lite 模式)，打卡与 GM 运维模块已冻结。如需使用请在左下角关闭 Lite 模式。</span>
-                </div>
-              )}
-
-              <div className="grid grid-cols-12 gap-6">
                 {/* 运维指令卡片 */}
                 <div className="col-span-6 bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
                   <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
@@ -1634,7 +1214,7 @@ export const MainWindow: React.FC = () => {
                       onChange={(e) => setSearchKeyword(e.target.value)}
                       placeholder="输入水友昵称关键字或 UID 进行模糊搜索..."
                       disabled={isLite}
-                      className="flex-1 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
+                      className="flex-1 min-w-0 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
                     />
                     <div className="flex items-center gap-1.5 bg-neutral-950 border border-neutral-800 rounded-lg px-2.5">
                       <span className="text-[11px] text-neutral-400">发卡数量:</span>
@@ -1709,17 +1289,17 @@ export const MainWindow: React.FC = () => {
                   <div className="flex items-center gap-2">
                     <Lock className="w-4 h-4 text-emerald-400" />
                     <h3 className="text-xs font-bold text-emerald-300">
-                      敏感凭据加密托管 (credentials.dat)
+                      敏感凭据加密托管
                     </h3>
                   </div>
                   <span className="text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded-full font-mono flex items-center gap-1">
                     <FileCheck className="w-3 h-3 text-emerald-400" />
-                    <span>{credStatus?.loaded ? "HMAC 签名校验通过" : "未检测到凭据文件"}</span>
+                    <span>{credStatus?.loaded ? "校验通过" : "未检测到凭据文件"}</span>
                   </span>
                 </div>
 
                 <p className="text-[11px] text-neutral-400 leading-relaxed">
-                  遵循原工程安全规范，APP ID、AccessKey、TTS Key 与 AI Key 均存储于本地加密配置文件 <span className="text-amber-200/80 font-mono">credentials.dat</span> 中，采用 Base64 + HMAC-SHA256 签名双重校验，<strong className="text-neutral-200">不允许手动设置或明文暴露</strong>。
+                  遵循原工程安全规范，应用凭据（APP ID、访问密钥、语音与 AI 密钥）均加密保存在本地凭据文件中，<strong className="text-neutral-200">不允许手动设置或明文暴露</strong>。
                   安装包出于安全考虑<strong className="text-neutral-200">不随包分发该文件</strong>，请点击下方按钮导入由原工程生成（或随原始发行包提供）的凭据文件。
                 </p>
 
@@ -1730,7 +1310,7 @@ export const MainWindow: React.FC = () => {
                     className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1.5 rounded-lg text-[11px] shadow-lg shadow-emerald-600/30 transition"
                   >
                     <Upload className="w-3.5 h-3.5" />
-                    <span>导入凭据文件 (credentials.dat)</span>
+                    <span>导入凭据文件</span>
                   </button>
                   <span className="text-[10px] font-mono text-neutral-500 break-all">
                     目标路径：{credStatus?.file_path || "—"}
@@ -1748,7 +1328,7 @@ export const MainWindow: React.FC = () => {
                   <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
                     <span className="text-[10px] text-neutral-500 flex items-center gap-1">
                       <Key className="w-2.5 h-2.5 text-amber-400" />
-                      <span>AccessKey ID</span>
+                      <span>访问密钥 ID</span>
                     </span>
                     <span className="text-xs font-mono font-bold text-neutral-200">
                       {credStatus?.access_key_masked || "未加载"}
@@ -1765,7 +1345,7 @@ export const MainWindow: React.FC = () => {
                   <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
                     <span className="text-[10px] text-neutral-500 block">多引擎语音</span>
                     <span className={`text-xs font-bold ${credStatus?.has_mimo_key || credStatus?.has_vip_tts_key ? "text-emerald-300" : "text-neutral-500"}`}>
-                      {credStatus?.has_mimo_key ? "MiMo 已绑定" : "本地 SAPI"}
+                      {credStatus?.has_mimo_key ? "MiMo 已绑定" : "本地语音"}
                     </span>
                   </div>
                 </div>
@@ -1776,7 +1356,7 @@ export const MainWindow: React.FC = () => {
                 <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
                   <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
                     <Volume2 className="w-4 h-4" />
-                    <span>多引擎 TTS 语音与音效</span>
+                    <span>语音播报与音效</span>
                   </h3>
                   {isLite && <span className="text-[10px] text-amber-400">Lite 模式下已停用</span>}
                 </div>
@@ -1835,17 +1415,17 @@ export const MainWindow: React.FC = () => {
                 {/* 引擎与当前实际引擎 */}
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-3 border-t border-neutral-800">
                   <div>
-                    <label className="block text-[11px] text-neutral-400 mb-1">TTS 引擎</label>
+                    <label className="block text-[11px] text-neutral-400 mb-1">播报引擎</label>
                     <select
                       value={config.tts_engine || "auto"}
                       disabled={isLite}
                       onChange={(e) => setConfig({ ...config, tts_engine: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
-                      <option value="auto">自动（Manbo → MiMo → SAPI）</option>
+                      <option value="auto">自动（按优先级依次尝试）</option>
                       <option value="manbo">Manbo</option>
                       <option value="mimo">小米 MiMo</option>
-                      <option value="sapi">Windows SAPI</option>
+                      <option value="sapi">Windows 本地语音</option>
                     </select>
                   </div>
                   <div className="flex items-end">
@@ -1894,9 +1474,9 @@ export const MainWindow: React.FC = () => {
 
                 {/* Manbo API Key：仅写注册表，永不回传明文 */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  <div>
+                  <div className="min-w-0">
                     <label className="block text-[11px] text-neutral-400 mb-1">
-                      Manbo API Key（仅写入注册表，不落 JSON / 不回显）
+                      Manbo API Key（仅保存到本机，不回显）
                     </label>
                     <div className="flex items-center gap-2">
                       <input
@@ -1905,7 +1485,7 @@ export const MainWindow: React.FC = () => {
                         disabled={isLite}
                         onChange={(e) => setManboKeyInput(e.target.value)}
                         placeholder={credStatus?.has_vip_tts_key ? "已绑定（留空则保持不变）" : "输入 Manbo API Key"}
-                        className="flex-1 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 disabled:opacity-40"
+                        className="flex-1 min-w-0 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 disabled:opacity-40"
                       />
                       <button
                         type="button"
@@ -1967,7 +1547,7 @@ export const MainWindow: React.FC = () => {
                   </div>
                   <div>
                     <label className="block text-[11px] text-neutral-400 mb-1">
-                      语音音量 ({config.speech_volume}，SAPI 按 1/2 生效；其余引擎按 200 为满量程)
+                      语音音量 ({config.speech_volume})
                     </label>
                     <input
                       type="range"
@@ -1982,7 +1562,7 @@ export const MainWindow: React.FC = () => {
                   </div>
                   <div>
                     <label className="block text-[11px] text-neutral-400 mb-1">
-                      语音音调 (SAPI) ({config.speech_pitch})
+                      语音音调 ({config.speech_pitch})
                     </label>
                     <input
                       type="range"
@@ -2137,8 +1717,7 @@ export const MainWindow: React.FC = () => {
                     </span>
                   </div>
                   <p className="text-[10px] text-neutral-500 leading-relaxed">
-                    锁定后窗口透明且鼠标穿透（使用穿透模式透明度），方便查看游戏画面；窗口位置会自动记忆
-                    （配置项 top_pos_x / top_pos_y），下次启动按记忆位置显示。
+                    锁定后窗口透明且鼠标穿透（使用穿透模式透明度），方便查看游戏画面；窗口位置会自动记忆，下次启动按记忆位置显示。
                   </p>
                 </div>
               </div>
@@ -2152,94 +1731,6 @@ export const MainWindow: React.FC = () => {
                 </button>
               </div>
             </form>
-          )}
-
-          {/* 6. 运行日志 TAB（D5，全模式保留） */}
-          {activeTab === "logs" && (
-            <div className="max-w-5xl space-y-4">
-              {resourceWarnings.length > 0 && (
-                <div className="bg-red-950/40 border border-red-500/50 rounded-xl p-4 space-y-1">
-                  <div className="flex items-center gap-2 text-red-200 text-xs font-bold">
-                    <AlertCircle className="w-4 h-4 text-red-400" />
-                    <span>资源缺失，相关功能将降级运行：</span>
-                  </div>
-                  {resourceWarnings.map((w) => (
-                    <div key={w} className="text-[11px] text-red-300 font-mono pl-6">
-                      {w}
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
-                <div className="flex items-center justify-between pb-3 border-b border-neutral-800">
-                  <div>
-                    <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
-                      <ScrollText className="w-4 h-4" />
-                      <span>运行日志（内存环最近 500 条）</span>
-                    </h3>
-                    <p className="text-[10px] text-neutral-500 mt-1 font-mono break-all">
-                      文件日志: {logSnapshot?.dir || "解析中..."}/YYYY-MM-DD.txt（UTF-8 BOM，按日期分文件）
-                    </p>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={logLevel}
-                      onChange={(e) =>
-                        setLogLevel(e.target.value as "DEBUG" | "INFO" | "WARNING" | "ERROR")
-                      }
-                      className="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200"
-                    >
-                      <option value="ERROR">仅 ERROR</option>
-                      <option value="WARNING">WARNING 及以上</option>
-                      <option value="INFO">INFO 及以上</option>
-                      <option value="DEBUG">全部（含 DEBUG）</option>
-                    </select>
-                    <button
-                      onClick={fetchLogs}
-                      className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-bold rounded-lg border border-neutral-700 transition"
-                    >
-                      刷新
-                    </button>
-                    <button
-                      onClick={handleClearLogs}
-                      className="px-3 py-1.5 bg-neutral-800 hover:bg-red-600 hover:text-white text-neutral-400 text-xs font-bold rounded-lg border border-neutral-700 transition"
-                    >
-                      清空视图
-                    </button>
-                  </div>
-                </div>
-
-                <div className="max-h-[34rem] overflow-y-auto bg-neutral-950 border border-neutral-800 rounded-lg p-3 font-mono text-[11px] leading-relaxed scrollbar-thin scrollbar-thumb-neutral-800">
-                  {!logSnapshot || logSnapshot.entries.length === 0 ? (
-                    <div className="text-neutral-500 py-8 text-center">
-                      暂无日志（Debug 级别在 Release 构建下不输出）
-                    </div>
-                  ) : (
-                    logSnapshot.entries.map((entry, idx) => (
-                      <div key={`${entry.time}-${idx}`} className="flex gap-2">
-                        <span className="text-neutral-500 shrink-0">{entry.time}</span>
-                        <span
-                          className={`shrink-0 font-bold ${
-                            entry.level === "ERROR"
-                              ? "text-red-400"
-                              : entry.level === "WARNING"
-                              ? "text-amber-400"
-                              : entry.level === "INFO"
-                              ? "text-emerald-400"
-                              : "text-neutral-400"
-                          }`}
-                        >
-                          [{entry.level}]
-                        </span>
-                        <span className="text-neutral-200 break-all">{entry.message}</span>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            </div>
           )}
         </div>
       </main>

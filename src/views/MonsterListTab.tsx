@@ -187,7 +187,7 @@ export const MonsterListTab: React.FC<Props> = ({
       });
       await onDictChanged();
       setDraft(null);
-      toast(`条目「${name}」已保存，匹配器已热重载`);
+      toast(`条目「${name}」已保存并生效`);
     } catch (err) {
       toast(`保存失败: ${err}`);
     } finally {
@@ -262,7 +262,7 @@ export const MonsterListTab: React.FC<Props> = ({
         <div>
           <h1>怪物名单</h1>
           <p className="sub">
-            禁点名单：名单内的怪物不可被点单（弹幕与选怪面板同时生效）· 空名单不限制任何点怪 · 数据源 <b>monster_list.json</b>
+            禁点名单：名单内的怪物不可被点单（弹幕与选怪面板同时生效）· 空名单不限制任何点怪 · 自动保存到本机
           </p>
         </div>
         <div className="head-actions">
@@ -545,7 +545,7 @@ export const MonsterListTab: React.FC<Props> = ({
           <aside className="drawer">
             <header>
               <span className="ttl">{draft.original ? "编辑怪物条目" : "新增怪物条目"}</span>
-              <span className="src">monster_list.json</span>
+              <span className="src">本机列表文件</span>
               <button className="x" onClick={() => setDraft(null)}>
                 <X />
               </button>

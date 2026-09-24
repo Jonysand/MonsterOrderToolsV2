@@ -311,15 +311,6 @@ fn restore_order(
     Ok(items)
 }
 
-/// 匹配怪物名称
-#[tauri::command]
-fn match_monster_name(
-    input_text: String,
-    state: State<'_, AppState>,
-) -> Result<Option<monster::MonsterMatchResult>, String> {
-    Ok(state.monster_mgr.match_monster(&input_text))
-}
-
 /// 读取全量怪物字典（图鉴库展示与别称冲突检测的数据源）
 #[tauri::command]
 fn get_monster_dict(
@@ -440,7 +431,7 @@ pub fn parse_roster_json(content: &str) -> Result<RosterData, String> {
                 .map_err(|e| format!("名单数组元素必须为字符串: {}", e))?;
             Ok(RosterData { items })
         }
-        _ => Err("名单 JSON 顶层必须是对象或字符串数组".into()),
+        _ => Err("名单文件格式不正确（顶层需为对象或字符串数组）".into()),
     }
 }
 
@@ -538,12 +529,29 @@ fn ensure_not_lite(state: &AppState, module: &str) -> Result<(), String> {
 #[tauri::command]
 fn get_app_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?.clone();
+    cfg.id_code = resolve_id_code(&state);
+    Ok(cfg.sanitized())
+}
+
+/// 解析本机已保存的开播身份码：注册表优先，注册表为空时回退内存配置
+fn resolve_id_code(state: &AppState) -> String {
     if let Ok(reg_code) = registry::read_id_code() {
         if !reg_code.trim().is_empty() {
-            cfg.id_code = reg_code;
+            return reg_code;
         }
     }
-    Ok(cfg.sanitized())
+    state
+        .config
+        .lock()
+        .map(|c| c.id_code.clone())
+        .unwrap_or_default()
+}
+
+/// 读取本机已保存的开播身份码（供前端身份码输入框以密码形态回显；
+/// 配置 JSON 与日志仍不含该字段，权威来源为注册表）
+#[tauri::command]
+fn get_id_code(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(resolve_id_code(&state))
 }
 
 /// 保存主播开播身份码（严格遵循原工程规范持久化至 Windows 注册表 HKCU\Software\MonsterOrderWilds\IdCode）
@@ -1216,7 +1224,7 @@ pub fn handle_incoming_live_event(
     }
 }
 
-/// 模拟/开启 B 站长连
+/// 开启 / 断开 B 站直播连接
 #[tauri::command]
 async fn set_bili_connection(
     connected: bool,
@@ -1265,11 +1273,11 @@ async fn set_bili_connection(
         };
 
         if id_code.trim().is_empty() {
-            return Err("未填入开播身份码（id_code），请在长连面板输入当次开播身份码后重试".into());
+            return Err("未填入开播身份码，请在直播连接面板输入当次开播身份码后重试".into());
         }
 
         if !creds.is_valid() {
-            return Err("B站开放平台凭证未配置或不完整（请确保 credentials.dat 存在并填入开播身份码 id_code）".into());
+            return Err("B 站开放平台凭据未配置或不完整（请导入凭据文件并填入开播身份码）".into());
         }
 
         state.bili_service.set_running(true);
@@ -1378,56 +1386,6 @@ async fn set_bili_connection(
 
         Ok(false)
     }
-}
-
-/// 弹幕模拟测试通道（与真实直播间长连统一管道）
-#[tauri::command]
-fn simulate_danmu(
-    danmu: bilibili::DanmuData,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> Result<bilibili::DanmuProcessResult, String> {
-    Ok(handle_incoming_danmu(Some(&app_handle), &state, danmu))
-}
-
-/// 礼物模拟测试通道（B8 连击合并 / B11 付费过滤的手工验证入口）
-#[tauri::command]
-fn simulate_gift(
-    event: tts::GiftEvent,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> Result<(), String> {
-    handle_incoming_gift(Some(&app_handle), &state, event);
-    Ok(())
-}
-
-/// 直播间事件模拟测试通道（B2 SC / 上舰 / 进场的手工验证入口）
-#[tauri::command]
-fn simulate_live_event(
-    event: bilibili::LiveEvent,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> Result<(), String> {
-    handle_incoming_live_event(Some(&app_handle), &state, event);
-    Ok(())
-}
-
-/// 模拟点赞事件（与真实长连同一管道：msg_id 去重 + 奖卡 + 播报）
-#[tauri::command]
-fn simulate_like(
-    event: bilibili::LikeEvent,
-    state: State<'_, AppState>,
-    app_handle: AppHandle,
-) -> Result<Vec<String>, String> {
-    ensure_not_lite(&state, "点赞奖卡模块")?;
-    let mut ev = event;
-    if ev.timestamp <= 0 {
-        ev.timestamp = chrono::Utc::now().timestamp();
-    }
-    if ev.msg_id.is_empty() {
-        ev.msg_id = format!("sim_like_{}", chrono::Utc::now().timestamp_millis());
-    }
-    Ok(handle_incoming_like(Some(&app_handle), &state, &ev))
 }
 
 /// GM: 批量补签（受 Lite 模式控制）
@@ -1930,7 +1888,7 @@ fn hide_window(app_handle: AppHandle, label: String) -> Result<(), String> {
 }
 
 /// 退出清理链路（E3，对齐原工程 Exit 命令：WriteQueue::Flush → BliveManager::Disconnect → PostQuitMessage）：
-/// V2 中队列/配置均为变更即时落盘，此处补做待写悬浮窗位置落盘、停止长连并记录日志，最后退出进程。
+/// V2 中队列/配置均为变更即时落盘，此处补做待写悬浮窗位置落盘、停止直播连接并记录日志，最后退出进程。
 /// 有意差异：不在退出路径阻塞调用 B 站下播接口（end_app API），避免网络等待拖慢退出
 fn shutdown_app(app_handle: &AppHandle, state: &AppState) {
     // 1. 待写悬浮窗位置立即落盘（等价原工程 WriteQueue::Flush 的兜底落盘）
@@ -1943,10 +1901,10 @@ fn shutdown_app(app_handle: &AppHandle, state: &AppState) {
     }
     // 2. 队列强制落盘（等价原工程退出前的 WriteQueue::Flush；覆盖 500ms 节流窗口内未写的变更）
     flush_queue(state, true);
-    // 3. 停止直播长连（等价原工程 BliveManager::Disconnect / Destroy）
+    // 3. 停止直播连接（等价原工程 BliveManager::Disconnect / Destroy）
     if state.bili_service.is_running() {
         state.bili_service.set_running(false);
-        crate::log_info!("[App] 退出：已断开 B 站直播长连");
+        crate::log_info!("[App] 退出：已断开 B 站直播连接");
     }
     crate::log_info!("[App] 退出程序：队列与配置已落盘");
     app_handle.exit(0);
@@ -2192,7 +2150,6 @@ pub fn run() {
             hide_window,
             get_credentials_status,
             import_credentials_file,
-            match_monster_name,
             get_monster_dict,
             save_monster_entry,
             delete_monster_entry,
@@ -2204,12 +2161,9 @@ pub fn run() {
             get_app_config,
             save_app_config,
             save_id_code,
+            get_id_code,
             get_bili_connection_state,
             set_bili_connection,
-            simulate_danmu,
-            simulate_gift,
-            simulate_live_event,
-            simulate_like,
             gm_batch_checkin,
             gm_search_users,
             gm_grant_card,
@@ -3252,6 +3206,17 @@ mod tests {
             cfg.id_code = read_val.clone();
         }
         assert_eq!(state.config.lock().unwrap().id_code, test_val);
+
+        // 回显解析：注册表优先
+        assert_eq!(resolve_id_code(&state), test_val);
+
+        // 注册表为空时回退内存配置
+        let _ = registry::delete_id_code();
+        {
+            let mut cfg = state.config.lock().unwrap();
+            cfg.id_code = "ID_CODE_FALLBACK_CFG".into();
+        }
+        assert_eq!(resolve_id_code(&state), "ID_CODE_FALLBACK_CFG");
 
         // 还原现场
         if orig.is_empty() {

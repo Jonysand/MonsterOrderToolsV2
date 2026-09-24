@@ -454,7 +454,7 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **五态**（`bilibili.rs`）：`Disconnected / Connecting / Connected / Reconnecting / ReconnectFailed` + `DisconnectReason`（`None / NetworkError / HeartbeatTimeout / ServerClose / AuthFailed`），中文文案取自原工程 `ConnectionStateToString / DisconnectReasonToString`。
 - **驱动点**：进入循环即 `Connecting`；`start_app` 网络类失败 → `Reconnecting(NetworkError, N)`；WS 连接成功 → `Connected`；心跳发送失败 → `HeartbeatTimeout`；服务端关闭帧/终止包 → `ServerClose`；接收错误 → `NetworkError`；用户断开 → `Disconnected`。
 - **命令/事件**：`get_bili_connection_state` 返回 `{state, reason, reason_text, attempt, display}`，事件 `connection-state-changed`（替换原 `connection-changed` bool 事件）。
-- **前端**：侧栏状态点四色（绿/琥珀脉冲/红/灰），长连面板显示「正在重连...(第N次)」「重连失败，原因: 鉴权失败」；按钮文案随状态切换（断开长连 / 取消连接 / 开启直播长连）。
+- **前端**：侧栏状态点四色（绿/琥珀脉冲/红/灰），直播连接面板显示「正在重连...(第N次)」「重连失败，原因: 鉴权失败」；按钮文案随状态切换（断开连接 / 取消连接 / 开启直播连接）。
 - **有意差异**：鉴权类失败（HTTP 401/403、错误码 -400/100001、文案含签名/鉴权/权限）收敛为 `ReconnectFailed` 并**停止重试**（原工程 `ReconnectFailed`/`AuthFailed` 从未被置位、无限重试；见 `classify_start_error` 注释）。
 - **验收**：`test_connection_status_five_states_and_reasons`、`test_start_error_classification_stops_retry_on_auth`。
 

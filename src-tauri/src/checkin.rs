@@ -839,7 +839,7 @@ impl CheckinManager {
         let (continuous, cumulative) = Self::calc_streak_and_cumulative(&conn, uid)?;
 
         if continuous >= cumulative {
-            return Err("拦截校验失败：连续打卡天数已达到或超过累计打卡天数，当前没有断签断档，无需补签".into());
+            return Err("当前没有断签断档，连续打卡天数已达到累计打卡天数，无需补签".into());
         }
         Ok(())
     }
@@ -908,7 +908,7 @@ impl CheckinManager {
         let (cur_continuous, cur_cumulative) = Self::calc_streak_and_cumulative(&conn, uid)?;
 
         if cur_continuous >= cur_cumulative {
-            return Err("拦截：连续打卡天数已等于累计打卡天数，无需补签".into());
+            return Err("连续打卡天数已等于累计打卡天数，无需补签".into());
         }
 
         // 3. 开启原子事务
@@ -1188,7 +1188,7 @@ impl CheckinManager {
     /// 对齐原工程 DataBridgeExports::ProfileManager_ExportUsersSummary 与 ProfileManager::GetAllUsersSummary
     pub fn export_users_summary(&self, format: &str) -> Result<String, String> {
         if format != "csv" && format != "json" {
-            return Err("Unsupported format. Use 'csv' or 'json'".into());
+            return Err("不支持的导出格式（请选择 CSV 或 JSON）".into());
         }
 
         let conn = self.conn.lock().unwrap();
@@ -1254,7 +1254,7 @@ impl CheckinManager {
         end: Option<NaiveDate>,
     ) -> Result<String, String> {
         if format != "csv" && format != "json" {
-            return Err("Unsupported format. Use 'csv' or 'json'".into());
+            return Err("不支持的导出格式（请选择 CSV 或 JSON）".into());
         }
 
         let conn = self.conn.lock().unwrap();
@@ -1275,7 +1275,7 @@ impl CheckinManager {
                 .map_err(|e| e.to_string())?;
             uids = rows.flatten().collect();
             if uids.is_empty() {
-                return Err("User not found".into());
+                return Err("未找到该用户".into());
             }
         }
 
@@ -2022,16 +2022,16 @@ mod tests {
         assert!(!filtered.contains("20260910"), "日期范围应生效");
         assert!(filtered.contains("u_e1") && filtered.contains("u_e2"));
 
-        // 无命中用户 → User not found；非法格式 → Unsupported format
+        // 无命中用户 → 未找到该用户；非法格式 → 不支持的导出格式
         assert_eq!(
             mgr.export_records_content("csv", Some("不存在的昵称"), None, None)
                 .unwrap_err(),
-            "User not found"
+            "未找到该用户"
         );
         assert!(mgr
             .export_records_content("xml", None, None, None)
             .unwrap_err()
-            .contains("Unsupported format"));
+            .contains("不支持的导出格式"));
         println!("[PASS] test_export_records_content_formats_and_filters passed");
     }
 

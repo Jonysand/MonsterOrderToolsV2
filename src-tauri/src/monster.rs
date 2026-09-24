@@ -167,7 +167,7 @@ impl MonsterDataManager {
             .map_err(|e| format!("怪物列表内容不是合法 JSON: {}", e))?;
         match value {
             serde_json::Value::Object(map) => Ok(map),
-            _ => Err("怪物列表顶层必须是对象（{怪物名: 配置}）".to_string()),
+            _ => Err("怪物列表文件格式不正确（顶层需为对象）".to_string()),
         }
     }
 

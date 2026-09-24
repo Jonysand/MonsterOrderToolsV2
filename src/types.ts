@@ -210,15 +210,3 @@ export interface GuardReceivedPayload {
   guard_num: number;
   guard_unit: string;
 }
-
-// ---------- D5 运行日志 ----------
-export interface LogEntry {
-  time: string;
-  level: string;
-  message: string;
-}
-
-export interface LogsSnapshot {
-  dir: string;
-  entries: LogEntry[];
-}
