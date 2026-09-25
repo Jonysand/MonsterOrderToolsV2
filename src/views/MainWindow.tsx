@@ -1611,7 +1611,7 @@ export const MainWindow: React.FC = () => {
                   </label>
 
                   <div>
-                    <label className="block text-[11px] text-neutral-400 mb-1">打卡触发词（逗号分隔）</label>
+                    <label className="block text-[11px] text-neutral-400 mb-1">打卡触发词（中英文逗号分隔）</label>
                     <input
                       type="text"
                       value={config.checkin_trigger_words}
@@ -1619,7 +1619,7 @@ export const MainWindow: React.FC = () => {
                       onChange={(e) => setConfig({ ...config, checkin_trigger_words: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     />
-                    <span className="text-[10px] text-neutral-500">默认：打卡,签到（清空则完全停用打卡指令）</span>
+                    <span className="text-[10px] text-neutral-500">默认：打卡,签到（支持中文逗号，清空则完全停用打卡指令）</span>
                   </div>
 
                   <div>

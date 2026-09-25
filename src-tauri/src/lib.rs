@@ -776,6 +776,16 @@ fn schedule_checkin_reply(
     });
 }
 
+/// 解析打卡触发词：按英文/中文逗号分割并去除首尾空白
+/// （对齐原工程 CaptainCheckInModule::SetTriggerWords 的 `,` 与 `，` 双逗号分割）。
+/// 结果为空时打卡功能停用（不得内置兜底词，否则用户无法通过配置关闭打卡）
+fn parse_checkin_trigger_words(raw: &str) -> Vec<String> {
+    raw.split(|c| c == ',' || c == '，')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// 指令类弹幕判定：打卡触发词（含用户自定义）与补签/补签查询指令。
 /// 这类消息是操作指令而非发言内容，不参与发言习惯学习，
 /// 否则会污染关键词与 AI 提示词的「最近发言」（原工程无此过滤，属有意差异）
@@ -813,13 +823,8 @@ pub fn handle_incoming_danmu(
         let checkin_module_enabled = cfg.enable_captain_checkin_ai;
 
         // 触发词提前解析：后续步骤 2.2 判指令、步骤 2.3 判打卡都要用。
-        // 触发词清空后打卡功能即完全停用，不得内置兜底词，否则用户无法通过配置关闭打卡。
-        let checkin_triggers: Vec<String> = cfg
-            .checkin_trigger_words
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // 支持中英文逗号分隔（对齐原工程 SetTriggerWords），清空后打卡功能完全停用
+        let checkin_triggers = parse_checkin_trigger_words(&cfg.checkin_trigger_words);
         let is_checkin_command = checkin_triggers
             .iter()
             .any(|t| msg_trim.eq_ignore_ascii_case(t));
@@ -2510,6 +2515,25 @@ mod tests {
         let yesterday_int = checkin::CheckinManager::date_to_int(d_yesterday);
         assert!(records.contains(&yesterday_int.to_string()));
         println!("[PASS] test_simulate_danmu_retroactive_flow passed");
+    }
+
+    /// 打卡触发词解析：中英文逗号均可分隔（对齐原工程 SetTriggerWords 的
+    /// `,` 与 `，` 双逗号分割），逐词 trim、空词过滤、清空即停用
+    #[test]
+    fn test_parse_checkin_trigger_words_fullwidth_comma() {
+        // 默认配置：英文逗号
+        assert_eq!(parse_checkin_trigger_words("打卡,签到"), vec!["打卡", "签到"]);
+        // 中文逗号：修复前会被当成一个整体触发词导致打卡静默失效
+        assert_eq!(parse_checkin_trigger_words("打卡，签到"), vec!["打卡", "签到"]);
+        // 混合逗号 + 首尾空白 + 空词过滤
+        assert_eq!(
+            parse_checkin_trigger_words(" 打卡 ，签到 , 签到卡，，"),
+            vec!["打卡", "签到", "签到卡"]
+        );
+        // 仅分隔符/空白 → 空（打卡功能停用）
+        assert!(parse_checkin_trigger_words("，, ,").is_empty());
+        assert!(parse_checkin_trigger_words("").is_empty());
+        println!("[PASS] test_parse_checkin_trigger_words_fullwidth_comma passed");
     }
 
     #[test]
