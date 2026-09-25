@@ -1,4 +1,5 @@
-# 发布打包：推送 tag（如 0.1.0 或 v0.1.0）触发 Windows 与 macOS 安装包构建，并附加到 GitHub Release
+# 发布打包：推送 tag（如 0.1.0 或 v0.1.0）触发 Windows 与 macOS 安装包构建，并附加到 GitHub Release。
+# 每平台连产「完整版」与「Lite 纯排队版」两套产物（Lite = Cargo feature `lite` + tauri.conf.lite.json）
 # 与 ci.yml 的分工：ci.yml 管「提交是否健康」，本文件管「版本能否发出去」
 name: Release
 
@@ -18,7 +19,7 @@ env:
 
 jobs:
   bundle-windows:
-    name: 打包 Windows 安装包
+    name: 打包 Windows 安装包（完整版 + Lite）
     runs-on: windows-latest
     steps:
       - name: 检出代码
@@ -41,10 +42,15 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      # npm run tauri build 会先执行 beforeBuildCommand(npm run build) 产出前端，
-      # 再按 tauri.conf.json 的 bundle.targets="all" 生成 msi + nsis
-      - name: 打包安装包
+      # 连产两版（同 job 串行：第二次构建复用依赖缓存，仅重编译本 crate）：
+      # 1) 完整版：beforeBuildCommand(npm run build) 先产前端，再按 bundle.targets="all" 生成 msi + nsis
+      # 2) Lite 纯排队版：Cargo feature `lite` + tauri.conf.lite.json（产物名 *-Lite，与完整版同目录共存）
+      # 上传路径为通配，两版产物自动全部收录
+      - name: 打包完整版安装包
         run: npm run tauri build
+
+      - name: 打包 Lite 版安装包
+        run: npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json
 
       - name: 上传安装包为 Actions 产物
         uses: actions/upload-artifact@v7
@@ -72,7 +78,7 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.exe
 
   bundle-macos:
-    name: 打包 macOS 安装包
+    name: 打包 macOS 安装包（完整版 + Lite）
     runs-on: macos-latest
     steps:
       - name: 检出代码
@@ -97,8 +103,12 @@ jobs:
 
       # macos-latest 为 Apple Silicon，bundle.targets="all" 在此产出 .app + aarch64 .dmg。
       # 注：产物为 adhoc 签名（无 TeamIdentifier，未公证），用户首次打开需右键「打开」放行。
-      - name: 打包安装包
+      # 与 Windows job 同口径连产完整版与 Lite 版（tauri.conf.lite.json），dmg 通配自动收录两版
+      - name: 打包完整版安装包
         run: npm run tauri build
+
+      - name: 打包 Lite 版安装包
+        run: npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json
 
       - name: 上传安装包为 Actions 产物
         uses: actions/upload-artifact@v7

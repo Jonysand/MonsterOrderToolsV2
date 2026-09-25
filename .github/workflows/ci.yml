@@ -57,6 +57,12 @@ jobs:
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # Lite 形态编译期守卫防回归：feature `lite` 下单测须独立通过（含
+      # test_lite_build_disables_non_queue_pipelines）；仅在 Windows job 跑，
+      # macOS 省略——lite 仅切换 IS_LITE 编译期常量，与平台专有路径无交互
+      - name: Rust 单元测试（Lite 形态）
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features lite
+
   verify-macos:
     name: 构建与单元测试 (macOS)
     runs-on: macos-latest
