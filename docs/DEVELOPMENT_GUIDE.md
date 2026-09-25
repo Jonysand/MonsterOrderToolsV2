@@ -124,6 +124,7 @@ cargo test --manifest-path src-tauri/Cargo.toml   # Rust 单测（亦可用 npm 
 npm run verify                     # 提交门禁：build + 单测 + 编码核查
 npm run tauri build                # 生产打包（内部先跑 beforeBuildCommand 的 npm run build）
 ./build-macos.sh                   # 上述生产打包的一键封装：自动补 cargo PATH、校验依赖并打印产物路径
+build-windows.bat                  # Windows 端同口径一键封装（双击或 cmd 执行，产出裸 exe + NSIS + MSI；文件须保持 GBK/ANSI 编码与 CRLF 换行，勿另存为 UTF-8）
 ```
 
 判定成败时**不要**把命令接到 `| tail` 再看退出码 —— 管道退出码取自最右侧命令，cargo 根本不存在时也会返回 0，会造成「构建通过」的假象。应重定向日志后单独取退出码：
