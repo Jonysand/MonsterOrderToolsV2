@@ -356,7 +356,9 @@ impl CheckinManager {
     ) -> Result<UserProfile, String> {
         let conn = self.conn.lock().unwrap();
         let date_int = Self::date_to_int(date);
-        let now = Utc::now().timestamp();
+        // created_at/updated_at 统一用毫秒纪元，对齐原工程 GetCurrentTimestamp
+        // （ProfileManager.cpp:21-24，旧库历史数据均为 13 位毫秒，秒级会使单位混用）
+        let now = Utc::now().timestamp_millis();
 
         // 尝试插入打卡明细：同日重复打卡时按时间戳更新（对齐原工程
         // ProfileManager.cpp:31 的 ON CONFLICT ... WHERE created_at != excluded.created_at）
@@ -445,7 +447,8 @@ impl CheckinManager {
         profile: &LearningProfile,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
-        let now = Utc::now().timestamp();
+        // updated_at 毫秒纪元，对齐原工程 SaveProfileToDb 的 GetCurrentTimestamp
+        let now = Utc::now().timestamp_millis();
         let keywords_json = serde_json::to_string(&profile.keywords).map_err(|e| e.to_string())?;
         let history_json =
             serde_json::to_string(&profile.danmu_history).map_err(|e| e.to_string())?;
@@ -936,7 +939,8 @@ impl CheckinManager {
         .map_err(|e| e.to_string())?;
 
         // 6. 插入目标打卡记录（前置校验已确认该日期缺失，故用普通 INSERT 而非 OR REPLACE）
-        let now = Utc::now().timestamp();
+        // created_at 毫秒纪元，对齐原工程 ExecuteRetroactiveCheckin 的 GetCurrentTimestamp
+        let now = Utc::now().timestamp_millis();
         tx.execute(
             "INSERT INTO checkin_records (uid, username, checkin_date, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![uid, username, target_date_int, now],
@@ -1088,7 +1092,8 @@ impl CheckinManager {
         let mut conn = self.conn.lock().unwrap();
         let today = Local::now().date_naive();
         let today_int = Self::date_to_int(today);
-        let now = Utc::now().timestamp();
+        // created_at 毫秒纪元，对齐原工程 BatchCheckin 的 GetCurrentTimestamp
+        let now = Utc::now().timestamp_millis();
 
         let mut stmt = conn
             .prepare("SELECT uid, username, last_checkin_date, cumulative_days FROM user_profiles WHERE cumulative_days > 0")
@@ -2172,5 +2177,404 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 0);
         println!("[PASS] test_execute_retroactive_rejects_existing_date_without_charging_card passed");
+    }
+
+    /// created_at/updated_at 单位回归：4 条写入链路（常规打卡 / 学习档案 / 补签 / 批量补签）
+    /// 全部必须为毫秒纪元，对齐原工程 GetCurrentTimestamp 与旧库 13 位历史数据
+    #[test]
+    fn test_created_at_uses_millisecond_epoch() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        // 毫秒纪元下界（2001-09）：秒级 now（~1.7e9）远小于此，可稳定区分两种单位
+        let ms_floor: i64 = 1_000_000_000_000;
+        let today = NaiveDate::from_ymd_opt(2026, 9, 19).unwrap();
+
+        // 1. 常规打卡：user_profiles 的 created_at/updated_at 与 checkin_records.created_at 均为毫秒
+        let p = mgr.record_checkin("u_ms", "水友", today).unwrap();
+        assert!(p.created_at >= ms_floor, "profile.created_at 应为毫秒: {}", p.created_at);
+        assert!(p.updated_at >= ms_floor, "profile.updated_at 应为毫秒: {}", p.updated_at);
+        let rec_created: i64 = {
+            let conn = mgr.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT created_at FROM checkin_records WHERE uid = 'u_ms'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(rec_created >= ms_floor, "明细 created_at 应为毫秒: {}", rec_created);
+
+        // 2. 学习档案写入：user_profiles.created_at/updated_at 为毫秒
+        mgr.save_learning("u_ms2", "水友2", &LearningProfile::default()).unwrap();
+        let p2 = mgr.get_profile("u_ms2").unwrap();
+        assert!(
+            p2.created_at >= ms_floor && p2.updated_at >= ms_floor,
+            "学习链路 created_at/updated_at 应为毫秒: {}/{}",
+            p2.created_at,
+            p2.updated_at
+        );
+
+        // 3. 补签插入：checkin_records.created_at 为毫秒
+        //    先制造断档（打 today-3 与 today，缺 today-1/today-2），否则连续=累计会被拦截
+        let _ = mgr.record_checkin("u_ms", "水友", today - Duration::days(3)).unwrap();
+        let _ = mgr.grant_card("u_ms", 1).unwrap();
+        let _ = mgr
+            .execute_retroactive_checkin("u_ms", "水友", today - Duration::days(1))
+            .unwrap();
+        let retro_created: i64 = {
+            let conn = mgr.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT created_at FROM checkin_records WHERE uid = 'u_ms' AND checkin_date = ?1",
+                params![CheckinManager::date_to_int(today - Duration::days(1))],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(retro_created >= ms_floor, "补签 created_at 应为毫秒: {}", retro_created);
+
+        // 4. 批量补签插入：checkin_records.created_at 为毫秒
+        let _ = mgr.record_checkin("u_ms3", "水友3", today - Duration::days(3)).unwrap();
+        mgr.batch_checkin().unwrap();
+        let batch_created: i64 = {
+            let conn = mgr.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT MIN(created_at) FROM checkin_records WHERE uid = 'u_ms3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(batch_created >= ms_floor, "批量补签 created_at 应为毫秒: {}", batch_created);
+
+        println!("[PASS] test_created_at_uses_millisecond_epoch passed");
+    }
+
+    // ===== publish_v2 原包体真实库兼容测试 =====
+    // 环境变量 MH_PUBLISH_DB 指向原工程发布环境（如 D:\VisualStudioProjects\publish_v2）
+    // captain_profiles.db 的「副本」；未设置时跳过，全程不触碰原件。
+
+    /// 将真实库复制为独立临时副本（各测试互不干扰）
+    fn publish_db_copy(tag: &str) -> Option<PathBuf> {
+        let src = std::env::var_os("MH_PUBLISH_DB").map(PathBuf::from)?;
+        let dst = std::env::temp_dir().join(format!("mh_publish_{}_{}.db", tag, std::process::id()));
+        let _ = std::fs::remove_file(&dst);
+        std::fs::copy(&src, &dst).expect("复制真实库副本失败");
+        Some(dst)
+    }
+
+    /// 统计五张表的行数（打开前 / 打开后必须一致，证明迁移与读取不增删数据行）
+    fn count_all_rows(conn: &Connection) -> [i64; 5] {
+        let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        [
+            q("SELECT COUNT(*) FROM user_profiles"),
+            q("SELECT COUNT(*) FROM checkin_records"),
+            q("SELECT COUNT(*) FROM retroactive_cards"),
+            q("SELECT COUNT(*) FROM user_like_streaks"),
+            q("SELECT COUNT(*) FROM user_daily_likes"),
+        ]
+    }
+
+    /// 结构迁移：真实 pre-v40 库（仅有 monthly_first_claimed）打开后追加 weekly_first_claimed、
+    /// 保留原月度列、其余表结构逐字不变，且重复打开幂等
+    #[test]
+    fn test_publish_db_schema_migration_on_real_legacy() {
+        let Some(dst) = publish_db_copy("schema") else {
+            println!("[SKIP] test_publish_db_schema_migration_on_real_legacy: 未设置 MH_PUBLISH_DB");
+            return;
+        };
+        let before = {
+            let conn = Connection::open(&dst).unwrap();
+            schema_snapshot(&conn)
+        };
+
+        {
+            let mgr = CheckinManager::new(Some(&dst)).unwrap();
+            let conn = mgr.conn.lock().unwrap();
+            assert!(
+                CheckinManager::table_has_column(&conn, "retroactive_cards", "weekly_first_claimed")
+                    .unwrap(),
+                "真实库应被追加 weekly_first_claimed"
+            );
+            assert!(
+                CheckinManager::table_has_column(&conn, "retroactive_cards", "monthly_first_claimed")
+                    .unwrap(),
+                "原月度列必须保留，不得删除"
+            );
+        }
+
+        // 重复打开幂等：除 retroactive_cards（仅追加列）外，其余表结构逐字不变
+        {
+            let _ = CheckinManager::new(Some(&dst)).unwrap();
+            let conn = Connection::open(&dst).unwrap();
+            let after = schema_snapshot(&conn);
+            assert_eq!(before.len(), after.len(), "迁移不得增删表");
+            for (b, a) in before.iter().zip(after.iter()) {
+                if b.0 == "retroactive_cards" {
+                    continue;
+                }
+                assert_eq!(b, a, "表 {} 结构不得变更", b.0);
+            }
+        }
+        let _ = std::fs::remove_file(&dst);
+        println!("[PASS] test_publish_db_schema_migration_on_real_legacy passed");
+    }
+
+    /// 数据行保真：打开 + 迁移前后五张表行数一致；奖卡抽样读取与 SQL 直查一致
+    #[test]
+    fn test_publish_db_row_counts_unchanged_after_open() {
+        let Some(dst) = publish_db_copy("rows") else {
+            println!("[SKIP] test_publish_db_row_counts_unchanged_after_open: 未设置 MH_PUBLISH_DB");
+            return;
+        };
+        let before = {
+            let conn = Connection::open(&dst).unwrap();
+            count_all_rows(&conn)
+        };
+        assert!(before[0] > 0 && before[1] > 0, "真实库应有数据: {:?}", before);
+
+        {
+            let mgr = CheckinManager::new(Some(&dst)).unwrap();
+            // 抽样 5 个持卡用户：V2 读取的 card_count 必须与 SQL 直查一致
+            let conn = Connection::open(&dst).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT uid, card_count FROM retroactive_cards WHERE card_count > 0 LIMIT 5")
+                .unwrap();
+            let samples: Vec<(String, i32)> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            drop(stmt);
+            drop(conn);
+            for (uid, sql_count) in samples {
+                assert_eq!(mgr.get_cards(&uid).card_count, sql_count, "uid={} 卡数读取不一致", uid);
+            }
+        }
+
+        let after = {
+            let conn = Connection::open(&dst).unwrap();
+            count_all_rows(&conn)
+        };
+        assert_eq!(before, after, "打开 + 迁移不得增删任何数据行");
+        let _ = std::fs::remove_file(&dst);
+        println!("[PASS] test_publish_db_row_counts_unchanged_after_open passed");
+    }
+
+    /// 连续天数重算：对真实用户的明细日期用独立实现倒推，与 calculate_continuous_days_from_records 对照；
+    /// 同时观察原工程「一键黑幕遗留形态」（profile 累计 < 明细实数）是否存在于该库
+    #[test]
+    fn test_publish_db_continuous_recalc_matches_independent_walk() {
+        let Some(dst) = publish_db_copy("streak") else {
+            println!("[SKIP] test_publish_db_continuous_recalc_matches_independent_walk: 未设置 MH_PUBLISH_DB");
+            return;
+        };
+        let mgr = CheckinManager::new(Some(&dst)).unwrap();
+        let conn = mgr.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT uid FROM checkin_records LIMIT 30",
+            )
+            .unwrap();
+        let uids: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().flatten().collect();
+        drop(stmt);
+        assert!(!uids.is_empty(), "真实库应有打卡明细");
+        drop(conn); // 释放锁：循环内短作用域重新取锁 + 调用 mgr 方法
+
+        let mut dirty_forms = 0;
+        for uid in &uids {
+            // 短作用域取数（锁内只做查询，随后释放，避免与下方 mgr 方法重复加锁死锁）
+            let (dates, stored, real): (Vec<NaiveDate>, i32, i32) = {
+                let conn = mgr.conn.lock().unwrap();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT checkin_date FROM checkin_records WHERE uid = ?1 ORDER BY checkin_date DESC",
+                    )
+                    .unwrap();
+                let dates: Vec<NaiveDate> = stmt
+                    .query_map(params![uid], |r| r.get::<_, i32>(0))
+                    .unwrap()
+                    .flatten()
+                    .filter_map(CheckinManager::int_to_date)
+                    .collect();
+                drop(stmt);
+                let stored: i32 = conn
+                    .query_row(
+                        "SELECT cumulative_days FROM user_profiles WHERE uid = ?1",
+                        params![uid],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let real: i32 = conn
+                    .query_row(
+                        "SELECT COUNT(DISTINCT checkin_date) FROM checkin_records WHERE uid = ?1",
+                        params![uid],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                (dates, stored, real)
+            };
+
+            // 独立实现：日期降序，逐日比较 +1 天
+            let mut expected = 1;
+            for i in 1..dates.len() {
+                if dates[i] + Duration::days(1) == dates[i - 1] {
+                    expected += 1;
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(
+                mgr.calculate_continuous_days_from_records(uid),
+                expected,
+                "uid={} 连续天数重算与独立倒推不一致",
+                uid
+            );
+
+            // 脏形态观察：profile 存的累计 < 明细实数（原工程黑幕只改连续不重算累计的遗留）
+            if real > stored {
+                dirty_forms += 1;
+            }
+        }
+        println!(
+            "[INFO] 独立倒推对照通过；原工程黑幕遗留形态（明细实数 > profile 累计）用户数: {}",
+            dirty_forms
+        );
+        drop(mgr); // 先释放 SQLite 连接，否则 Windows 上文件被占用导致 remove_file 静默失败
+        let _ = std::fs::remove_file(&dst);
+        println!("[PASS] test_publish_db_continuous_recalc_matches_independent_walk passed");
+    }
+
+    /// 补签 + 周卡全链路（真实用户，副本上执行）：
+    /// 断签真实用户凭卡补签成功、扣卡、明细 +1；pre-v40 库迁移后周首破 30 正常发卡
+    #[test]
+    fn test_publish_db_retro_flow_and_weekly_card_on_real_user() {
+        let Some(dst) = publish_db_copy("retro") else {
+            println!("[SKIP] test_publish_db_retro_flow_and_weekly_card_on_real_user: 未设置 MH_PUBLISH_DB");
+            return;
+        };
+        let mgr = CheckinManager::new(Some(&dst)).unwrap();
+
+        // 用生产链路判定入口（实时重算连续/累计）挑选真正可补签的真实用户：
+        // 连续 >= 累计（满勤或黑幕拉平）会被拦截，跳过；找第一个可补签者
+        let candidates: Vec<(String, String)> = {
+            let conn = mgr.conn.lock().unwrap();
+            let rows: Vec<(String, String)> = conn
+                .prepare("SELECT uid, username FROM user_profiles WHERE cumulative_days > 0")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            rows
+        };
+        let (uid, username) = candidates
+            .iter()
+            .find(|(uid, _)| mgr.check_retroactive_validity(uid).is_ok())
+            .map(|(uid, name)| (uid.clone(), name.clone()))
+            .expect("真实库应存在可补签的断签用户");
+
+        let records_before: i64 = {
+            let conn = mgr.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM checkin_records WHERE uid = ?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(mgr.grant_card(&uid, 2).unwrap(), 2);
+        let today = Local::now().date_naive();
+        let outcome = mgr.retro_command_outcome(&uid, &username, today);
+        assert!(outcome.success, "断签真实用户补签应成功: {}", outcome.reply);
+        assert!(outcome.reply.contains("已成功补签"), "{}", outcome.reply);
+        assert_eq!(mgr.get_cards(&uid).card_count, 1, "补签一次应扣 1 张卡");
+
+        let records_after: i64 = {
+            let conn = mgr.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM checkin_records WHERE uid = ?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(records_after, records_before + 1, "补签应恰好新增一条明细");
+
+        // pre-v40 库迁移后 weekly_first_claimed 默认 0 → 本周首次当日达 30 必发周卡
+        let rewards = mgr.add_likes(&uid, 30, today).expect("add_likes 不得报错");
+        assert!(rewards.weekly_reward, "迁移后周首破标记为 0，当日 30 应发卡");
+        assert_eq!(mgr.get_cards(&uid).card_count, 2);
+        drop(mgr); // 先释放 SQLite 连接，否则 Windows 上文件被占用导致 remove_file 静默失败
+        let _ = std::fs::remove_file(&dst);
+        println!("[PASS] test_publish_db_retro_flow_and_weekly_card_on_real_user passed");
+    }
+
+    /// 一键黑幕统计口径 + 导出格式（对照 publish_v2 真实导出样例）：
+    /// patched + skipped == 总用户数、插入数 == 明细前后差、补后连续 == 黑幕前档案累计（对齐原工程黑幕语义）、
+    /// 导出 CSV 带 BOM 且表头与原样例逐字一致
+    #[test]
+    fn test_publish_db_batch_checkin_stats_and_export_header() {
+        let Some(dst) = publish_db_copy("batch") else {
+            println!("[SKIP] test_publish_db_batch_checkin_stats_and_export_header: 未设置 MH_PUBLISH_DB");
+            return;
+        };
+        let mgr = CheckinManager::new(Some(&dst)).unwrap();
+
+        let (before, stored_cums): (i64, Vec<(String, i32)>) = {
+            let conn = mgr.conn.lock().unwrap();
+            let cums: Vec<(String, i32)> = conn
+                .prepare("SELECT uid, cumulative_days FROM user_profiles WHERE cumulative_days > 0")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            let total: i64 = conn
+                .query_row("SELECT COUNT(*) FROM checkin_records", [], |r| r.get(0))
+                .unwrap();
+            (total, cums)
+        };
+
+        let res = mgr.batch_checkin().unwrap();
+        assert_eq!(res.total_users, stored_cums.len() as i32, "候选集应为 cumulative>0 用户");
+        assert_eq!(
+            res.patched_users + res.skipped_users,
+            res.total_users,
+            "patched 与 skipped 必须互斥且覆盖全部候选"
+        );
+
+        let after: i64 = {
+            let conn = mgr.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM checkin_records", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(res.total_inserted as i64, after - before, "插入数应等于明细增量");
+
+        // 黑幕语义（对齐原工程 BatchCheckin）：连续天数置为黑幕前档案累计值（可能小于明细实数，
+        // 由后续打卡的实时重算自愈）
+        let (uid, stored_cum) = stored_cums.first().unwrap().clone();
+        let profile = mgr.get_profile(&uid).unwrap();
+        assert_eq!(
+            profile.continuous_days, stored_cum,
+            "黑幕后连续天数应等于黑幕前档案累计（原工程语义）"
+        );
+
+        // 导出格式与 publish_v2\checkin_records_20260527.csv 真实样例对照（BOM + 表头逐字一致）
+        let csv = mgr.export_records_content("csv", None, None, None).unwrap();
+        assert!(csv.starts_with('\u{feff}'), "明细导出应带 UTF-8 BOM");
+        assert!(
+            csv.trim_start_matches('\u{feff}').starts_with("uid,username,checkin_date,created_at\n"),
+            "明细导出表头必须与原工程样例一致"
+        );
+        let summary = mgr.export_users_summary("csv").unwrap();
+        assert!(summary.starts_with('\u{feff}'), "汇总导出应带 UTF-8 BOM");
+        assert_eq!(
+            summary.trim_start_matches('\u{feff}').lines().count() - 1,
+            res.total_users as usize,
+            "汇总导出行数应等于候选用户数"
+        );
+        drop(mgr); // 先释放 SQLite 连接，否则 Windows 上文件被占用导致 remove_file 静默失败
+        let _ = std::fs::remove_file(&dst);
+        println!("[PASS] test_publish_db_batch_checkin_stats_and_export_header passed");
     }
 }
