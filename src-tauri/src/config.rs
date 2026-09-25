@@ -56,9 +56,6 @@ pub struct AppConfig {
     pub checkin_trigger_words: String,
     #[serde(skip_serializing)]
     pub deepseek_api_key: String,
-
-    // 6. 核心架构 Lite 模式
-    pub is_lite_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -101,8 +98,6 @@ impl Default for AppConfig {
             enable_captain_checkin_ai: true,
             checkin_trigger_words: "打卡,签到".into(),
             deepseek_api_key: String::new(),
-
-            is_lite_mode: false,
         }
     }
 }
@@ -381,19 +376,16 @@ mod tests {
         assert_eq!(cfg.top_pos_x, 0.0);
         assert_eq!(cfg.top_pos_y, 0.0);
         assert_eq!(cfg.default_marquee_text, "");
-        assert_eq!(cfg.is_lite_mode, false);
 
         // id_code 不再经 JSON 往返（仅注册表持久化），此处只验证常规字段
         cfg.default_marquee_text = "自定义跑马灯通告".into();
         cfg.opacity = 80;
-        cfg.is_lite_mode = true;
 
         assert!(cfg.save(Some(&path)).is_ok());
 
         let loaded = AppConfig::load(Some(&path));
         assert_eq!(loaded.default_marquee_text, "自定义跑马灯通告");
         assert_eq!(loaded.opacity, 80);
-        assert_eq!(loaded.is_lite_mode, true);
 
         // sanitized()：凭据清空、常规字段保持
         let s = cfg.sanitized();
@@ -547,7 +539,6 @@ mod tests {
         assert_eq!(cfg.top_pos_x, def.top_pos_x);
         assert_eq!(cfg.default_marquee_text, def.default_marquee_text);
         assert_eq!(cfg.checkin_trigger_words, def.checkin_trigger_words);
-        assert_eq!(cfg.is_lite_mode, def.is_lite_mode);
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);

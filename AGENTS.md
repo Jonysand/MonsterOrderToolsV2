@@ -25,10 +25,16 @@
 - **单元测试在代码修改后立即运行验证**（`cargo test`）
 - 测试输出使用 `[PASS]` 标记
 
-## ONLY_ORDER_MONSTER 功能询问与设计规则
-- **新增任何功能时，必须明确考虑并询问用户：此功能是否需要在 `ONLY_ORDER_MONSTER=1`（Lite 模式）下支持**
-- 默认为不支持，即非排队功能代码默认受 `is_lite_mode` 控制
-- Lite 模式下仅保留核心点怪排队队列和悬浮窗，停用 TTS、打卡和 AI 模块
+## Lite 形态（ONLY_ORDER_MONSTER）构建与设计规则
+- **Lite 形态为 build 期定型**（2026-09-25 起）：完整版与 Lite 版分开构建产物，运行期不可切换、无运行时开关
+  - 后端：Cargo feature `lite`（`src-tauri/Cargo.toml`），代码内统一用编译期常量 `IS_LITE = cfg!(feature = "lite")` 守卫（对应原工程 C++ 侧 `#if !ONLY_ORDER_MONSTER` 编译期宏）
+  - 前端：vite `--mode lite`（`npm run build:lite` / `dev:lite`）注入编译期常量 `__IS_LITE__`
+  - 产物命名：`tauri.conf.lite.json` 覆盖 productName 为 `MonsterOrderWilds-Ascendance-Lite`
+  - 打包：`build-windows.bat` / `build-macos.sh` 一键连产双版本；Lite 调试用 `npm run tauri dev -- --features lite --config src-tauri/tauri.conf.lite.json`
+- **新增任何功能时，必须明确考虑并询问用户：此功能是否需要在 Lite 版下支持**
+- 默认为不支持：新增非排队功能必须在命令入口调用 `ensure_not_lite` 守卫（Lite 构建下统一拒绝）；
+  事件管道类在 `handle_incoming_*` 首部 `if IS_LITE { return }`
+- Lite 版仅保留核心点怪排队队列和悬浮窗，停用 TTS、打卡和 AI 模块
 
 ## 文件编码规则
 - **所有源代码文件统一使用 UTF-8 with BOM 编码**

@@ -22,9 +22,12 @@
    - **桌面置顶透明悬浮窗 (`overlay`)**：无边框半透明背景（透明度仅作用于背景，文字保持不透明），支持任意拖拽移动（`data-tauri-drag-region`）、`Alt+,` 全局热键一键锁定穿透、位置记忆，主播点击条目上的「完成」按钮保序出队。
 3. **OBS 推流兼容**：
    - 桌面点怪悬浮窗为标准置顶透明窗口，在 OBS 中使用【窗口捕获】直接捕获即可推流，无需额外本地服务或浏览器源。
-4. **业务保序算法与 Lite 模式 (ONLY_ORDER_MONSTER)**：
+4. **业务保序算法与 Lite 纯排队版 (ONLY_ORDER_MONSTER)**：
    - 保留核心排队优势：条目完成删除后，队列剩余元素相对顺序保持严格不变。
-   - 运行时开关一键切换纯排队 Lite 模式，彻底停用打卡、TTS、点赞奖卡、GM 与 AI 等非排队模块（后端统一守卫 `ensure_not_lite` + 前端置灰降级）。
+   - **编译期双形态**：完整版与 Lite 版分别构建、运行期不可切换——Lite 版彻底停用打卡、TTS、
+     点赞奖卡、GM 与 AI 等非排队模块（后端 Cargo feature `lite` + `IS_LITE` 编译期守卫
+     `ensure_not_lite`，前端 `__IS_LITE__` 编译期常量置灰降级），对齐原工程 C++ 编译期宏。
+   - 一键连产双版本：`build-windows.bat` / `build-macos.sh`（Lite 版产物名 `*-Lite`）。
    - 逐功能覆盖矩阵见 [docs/LITE_COVERAGE_MATRIX.md](docs/LITE_COVERAGE_MATRIX.md)。
 5. **首次使用：导入凭据文件**：
    - 出于安全考虑，安装包**不随包分发** B 站开放平台凭据 `credentials.dat`。

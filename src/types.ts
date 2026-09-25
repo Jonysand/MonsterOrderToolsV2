@@ -74,8 +74,6 @@ export interface AppConfig {
   enable_captain_checkin_ai: boolean;
   checkin_trigger_words: string;
   deepseek_api_key: string;
-
-  is_lite_mode: boolean;
 }
 
 export interface BatchCheckinResult {

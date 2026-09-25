@@ -6,8 +6,14 @@ import process from "node:process";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
-export default defineConfig(() => ({
+export default defineConfig(({ mode }) => ({
   plugins: [react(), tailwindcss()],
+
+  // 编译期形态注入：`vite --mode lite`（npm run dev:lite / build:lite）产出 Lite 纯排队版前端，
+  // 其余模式为完整版。与后端 Cargo feature `lite` 一一对应，运行期不可切换。
+  define: {
+    __IS_LITE__: JSON.stringify(mode === "lite"),
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

@@ -14,6 +14,12 @@ edition = "2021"
 name = "mhdanmutoolsv2_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# Lite 纯排队版编译期开关（对应原工程 ONLY_ORDER_MONSTER 编译期宏）：
+# 默认不启用 = 完整版；`cargo build --features lite` / `tauri build --features lite` 产出 Lite 版。
+# Lite 下停用 TTS、舰长打卡、GM 与 AI 模块（lib.rs IS_LITE 常量统一守卫），运行期不可切换。
+[features]
+lite = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -14,7 +14,7 @@
 │   │  MainWindow (控制台)    │  │ OverlayWindow (悬浮窗)  │                   │
 │   │  - 直播间长连配置       │  │ - 半透明置顶毛玻璃      │                   │
 │   │  - 完整点单管理         │  │ - 自由拖拽 (drag region)│                   │
-│   │  - Lite 模式切换开关    │  │ - 保序删除              │                   │
+│   │  - Lite 构建置灰指示    │  │ - 保序删除              │                   │
 │   └───────────┬─────────────┘  └───────────┬─────────────┘                   │
 │               │                            │                                │
 │               └────────────────────────────┘                                │
@@ -28,18 +28,18 @@
 │   ┌────────────────────────────────────────┴────────────────────────────┐   │
 │   │                     Command Handler (路由与指令分发)                │   │
 │   │  - get_queue / add_order / dequeue_by_user_id                       │   │
-│   │  - get_lite_mode / set_lite_mode / clear_queue                      │   │
+│   │  - clear_queue（Lite 守卫与状态见下方「Lite 版」章节）              │   │
 │   └────────────────────────────────────────┬────────────────────────────┘   │
 │                                            │                                │
 │   ┌────────────────────────────────────────┴────────────────────────────┐   │
 │   │                  AppState (全局线程安全业务状态管理器)              │   │
 │   │  - queue: Mutex<Vec<QueueItem>>                                     │   │
-│   │  - is_lite_mode: Mutex<bool>                                        │   │
+│   │  - IS_LITE: 编译期形态常量（Cargo feature `lite`，运行期不可切换）  │   │
 │   └───────────────────┬───────────────────────────────────┬─────────────┘   │
 │                       │                                   │                 │
 │         ┌─────────────┴─────────────┐       ┌─────────────┴─────────────┐   │
-│         │   点怪排队内核 (保序算法)   │       │   Lite 模式冻结管理器     │   │
-│         │   - 提权置前逻辑          │       │   - 冻结 TTS / AI / 打卡  │   │
+│         │   点怪排队内核 (保序算法)   │       │   Lite 版冻结（编译期）   │   │
+│         │   - 提权置前逻辑          │       │   - 守卫 TTS / AI / 打卡  │   │
 │         │   - 保序精确移除          │       │   - 仅保留核心点怪排队    │   │
 │         └───────────────────────────┘       └───────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -64,7 +64,7 @@
 * `add_order(user_id, user_name, monster_name, is_priority)`: 新增点单或对已在队用户提权。
 * `dequeue_by_user_id(user_id)`: 按用户唯一 ID 精确删除条目，**严格保序**。
 * `clear_queue()`: 清空队列。
-* `get_lite_mode()` / `set_lite_mode(enabled)`: 查询与设置 Lite 模式状态。
+* Lite 形态自 2026-09-25 起**无运行时命令**：完整版 / Lite 版由 build 期决定（Cargo feature `lite` + vite `--mode lite`），前端 `isLite` 为编译期常量 `__IS_LITE__`。
 * `get_bili_connection_state()`: 返回长连五态快照 `{state, reason, reason_text, attempt, display}`（D7）。
 * `get_id_code()` / `save_id_code(id_code)`: 开播身份码读取（注册表优先，供前端输入框以密码形态回显）与保存（仅注册表，不落 JSON）。
 * `set_overlay_locked(locked)` / `get_overlay_locked()`: 悬浮窗鼠标穿透 + 置顶（D2，运行时状态不持久化）。
@@ -105,11 +105,12 @@
 * 新增元素遵循：优先元素插入在最后一个优先元素之后、首个普通元素之前；普通元素直接追加在末尾；
 * 核心单元测试：`test_dequeue_by_user_id_preserves_order` 确保无论删除首项、中项还是尾项，剩余条目的前后相对位置均恒定不变。
 
-### 2. Lite 模式 (ONLY_ORDER_MONSTER=1)
-* **顶层开关**：系统维护全局 `is_lite_mode` 标识（运行时开关，替代原工程编译期宏 + C# 运行时判断）。
-* **前端响应**：当切换为 Lite 模式时，界面上的“舰长周打卡”、“TTS 语音播报”等卡片自动进入冻结/禁用状态，页面标题旁显示琥珀色“Lite 纯排队模式已启用”徽章（注：原工程 Lite 下仅隐藏对应 Tab、不修改窗口标题；V2 以页内徽章指示，不调用 `setTitle`）。
-* **后端响应（E1 统一守卫）**：非排队功能的命令入口第一行调用 `ensure_not_lite(&state, "模块名")?`（Lite 下返回 `Lite模式下XX已停用`）；
-  事件管道类（`handle_incoming_danmu` / `_like` / `_gift` / `_live_event`）在函数首部判定 `is_lite_mode` 直接 return。
+### 2. Lite 版 (ONLY_ORDER_MONSTER)
+* **形态判定（2026-09-25 起为编译期）**：全局常量 `IS_LITE = cfg!(feature = "lite")`（完整还原原工程 C++ 编译期宏 `ONLY_ORDER_MONSTER` 的 build 期排除语义；早期 V2 曾用运行时开关 `is_lite_mode`，已移除）。
+  Lite 版由 `tauri build --features lite --config src-tauri/tauri.conf.lite.json` 构建，productName 为 `MonsterOrderWilds-Ascendance-Lite`。
+* **前端响应**：Lite 构建下界面上的“舰长周打卡”、“TTS 语音播报”等卡片自动进入冻结/禁用状态，页面标题旁显示琥珀色“Lite 纯排队模式已启用”徽章（注：原工程 Lite 下仅隐藏对应 Tab、不修改窗口标题；V2 以页内徽章指示，不调用 `setTitle`）。
+* **后端响应（E1 统一守卫）**：非排队功能的命令入口第一行调用 `ensure_not_lite(&state, "模块名")?`（Lite 构建下返回 `Lite模式下XX已停用`）；
+  事件管道类（`handle_incoming_danmu` / `_like` / `_gift` / `_live_event`）在函数首部 `if IS_LITE { return }`（release 下整段死代码被消除）。
   Lite 下仅保留：点怪排队、悬浮窗、B 站长连、身份码、配置、日志落盘。
 * **逐功能覆盖矩阵**：见 `docs/LITE_COVERAGE_MATRIX.md`（含新增功能必须显式声明是否支持 Lite 的规则）。
 

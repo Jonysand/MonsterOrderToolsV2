@@ -307,72 +307,91 @@ export const OverlayWindow: React.FC = () => {
       pushMarquee(`${user_name} 点怪 ${monster_name} 未生效（已在禁点名单）`);
     });
 
+    // D4 停用模块气泡（打卡 / 补签 / 点赞）：Lite 构建下无此功能，监听整体剔除（noop 占位保持清理逻辑统一）
+    const liteNoop = Promise.resolve(() => {});
+
     // D4 舰长打卡回复气泡（原工程 CheckinTTSPlay 回调）
-    const unlistenCheckin = listen<CheckinReplyPayload>("checkin-reply", (event) => {
-      const { user_name, reply, is_ai } = event.payload;
-      pushBubble({
-        title: is_ai ? "舰长打卡 · AI 回复" : "舰长打卡",
-        username: user_name,
-        content: reply,
-        tone: "checkin",
-      });
-    });
+    const unlistenCheckin = __IS_LITE__
+      ? liteNoop
+      : listen<CheckinReplyPayload>("checkin-reply", (event) => {
+          const { user_name, reply, is_ai } = event.payload;
+          pushBubble({
+            title: is_ai ? "舰长打卡 · AI 回复" : "舰长打卡",
+            username: user_name,
+            content: reply,
+            tone: "checkin",
+          });
+        });
 
     // D4 补签结果气泡
-    const unlistenRetro = listen<RetroactivePayload>("retroactive-checkin-recorded", (event) => {
-      const { user_name, reply } = event.payload;
-      pushBubble({ title: "补签结果", username: user_name, content: reply, tone: "retro" });
-    });
+    const unlistenRetro = __IS_LITE__
+      ? liteNoop
+      : listen<RetroactivePayload>("retroactive-checkin-recorded", (event) => {
+          const { user_name, reply } = event.payload;
+          pushBubble({ title: "补签结果", username: user_name, content: reply, tone: "retro" });
+        });
 
     // D4 补签查询气泡（仅气泡不朗读）
-    const unlistenQuery = listen<RetroactivePayload>("retroactive-query", (event) => {
-      const { user_name, reply } = event.payload;
-      pushBubble({ title: "补签查询", username: user_name, content: reply, tone: "retro" });
-    });
+    const unlistenQuery = __IS_LITE__
+      ? liteNoop
+      : listen<RetroactivePayload>("retroactive-query", (event) => {
+          const { user_name, reply } = event.payload;
+          pushBubble({ title: "补签查询", username: user_name, content: reply, tone: "retro" });
+        });
 
     // D4 点赞奖卡气泡
-    const unlistenLike = listen<LikeRewardPayload>("like-reward-granted", (event) => {
-      const { user_name, replies } = event.payload;
-      pushBubble({
-        title: "点赞奖卡",
-        username: user_name,
-        content: replies.join("\n"),
-        tone: "like",
-      });
-    });
+    const unlistenLike = __IS_LITE__
+      ? liteNoop
+      : listen<LikeRewardPayload>("like-reward-granted", (event) => {
+          const { user_name, replies } = event.payload;
+          pushBubble({
+            title: "点赞奖卡",
+            username: user_name,
+            content: replies.join("\n"),
+            tone: "like",
+          });
+        });
 
-    // D4 礼物气泡
-    const unlistenGift = listen<GiftReceivedPayload>("gift-received", (event) => {
-      const { uname, gift_name, gift_num } = event.payload;
-      pushBubble({
-        title: "礼物",
-        username: uname,
-        content: `赠送 ${gift_name} ×${gift_num}`,
-        tone: "gift",
-      });
-    });
+    // D4 礼物 / SC / 上舰气泡：Lite 构建下无此功能，监听整体剔除
+    const unlistenGift = __IS_LITE__
+      ? liteNoop
+      : listen<GiftReceivedPayload>("gift-received", (event) => {
+          const { uname, gift_name, gift_num } = event.payload;
+          pushBubble({
+            title: "礼物",
+            username: uname,
+            content: `赠送 ${gift_name} ×${gift_num}`,
+            tone: "gift",
+          });
+        });
 
-    // D4 SC / 上舰气泡（载荷为内部标签枚举：kind 字段区分类型）
-    const unlistenSc = listen<SuperChatReceivedPayload>("super-chat-received", (event) => {
-      const sc = event.payload;
-      if (!sc || sc.kind !== "SuperChat") return;
-      pushBubble({
-        title: `醒目留言 ¥${sc.rmb}`,
-        username: sc.uname,
-        content: sc.message,
-        tone: "like",
-      });
-    });
-    const unlistenGuard = listen<GuardReceivedPayload>("guard-received", (event) => {
-      const g = event.payload;
-      if (!g || g.kind !== "Guard") return;
-      pushBubble({
-        title: "上舰",
-        username: g.uname,
-        content: `开通 ${g.guard_unit} ×${g.guard_num}（等级 ${g.guard_level}）`,
-        tone: "gift",
-      });
-    });
+    // D4 SC 气泡
+    const unlistenSc = __IS_LITE__
+      ? liteNoop
+      : listen<SuperChatReceivedPayload>("super-chat-received", (event) => {
+          const sc = event.payload;
+          if (!sc || sc.kind !== "SuperChat") return;
+          pushBubble({
+            title: `醒目留言 ¥${sc.rmb}`,
+            username: sc.uname,
+            content: sc.message,
+            tone: "like",
+          });
+        });
+
+    // D4 上舰气泡
+    const unlistenGuard = __IS_LITE__
+      ? liteNoop
+      : listen<GuardReceivedPayload>("guard-received", (event) => {
+          const g = event.payload;
+          if (!g || g.kind !== "Guard") return;
+          pushBubble({
+            title: "上舰",
+            username: g.uname,
+            content: `开通 ${g.guard_unit} ×${g.guard_num}（等级 ${g.guard_level}）`,
+            tone: "gift",
+          });
+        });
 
     // 主窗口保存配置后即时刷新跑马灯 / 透明度，无需重启
     const unlistenConfig = listen("config-changed", () => {

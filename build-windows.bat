@@ -2,8 +2,10 @@
 setlocal EnableExtensions
 
 rem =====================================================================
-rem Windows 本地一键打包：产出裸 exe + NSIS 安装包 + MSI 安装包，
-rem 与 macOS 端 build-macos.sh 同口径（tauri bundle targets: all）。
+rem Windows 本地一键打包：连产「完整版」与「Lite 纯排队版」两套产物，
+rem 各含裸 exe + NSIS 安装包 + MSI 安装包，与 macOS 端 build-macos.sh 同口径。
+rem Lite 版 = Cargo feature `lite` + src-tauri/tauri.conf.lite.json（编译期定型，
+rem 运行期不可切换；对应原工程 ONLY_ORDER_MONSTER 编译期宏）。
 rem 用法：双击运行，或在终端执行 build-windows.bat
 rem
 rem 编码说明：本文件必须保持 ANSI/GBK 编码。cmd 对超过单个读取缓冲区
@@ -25,23 +27,27 @@ for %%T in (node npm cargo) do (
 )
 
 if not exist node_modules (
-  echo [1/2] 未检测到 node_modules，执行 npm ci 安装前端依赖...
+  echo [1/3] 未检测到 node_modules，执行 npm ci 安装前端依赖...
   call npm ci
   if errorlevel 1 goto :fail
 )
 
-rem 版本号取自 src-tauri/tauri.conf.json；beforeBuildCommand 会自动先跑 npm run build
-echo [2/2] 生产打包：npm run tauri build（首次编译耗时较长）
+echo [2/3] 完整版生产打包：npm run tauri build（首次编译耗时较长）
 call npm run tauri build
 if errorlevel 1 goto :fail
 
-set "EXE=%CD%\src-tauri\target\release\MonsterOrderWilds-Ascendance.exe"
-set "NSIS_DIR=src-tauri\target\release\bundle\nsis"
-set "MSI_DIR=src-tauri\target\release\bundle\msi"
+echo [3/3] Lite 纯排队版生产打包：npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json
+call npm run tauri build -- --features lite --config "src-tauri/tauri.conf.lite.json"
+if errorlevel 1 goto :fail
+
+set "REL=src-tauri\target\release"
+set "NSIS_DIR=%REL%\bundle\nsis"
+set "MSI_DIR=%REL%\bundle\msi"
 
 echo.
 echo 构建完成，产物：
-if exist "%EXE%" echo   裸程序: %EXE%
+if exist "%REL%\MonsterOrderWilds-Ascendance.exe" echo   [完整版] 裸程序: %CD%\%REL%\MonsterOrderWilds-Ascendance.exe
+if exist "%REL%\MonsterOrderWilds-Ascendance-Lite.exe" echo   [Lite版] 裸程序: %CD%\%REL%\MonsterOrderWilds-Ascendance-Lite.exe
 if exist "%NSIS_DIR%\*-setup.exe" for %%F in ("%NSIS_DIR%\*-setup.exe") do echo   NSIS 安装包: %%~fF
 if exist "%MSI_DIR%\*.msi" for %%F in ("%MSI_DIR%\*.msi") do echo   MSI 安装包: %%~fF
 echo 注：产物未做代码签名，分发后首次运行可能触发 SmartScreen 提示。

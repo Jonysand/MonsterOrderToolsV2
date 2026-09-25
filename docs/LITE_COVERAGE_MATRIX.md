@@ -1,14 +1,20 @@
-﻿# Lite 模式（ONLY_ORDER_MONSTER）覆盖矩阵
+﻿# Lite 版（ONLY_ORDER_MONSTER）覆盖矩阵
 
-> 批次 E1 产出。V2 用运行时开关 `is_lite_mode` 映射原工程的编译期宏 `ONLY_ORDER_MONSTER`
-> （`#if !ONLY_ORDER_MONSTER` 排除 TTS/打卡/GM/AI）与 C# 侧运行时判断 `ToolsMain.IsOnlyOrderMonster`。
+> 批次 E1 产出；2026-09-25 起由运行时开关升级为 **build 期定型**。
+> 完整版与 Lite 版分别构建产物（运行期不可切换），直接对应原工程 C++ 侧编译期宏
+> `ONLY_ORDER_MONSTER`（`#if !ONLY_ORDER_MONSTER` 排除 TTS/打卡/GM/AI）；
+> C# 侧运行时判断 `ToolsMain.IsOnlyOrderMonster` 对应 Lite 前端产物中的编译期常量。
+>
+> - 后端：Cargo feature `lite` → `IS_LITE = cfg!(feature = "lite")`，`tauri build --features lite`
+> - 前端：`vite --mode lite` → `__IS_LITE__` 编译期常量
+> - 产物命名：`tauri.conf.lite.json` 覆盖为 `MonsterOrderWilds-Ascendance-Lite`
 
 ## 一、机制
 
 | 层 | 机制 |
 | --- | --- |
-| 后端（Rust） | 统一守卫 `ensure_not_lite(&state, "模块名")?`（`lib.rs`），Lite 下返回 `Lite模式下XX已停用`；事件管道类在 `handle_incoming_*` 首部直接 return |
-| 前端（React） | `isLite` 状态：导航项 `opacity-40` + 「停用」标签；控件 `disabled={isLite}`；视图内琥珀色横幅提示 |
+| 后端（Rust） | 统一守卫 `ensure_not_lite(&state, "模块名")?`（`lib.rs`），Lite 构建下返回 `Lite模式下XX已停用`；事件管道类在 `handle_incoming_*` 首部 `if IS_LITE { return }` |
+| 前端（React） | `isLite = __IS_LITE__`（编译期常量）：导航项 `opacity-40` + 「停用」标签；控件 `disabled={isLite}`；视图内琥珀色横幅提示；release 构建下死分支被整体消除 |
 | 判定边界 | 与原工程一致：**Lite = 仅点怪排队 + 悬浮窗 + B 站长连 + 基础设施（配置/身份码/日志）** |
 
 ## 二、覆盖矩阵
@@ -19,7 +25,7 @@
 | 悬浮窗 | 跑马灯、业务气泡、队列列表、透明度、锁定穿透、位置记忆、`Alt+,` 热键 | 无守卫（保留） | 正常可用 | ✅ 支持 |
 | B 站长连 | 开播连接/断开、五态状态机、弹幕原始事件接收（点怪链路） | 无守卫（保留） | 直播连接面板正常 | ✅ 支持 |
 | 身份码 | `save_id_code`（注册表持久化） | 无守卫（保留） | 直播连接面板可编辑 | ✅ 支持 |
-| 配置 | `get_app_config` / `save_app_config` / `set_lite_mode` | 无守卫（保留） | 设置面板可用（TTS/打卡控件置灰） | ✅ 支持 |
+| 配置 | `get_app_config` / `save_app_config` | 无守卫（保留） | 设置面板可用（TTS/打卡控件置灰） | ✅ 支持 |
 | 运行日志 | 内存环 + `Logs/` 落盘、资源缺失告警（前端日志视图已移除，IPC 保留） | 无守卫（保留） | 资源缺失即时 Toast | ✅ 支持 |
 | 凭据导入 | `import_credentials_file`（安装版首次使用入口） | 无守卫（**决策：保留**） | 设置页「导入凭据文件」按钮 | ✅ 支持 |
 | TTS 播报 | 普通弹幕朗读 `{uname} 说：{msg}` | `handle_incoming_danmu` 第 4 节 `!is_lite && enable_voice` | 置灰 | ❌ 停用 |
@@ -42,10 +48,11 @@
 
 1. **默认不支持 Lite**：任何新增的非排队功能必须在该命令入口第一行调用
    `ensure_not_lite(&state, "模块名")?`，模块名用于生成前端提示文案。
-2. 事件管道类新增功能（无返回值的 `handle_incoming_*`）：在函数首部读取 `is_lite_mode`，
-   Lite 下直接 `return`（对齐原工程 `#if !ONLY_ORDER_MONSTER` 的编译期排除）。
+2. 事件管道类新增功能（无返回值的 `handle_incoming_*`）：在函数首部 `if IS_LITE { return }`
+   （编译期常量，release 构建下整段死代码被消除，对齐原工程 `#if !ONLY_ORDER_MONSTER`）。
 3. 前端：控件加 `disabled={isLite}` 与 `opacity-40`；视图级加琥珀色横幅提示。
-4. 单测：新模块须加入 `test_ensure_not_lite_guard_blocks_non_lite_modules` 的断言列表。
+4. 单测：新模块须加入 `test_ensure_not_lite_guard_matches_build_flavor` 的断言列表
+   （该测试按 `IS_LITE` 分门：Lite 构建断言拒绝、完整版构建断言放行）。
 
 ## 四、`import_credentials_file` 的 Lite 归属决策（2026-09-19）
 
@@ -62,9 +69,11 @@
 
 ## 五、验证
 
-- `cargo test`：`test_ensure_not_lite_guard_blocks_non_lite_modules`（守卫文案与放行/拒绝矩阵）、
-  `test_lite_mode_disables_non_queue_modules`（Lite 下排队仍可用）。
-- 手工：界面左下角切换 Lite 开关 → 各视图控件禁用 + 后端命令返回 `Lite模式下XX已停用`；
-  切换后无需重启（`set_lite_mode` 即时落盘并对所有守卫生效）。
-- 有意差异：原工程为编译期宏（需重新编译出 Lite 版），V2 为运行时开关（同一二进制内切换），
-  行为边界逐项对齐（见矩阵）。
+- `cargo test`（完整版形态）：`test_ensure_not_lite_guard_matches_build_flavor`（守卫放行矩阵）、
+  `test_core_queue_works_in_both_build_flavors`（排队不受形态影响）。
+- `cargo test --features lite`（Lite 形态）：同一守卫测试断言统一拒绝 +
+  `test_lite_build_disables_non_queue_pipelines`（朗读/点赞/礼物/SC 全部短路）。
+- 打包：`build-windows.bat` / `build-macos.sh` 连产双版本；完整版与 Lite 版
+  productName 分别为 `MonsterOrderWilds-Ascendance` / `MonsterOrderWilds-Ascendance-Lite`。
+- 2026-09-25 起不再存在运行时开关（`set_lite_mode` 命令与配置字段 `is_lite_mode` 已删除）；
+  Lite 形态在构建期定型，行为边界逐项对齐原工程编译期宏（见矩阵）。

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MonsterOrderWilds-Ascendance-Lite",
+  "mainBinaryName": "MonsterOrderWilds-Ascendance-Lite",
+  "build": {
+    "beforeDevCommand": "npm run dev:lite",
+    "beforeBuildCommand": "npm run build:lite"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "MonsterOrderWilds-Ascendance Lite - 控制台",
+        "width": 1000,
+        "height": 700,
+        "minWidth": 800,
+        "minHeight": 550,
+        "resizable": true,
+        "dragDropEnabled": false
+      },
+      {
+        "label": "overlay",
+        "title": "点怪姬",
+        "url": "index.html#/overlay",
+        "width": 440,
+        "height": 360,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "dragDropEnabled": false
+      }
+    ]
+  }
+}

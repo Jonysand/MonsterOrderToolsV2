@@ -66,8 +66,11 @@ macOS 下产出 `.app` 与 `.dmg`，路径与核验方法见第五节。
    - 配置文件（`package.json`, `tauri.conf.json`, `tsconfig.json`）使用 UTF-8 无 BOM 编码；
    - 提交前用 `npm run check:encoding` 自动核查。
 2. **新增功能与 ONLY_ORDER_MONSTER 规则**：
-   - 新增任何业务功能时，必须明确考虑是否需要在 `ONLY_ORDER_MONSTER=1`（Lite 纯排队模式）下支持；
-   - 非排队功能（如 TTS、打卡、AI 互动）必须在命令入口调用统一守卫 `ensure_not_lite(&state, "模块名")?`；
+   - Lite 形态自 2026-09-25 起为 **build 期定型**（完整版 / Lite 版分开构建，运行期无开关）：
+     后端 Cargo feature `lite` + `IS_LITE` 编译期常量，前端 vite `--mode lite` 注入 `__IS_LITE__`；
+   - 新增任何业务功能时，必须明确考虑是否需要在 Lite 版下支持；
+   - 非排队功能（如 TTS、打卡、AI 互动）必须在命令入口调用统一守卫 `ensure_not_lite(&state, "模块名")?`
+     （Lite 构建下统一拒绝）；事件管道类在 `handle_incoming_*` 首部 `if IS_LITE { return }`；
    - 完整覆盖矩阵与新增功能声明规则见 `docs/LITE_COVERAGE_MATRIX.md`。
 3. **版本控制规则**：
    - 每次代码修改后必须执行 `git diff` 严格复查改动；

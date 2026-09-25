@@ -5,11 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "npm run gen:icons && vite",
+    "dev:lite": "npm run gen:icons && vite --mode lite",
     "build": "npm run gen:icons && tsc && vite build",
+    "build:lite": "npm run gen:icons && tsc && vite build --mode lite",
     "preview": "vite preview",
     "tauri": "tauri",
     "gen:icons": "python scripts/gen_icon_manifest.py",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:rust:lite": "cargo test --manifest-path src-tauri/Cargo.toml --features lite",
     "check:encoding": "python scripts/check_encoding.py",
     "check:fields": "python scripts/check_orphan_fields.py",
     "verify": "npm run build && npm run test:rust && npm run check:encoding"

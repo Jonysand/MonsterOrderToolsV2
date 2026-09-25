@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# macOS 本地一键打包（Apple Silicon）：产出 .app + .dmg，与 CI bundle-macos 同口径
+# macOS 本地一键打包（Apple Silicon）：连产「完整版」与「Lite 纯排队版」两套 .app + .dmg，
+# 与 Windows 端 build-windows.bat 同口径
+# Lite 版 = Cargo feature `lite` + src-tauri/tauri.conf.lite.json（编译期定型，运行期不可切换）
 # 用法：./build-macos.sh
 set -euo pipefail
 
@@ -21,21 +23,28 @@ for tool in node npm cargo; do
 done
 
 if [ ! -d node_modules ]; then
-  echo "[1/2] 未检测到 node_modules，执行 npm ci 安装前端依赖..."
+  echo "[1/3] 未检测到 node_modules，执行 npm ci 安装前端依赖..."
   npm ci
 fi
 
-# 版本号取自 src-tauri/tauri.conf.json；beforeBuildCommand 会自动先跑 npm run build
-echo "[2/2] 生产打包：npm run tauri build（首次编译耗时较长）"
+# 版本号取自 src-tauri/tauri.conf.json；beforeBuildCommand 会自动先跑前端构建
+echo "[2/3] 完整版生产打包：npm run tauri build（首次编译耗时较长）"
 npm run tauri build
 
+echo "[3/3] Lite 纯排队版生产打包：npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json"
+npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json
+
 APP="src-tauri/target/release/bundle/macos/MonsterOrderWilds-Ascendance.app"
+APP_LITE="src-tauri/target/release/bundle/macos/MonsterOrderWilds-Ascendance-Lite.app"
 DMG_DIR="src-tauri/target/release/bundle/dmg"
 
 echo
 echo "构建完成，产物："
 if [ -d "$APP" ]; then
-  echo "  App: $PWD/$APP"
+  echo "  [完整版] App: $PWD/$APP"
+fi
+if [ -d "$APP_LITE" ]; then
+  echo "  [Lite版] App: $PWD/$APP_LITE"
 fi
 if [ -d "$DMG_DIR" ]; then
   for f in "$DMG_DIR"/*.dmg; do

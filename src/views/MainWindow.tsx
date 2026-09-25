@@ -29,7 +29,6 @@ import {
   Gift,
   Flame,
   Power,
-  AlertCircle,
   GripVertical,
   ListPlus,
   Eye,
@@ -65,7 +64,8 @@ export const MainWindow: React.FC = () => {
     "queue" | "monster" | "bili" | "gm" | "settings"
   >("queue");
   const [queue, setQueue] = useState<QueueItem[]>([]);
-  const [isLite, setIsLite] = useState(false);
+  // 编译期形态常量（vite --mode lite 注入）：完整版 false / Lite 版 true，运行期不可切换
+  const isLite = __IS_LITE__;
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
 
@@ -137,7 +137,6 @@ export const MainWindow: React.FC = () => {
       // 已保存的身份码单独读取（配置序列化排除敏感字段），供输入框以密码形态回显
       const savedCode = await invoke<string>("get_id_code").catch(() => "");
       setConfig({ ...cfg, id_code: savedCode || cfg.id_code || "" });
-      setIsLite(cfg.is_lite_mode);
     } catch (e) {
       console.error(e);
     }
@@ -208,10 +207,12 @@ export const MainWindow: React.FC = () => {
       setConn(event.payload);
     });
 
-    // D4/D5 主播控制台动态：打卡记录
-    const unlistenCheckin = listen<UserProfile>("checkin-recorded", (event) => {
-      setRecentCheckins((prev) => [event.payload, ...prev].slice(0, 10));
-    });
+    // D4/D5 主播控制台动态：打卡记录（Lite 构建下无此功能，监听与提示一并剔除）
+    const unlistenCheckin = __IS_LITE__
+      ? Promise.resolve(() => {})
+      : listen<UserProfile>("checkin-recorded", (event) => {
+          setRecentCheckins((prev) => [event.payload, ...prev].slice(0, 10));
+        });
 
     // D2 锁定状态同步（命令 / Alt+, 热键）
     const unlistenLock = listen<boolean>("overlay-lock-changed", (event) => {
@@ -428,20 +429,6 @@ export const MainWindow: React.FC = () => {
       showToast(isVis ? "已调出桌面点怪悬浮窗" : "已隐藏桌面点怪悬浮窗");
     } catch (err) {
       showToast(`悬浮窗操作异常: ${err}`);
-    }
-  };
-
-  const toggleLite = async () => {
-    try {
-      const next = !isLite;
-      await invoke("set_lite_mode", { enabled: next });
-      setIsLite(next);
-      if (config) {
-        setConfig({ ...config, is_lite_mode: next });
-      }
-      showToast(next ? "已切换至 Lite 纯排队模式" : "已恢复完整全功能模式");
-    } catch (e) {
-      console.error(e);
     }
   };
 
@@ -700,18 +687,20 @@ export const MainWindow: React.FC = () => {
               </span>
             </button>
 
-            <button
-              onClick={() => setActiveTab("gm")}
-              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
-                activeTab === "gm"
-                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
-                  : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
-              } ${isLite ? "opacity-40" : ""}`}
-            >
-              <CalendarCheck className="w-4 h-4" />
-              <span>舰长打卡 & GM</span>
-              {isLite && <span className="ml-auto text-[9px] text-amber-400">停用</span>}
-            </button>
+            {/* 舰长打卡 & GM：Lite 构建下无此功能，页签入口整体隐藏（无占位、无提示） */}
+            {!isLite && (
+              <button
+                onClick={() => setActiveTab("gm")}
+                className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
+                  activeTab === "gm"
+                    ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                    : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
+                }`}
+              >
+                <CalendarCheck className="w-4 h-4" />
+                <span>舰长打卡 & GM</span>
+              </button>
+            )}
 
             <button
               onClick={() => setActiveTab("settings")}
@@ -727,29 +716,8 @@ export const MainWindow: React.FC = () => {
           </nav>
         </div>
 
-        {/* 底部模式与快捷操作 */}
+        {/* 底部快捷操作 */}
         <div className="space-y-2 border-t border-neutral-800 pt-3">
-          <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800/80">
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="text-xs font-bold text-neutral-300">Lite 纯排队模式</span>
-              <button
-                onClick={toggleLite}
-                className={`relative inline-flex h-4 w-8 items-center rounded-full transition-colors ${
-                  isLite ? "bg-amber-500" : "bg-neutral-700"
-                }`}
-              >
-                <span
-                  className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
-                    isLite ? "translate-x-4" : "translate-x-0.5"
-                  }`}
-                />
-              </button>
-            </div>
-            <p className="text-[10px] text-neutral-500 leading-tight">
-              {isLite ? "已停用语音、打卡和 AI 模块，超轻量运行" : "所有功能模块正常运行中"}
-            </p>
-          </div>
-
           <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800/80">
             <p className="text-[10px] text-neutral-500 leading-tight">
               OBS 推流：使用【窗口捕获】选择“桌面点怪悬浮窗”，无需额外服务。
@@ -767,14 +735,9 @@ export const MainWindow: React.FC = () => {
               {activeTab === "queue" && "点单排队管理"}
               {activeTab === "monster" && "怪物名单与禁点配置"}
               {activeTab === "bili" && "B 站开放平台直播间连接与监控"}
-              {activeTab === "gm" && "舰长周打卡系统与 GM 运维管理"}
+              {activeTab === "gm" && !isLite && "舰长周打卡系统与 GM 运维管理"}
               {activeTab === "settings" && "系统全局持久化参数设置"}
             </h1>
-            {isLite && (
-              <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold px-2 py-0.5 rounded-full">
-                Lite 纯排队模式已启用
-              </span>
-            )}
           </div>
 
           <div className="flex items-center gap-2">
@@ -1064,16 +1027,9 @@ export const MainWindow: React.FC = () => {
             </div>
           )}
 
-          {/* 4. 舰长打卡 & GM 运维 TAB */}
-          {activeTab === "gm" && (
+          {/* 4. 舰长打卡 & GM 运维 TAB：Lite 构建下无此功能，整页隐藏（导航入口一并隐藏） */}
+          {activeTab === "gm" && !isLite && (
             <div className="space-y-6">
-              {isLite && (
-                <div className="bg-amber-950/40 border border-amber-500/50 rounded-xl p-4 flex items-center gap-3 text-amber-200 text-xs">
-                  <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
-                  <span>当前处于 Lite 纯排队模式，打卡与 GM 运维模块已冻结。如需使用请在左下角关闭 Lite 模式。</span>
-                </div>
-              )}
-
               <div className="grid grid-cols-12 gap-6">
                 {/* D4 主播控制台实时动态：打卡记录 */}
                 <div className="col-span-12 bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-3">
@@ -1117,7 +1073,6 @@ export const MainWindow: React.FC = () => {
 
                   <button
                     onClick={handleBatchCheckin}
-                    disabled={isLite}
                     className="bg-purple-600 hover:bg-purple-500 text-white font-bold px-4 py-2 rounded-lg text-xs shadow-lg shadow-purple-600/30 transition disabled:opacity-40"
                   >
                     执行一键黑幕批量补签
@@ -1150,7 +1105,6 @@ export const MainWindow: React.FC = () => {
                       <select
                         value={exportFormat}
                         onChange={(e) => setExportFormat(e.target.value as "csv" | "json")}
-                        disabled={isLite}
                         className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
                       >
                         <option value="csv">CSV</option>
@@ -1164,7 +1118,6 @@ export const MainWindow: React.FC = () => {
                         value={exportUsername}
                         onChange={(e) => setExportUsername(e.target.value)}
                         placeholder="支持部分匹配"
-                        disabled={isLite}
                         className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
                       />
                     </div>
@@ -1174,7 +1127,6 @@ export const MainWindow: React.FC = () => {
                         type="date"
                         value={exportStartDate}
                         onChange={(e) => setExportStartDate(e.target.value)}
-                        disabled={isLite}
                         className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
                       />
                     </div>
@@ -1184,7 +1136,6 @@ export const MainWindow: React.FC = () => {
                         type="date"
                         value={exportEndDate}
                         onChange={(e) => setExportEndDate(e.target.value)}
-                        disabled={isLite}
                         className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
                       />
                     </div>
@@ -1192,7 +1143,6 @@ export const MainWindow: React.FC = () => {
 
                   <button
                     onClick={handleExportRecords}
-                    disabled={isLite}
                     className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-4 py-2 rounded-lg text-xs shadow-lg shadow-emerald-600/30 transition disabled:opacity-40 flex items-center gap-1.5"
                   >
                     <Download className="w-3.5 h-3.5" />
@@ -1213,7 +1163,6 @@ export const MainWindow: React.FC = () => {
                       value={searchKeyword}
                       onChange={(e) => setSearchKeyword(e.target.value)}
                       placeholder="输入水友昵称关键字或 UID 进行模糊搜索..."
-                      disabled={isLite}
                       className="flex-1 min-w-0 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 disabled:opacity-40"
                     />
                     <div className="flex items-center gap-1.5 bg-neutral-950 border border-neutral-800 rounded-lg px-2.5">
@@ -1224,13 +1173,11 @@ export const MainWindow: React.FC = () => {
                         max="20"
                         value={grantCardAmount}
                         onChange={(e) => setGrantCardAmount(Math.max(1, Number(e.target.value)))}
-                        disabled={isLite}
                         className="w-12 bg-transparent text-xs text-amber-300 font-bold focus:outline-none"
                       />
                     </div>
                     <button
                       type="submit"
-                      disabled={isLite}
                       className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 px-4 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1 disabled:opacity-40"
                     >
                       <Search className="w-3.5 h-3.5" />
@@ -1262,7 +1209,6 @@ export const MainWindow: React.FC = () => {
                               <td className="p-2.5 text-right">
                                 <button
                                   onClick={() => handleGrantCard(u.uid, u.username)}
-                                  disabled={isLite}
                                   className="bg-amber-600/80 hover:bg-amber-500 text-black font-bold px-2 py-1 rounded text-[11px] inline-flex items-center gap-1 disabled:opacity-40"
                                 >
                                   <Gift className="w-3 h-3" />
@@ -1299,7 +1245,7 @@ export const MainWindow: React.FC = () => {
                 </div>
 
                 <p className="text-[11px] text-neutral-400 leading-relaxed">
-                  遵循原工程安全规范，应用凭据（APP ID、访问密钥、语音与 AI 密钥）均加密保存在本地凭据文件中，<strong className="text-neutral-200">不允许手动设置或明文暴露</strong>。
+                  遵循原工程安全规范，应用凭据（APP ID、访问密钥{isLite ? "" : "、语音与 AI 密钥"}）均加密保存在本地凭据文件中，<strong className="text-neutral-200">不允许手动设置或明文暴露</strong>。
                   安装包出于安全考虑<strong className="text-neutral-200">不随包分发该文件</strong>，请点击下方按钮导入由原工程生成（或随原始发行包提供）的凭据文件。
                 </p>
 
@@ -1317,7 +1263,8 @@ export const MainWindow: React.FC = () => {
                   </span>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+                {/* AI 模型凭据与多引擎语音芯片：Lite 构建下无对应功能，一并隐藏 */}
+                <div className={`grid grid-cols-2 gap-3 pt-1 ${isLite ? "" : "sm:grid-cols-4"}`}>
                   <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
                     <span className="text-[10px] text-neutral-500 block">应用 APP ID</span>
                     <span className="text-xs font-mono font-bold text-neutral-200">
@@ -1335,30 +1282,34 @@ export const MainWindow: React.FC = () => {
                     </span>
                   </div>
 
-                  <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
-                    <span className="text-[10px] text-neutral-500 block">AI 模型凭据</span>
-                    <span className={`text-xs font-bold ${credStatus?.has_chat_key ? "text-emerald-300" : "text-neutral-500"}`}>
-                      {credStatus?.has_chat_key ? `已绑定 (${credStatus.chat_provider})` : "未绑定"}
-                    </span>
-                  </div>
+                  {!isLite && (
+                    <>
+                      <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
+                        <span className="text-[10px] text-neutral-500 block">AI 模型凭据</span>
+                        <span className={`text-xs font-bold ${credStatus?.has_chat_key ? "text-emerald-300" : "text-neutral-500"}`}>
+                          {credStatus?.has_chat_key ? `已绑定 (${credStatus.chat_provider})` : "未绑定"}
+                        </span>
+                      </div>
 
-                  <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
-                    <span className="text-[10px] text-neutral-500 block">多引擎语音</span>
-                    <span className={`text-xs font-bold ${credStatus?.has_mimo_key || credStatus?.has_vip_tts_key ? "text-emerald-300" : "text-neutral-500"}`}>
-                      {credStatus?.has_mimo_key ? "MiMo 已绑定" : "本地语音"}
-                    </span>
-                  </div>
+                      <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
+                        <span className="text-[10px] text-neutral-500 block">多引擎语音</span>
+                        <span className={`text-xs font-bold ${credStatus?.has_mimo_key || credStatus?.has_vip_tts_key ? "text-emerald-300" : "text-neutral-500"}`}>
+                          {credStatus?.has_mimo_key ? "MiMo 已绑定" : "本地语音"}
+                        </span>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
 
-              {/* D1 多引擎 TTS 语音与音效 */}
-              <div className={`bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4 ${isLite ? "opacity-40" : ""}`}>
+              {/* D1 多引擎 TTS 语音与音效：Lite 构建下无此功能，整卡隐藏（无占位、无提示） */}
+              {!isLite && (
+              <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
                 <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
                   <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
                     <Volume2 className="w-4 h-4" />
                     <span>语音播报与音效</span>
                   </h3>
-                  {isLite && <span className="text-[10px] text-amber-400">Lite 模式下已停用</span>}
                 </div>
 
                 {/* 总开关与播报过滤 */}
@@ -1367,7 +1318,6 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={config.enable_voice}
-                      disabled={isLite}
                       onChange={(e) => setConfig({ ...config, enable_voice: e.target.checked })}
                       className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                     />
@@ -1378,7 +1328,6 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={config.only_speek_wearing_medal}
-                      disabled={isLite}
                       onChange={(e) => setConfig({ ...config, only_speek_wearing_medal: e.target.checked })}
                       className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                     />
@@ -1389,7 +1338,6 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={config.only_speek_paid_gift}
-                      disabled={isLite}
                       onChange={(e) => setConfig({ ...config, only_speek_paid_gift: e.target.checked })}
                       className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                     />
@@ -1400,7 +1348,6 @@ export const MainWindow: React.FC = () => {
                     <label className="block text-[11px] text-neutral-400 mb-1">播报至少等级（大航海）</label>
                     <select
                       value={config.only_speek_guard_level}
-                      disabled={isLite}
                       onChange={(e) => setConfig({ ...config, only_speek_guard_level: Number(e.target.value) })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
@@ -1418,7 +1365,6 @@ export const MainWindow: React.FC = () => {
                     <label className="block text-[11px] text-neutral-400 mb-1">播报引擎</label>
                     <select
                       value={config.tts_engine || "auto"}
-                      disabled={isLite}
                       onChange={(e) => setConfig({ ...config, tts_engine: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
@@ -1440,7 +1386,6 @@ export const MainWindow: React.FC = () => {
                       min={1}
                       max={365}
                       value={config.tts_cache_days_to_keep}
-                      disabled={isLite}
                       onChange={(e) =>
                         setConfig({
                           ...config,
@@ -1456,7 +1401,6 @@ export const MainWindow: React.FC = () => {
                     </label>
                     <select
                       value={config.manbo_voice}
-                      disabled={isLite}
                       onChange={(e) => setConfig({ ...config, manbo_voice: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
@@ -1482,7 +1426,6 @@ export const MainWindow: React.FC = () => {
                       <input
                         type="password"
                         value={manboKeyInput}
-                        disabled={isLite}
                         onChange={(e) => setManboKeyInput(e.target.value)}
                         placeholder={credStatus?.has_vip_tts_key ? "已绑定（留空则保持不变）" : "输入 Manbo API Key"}
                         className="flex-1 min-w-0 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 disabled:opacity-40"
@@ -1490,7 +1433,6 @@ export const MainWindow: React.FC = () => {
                       <button
                         type="button"
                         onClick={handleSaveManboKey}
-                        disabled={isLite}
                         className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-bold rounded-lg border border-neutral-700 transition shrink-0 disabled:opacity-40"
                       >
                         保存 Key
@@ -1502,7 +1444,6 @@ export const MainWindow: React.FC = () => {
                       <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音角色</label>
                       <select
                         value={config.mimo_voice}
-                        disabled={isLite}
                         onChange={(e) => setConfig({ ...config, mimo_voice: e.target.value })}
                         className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                       >
@@ -1515,7 +1456,6 @@ export const MainWindow: React.FC = () => {
                       <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音风格</label>
                       <select
                         value={config.mimo_style}
-                        disabled={isLite}
                         onChange={(e) => setConfig({ ...config, mimo_style: e.target.value })}
                         className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                       >
@@ -1540,7 +1480,6 @@ export const MainWindow: React.FC = () => {
                       max="10"
                       step="1"
                       value={config.speech_rate}
-                      disabled={isLite}
                       onChange={(e) => applyConfigPatch({ speech_rate: Number(e.target.value) })}
                       className="w-full accent-amber-500 disabled:opacity-40"
                     />
@@ -1555,7 +1494,6 @@ export const MainWindow: React.FC = () => {
                       max="200"
                       step="1"
                       value={config.speech_volume}
-                      disabled={isLite}
                       onChange={(e) => applyConfigPatch({ speech_volume: Number(e.target.value) })}
                       className="w-full accent-amber-500 disabled:opacity-40"
                     />
@@ -1570,22 +1508,21 @@ export const MainWindow: React.FC = () => {
                       max="10"
                       step="1"
                       value={config.speech_pitch}
-                      disabled={isLite}
                       onChange={(e) => applyConfigPatch({ speech_pitch: Number(e.target.value) })}
                       className="w-full accent-amber-500 disabled:opacity-40"
                     />
                   </div>
                 </div>
               </div>
+              )}
 
-              {/* D1/D2 点怪门槛、舰长打卡 AI 与跑马灯文本 */}
-              <div className={`bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4 ${isLite ? "opacity-40" : ""}`}>
+              {/* D1/D2 点怪门槛、舰长打卡 AI 与跑马灯文本（Lite 构建下仅保留点怪门槛与跑马灯） */}
+              <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
                 <div className="flex items-center justify-between pb-2 border-b border-neutral-800">
                   <h3 className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
                     <CalendarCheck className="w-4 h-4" />
-                    <span>点怪门槛与舰长打卡 AI</span>
+                    <span>{isLite ? "点怪门槛与跑马灯" : "点怪门槛与舰长打卡 AI"}</span>
                   </h3>
-                  {isLite && <span className="text-[10px] text-amber-400">Lite 模式下已停用</span>}
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -1599,28 +1536,31 @@ export const MainWindow: React.FC = () => {
                     <span>仅粉丝牌（含舰长）可点怪</span>
                   </label>
 
-                  <label className="flex items-center gap-2 text-xs text-neutral-300 font-bold cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={config.enable_captain_checkin_ai}
-                      disabled={isLite}
-                      onChange={(e) => setConfig({ ...config, enable_captain_checkin_ai: e.target.checked })}
-                      className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
-                    />
-                    <span>开启舰长打卡 AI 功能</span>
-                  </label>
+                  {/* 打卡 AI 与触发词：Lite 构建下无此功能，控件隐藏 */}
+                  {!isLite && (
+                    <>
+                      <label className="flex items-center gap-2 text-xs text-neutral-300 font-bold cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={config.enable_captain_checkin_ai}
+                          onChange={(e) => setConfig({ ...config, enable_captain_checkin_ai: e.target.checked })}
+                          className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
+                        />
+                        <span>开启舰长打卡 AI 功能</span>
+                      </label>
 
-                  <div>
-                    <label className="block text-[11px] text-neutral-400 mb-1">打卡触发词（中英文逗号分隔）</label>
-                    <input
-                      type="text"
-                      value={config.checkin_trigger_words}
-                      disabled={isLite}
-                      onChange={(e) => setConfig({ ...config, checkin_trigger_words: e.target.value })}
-                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
-                    />
-                    <span className="text-[10px] text-neutral-500">默认：打卡,签到（支持中文逗号，清空则完全停用打卡指令）</span>
-                  </div>
+                      <div>
+                        <label className="block text-[11px] text-neutral-400 mb-1">打卡触发词（中英文逗号分隔）</label>
+                        <input
+                          type="text"
+                          value={config.checkin_trigger_words}
+                          onChange={(e) => setConfig({ ...config, checkin_trigger_words: e.target.value })}
+                          className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
+                        />
+                        <span className="text-[10px] text-neutral-500">默认：打卡,签到（支持中文逗号，清空则完全停用打卡指令）</span>
+                      </div>
+                    </>
+                  )}
 
                   <div>
                     <label className="block text-[11px] text-neutral-400 mb-1">默认跑马灯循环通告内容</label>

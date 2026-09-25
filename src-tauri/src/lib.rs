@@ -28,6 +28,12 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tts::{TTSConfig, TTSEngineType, TTSManager};
 
+/// Lite 形态编译期常量：对应原工程 C++ 侧编译期宏 `ONLY_ORDER_MONSTER`
+/// （`#if !ONLY_ORDER_MONSTER` 排除 TTS/打卡/GM/AI）。完整版与 Lite 版在
+/// build 期由 Cargo feature `lite` 决定（`cargo build --features lite`），
+/// 运行期不可切换；release 编译下恒定 false/true 的分支会被整体消除。
+pub const IS_LITE: bool = cfg!(feature = "lite");
+
 /// 全局运行状态（线程安全且支持克隆引用）
 #[derive(Clone)]
 pub struct AppState {
@@ -495,30 +501,12 @@ fn import_monster_roster(app_handle: AppHandle) -> Result<Option<RosterData>, St
     Ok(Some(data))
 }
 
-/// 设置 Lite 模式开关并持久化
-#[tauri::command]
-fn set_lite_mode(enabled: bool, state: State<'_, AppState>) -> Result<bool, String> {
-    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
-    cfg.is_lite_mode = enabled;
-    if let Err(e) = cfg.save(None) {
-        crate::log_warn!("[Config] Lite 模式开关保存失败: {}", e);
-        return Err(format!("Lite 模式开关保存失败: {}", e));
-    }
-    crate::log_info!("[Config] Lite 模式已{}", if enabled { "开启" } else { "关闭" });
-    Ok(enabled)
-}
-
-/// E1 统一 Lite 守卫：非排队功能在 Lite 模式下统一拒绝调用。
+/// E1 统一 Lite 守卫：非排队功能在 Lite 构建下统一拒绝调用。
 /// 依据 AGENTS.md「新增功能默认不支持 Lite」：任何新增的非排队功能都必须显式调用本守卫。
 /// Lite 保留清单（不调用本守卫）：点怪排队、悬浮窗/窗口控制、B 站长连、身份码、配置读写、
 /// 连接状态与运行日志（详见 docs/LITE_COVERAGE_MATRIX.md）
-fn ensure_not_lite(state: &AppState, module: &str) -> Result<(), String> {
-    let is_lite = state
-        .config
-        .lock()
-        .map_err(|e| e.to_string())?
-        .is_lite_mode;
-    if is_lite {
+fn ensure_not_lite(_state: &AppState, module: &str) -> Result<(), String> {
+    if IS_LITE {
         return Err(format!("Lite模式下{}已停用", module));
     }
     Ok(())
@@ -806,16 +794,12 @@ pub fn handle_incoming_danmu(
         danmu.guard_level = 1;
     }
 
-    let is_lite = {
-        state.config.lock().map(|c| c.is_lite_mode).unwrap_or(false)
-    };
-
     let cfg = {
         state.config.lock().map(|c| c.clone()).unwrap_or_default()
     };
 
-    // 2. 非 Lite 模式下的弹幕学习、舰长打卡与补签指令判定
-    if !is_lite {
+    // 2. 非 Lite 构建下的弹幕学习、舰长打卡与补签指令判定
+    if !IS_LITE {
         let msg_trim = danmu.message.trim();
 
         // 2.1 打卡模块总开关（原工程 enableCaptainCheckinAI 控制 CaptainCheckInModule 的启用：
@@ -1049,7 +1033,7 @@ pub fn handle_incoming_danmu(
     }
 
     // 4. TTS 播报（对齐原工程 HandleSpeekDm 过滤链：仅粉丝牌 → 仅舰长等级 → 语音开关）
-    if !is_lite && cfg.enable_voice {
+    if !IS_LITE && cfg.enable_voice {
         let msg_trim = danmu.message.trim();
         let passes_medal = !cfg.only_speek_wearing_medal || danmu.has_medal;
         let passes_guard = cfg.only_speek_guard_level == 0
@@ -1088,10 +1072,7 @@ pub fn handle_incoming_like(
     state: &AppState,
     ev: &bilibili::LikeEvent,
 ) -> Vec<String> {
-    let is_lite = {
-        state.config.lock().map(|c| c.is_lite_mode).unwrap_or(false)
-    };
-    if is_lite {
+    if IS_LITE {
         return Vec::new();
     }
 
@@ -1158,12 +1139,7 @@ pub fn handle_incoming_gift(
     state: &AppState,
     ev: tts::GiftEvent,
 ) {
-    let is_lite = state
-        .config
-        .lock()
-        .map(|c| c.is_lite_mode)
-        .unwrap_or(false);
-    if is_lite {
+    if IS_LITE {
         return;
     }
 
@@ -1193,12 +1169,7 @@ pub fn handle_incoming_live_event(
     state: &AppState,
     ev: bilibili::LiveEvent,
 ) {
-    let is_lite = state
-        .config
-        .lock()
-        .map(|c| c.is_lite_mode)
-        .unwrap_or(false);
-    if is_lite {
+    if IS_LITE {
         return;
     }
 
@@ -2051,12 +2022,12 @@ pub fn run() {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
                 loop {
                     interval.tick().await;
-                    let (is_lite, only_paid) = state
+                    let only_paid = state
                         .config
                         .lock()
-                        .map(|c| (c.is_lite_mode, c.only_speek_paid_gift))
-                        .unwrap_or((false, false));
-                    if is_lite {
+                        .map(|c| c.only_speek_paid_gift)
+                        .unwrap_or(false);
+                    if IS_LITE {
                         continue;
                     }
 
@@ -2162,7 +2133,6 @@ pub fn run() {
             set_monster_roster,
             export_monster_roster,
             import_monster_roster,
-            set_lite_mode,
             get_app_config,
             save_app_config,
             save_id_code,
@@ -2284,19 +2254,16 @@ mod tests {
         println!("[PASS] test_app_state_initialization passed");
     }
 
+    /// Lite 形态已改为编译期常量（IS_LITE / Cargo feature `lite`），
+    /// 运行期开关不复存在；核心点单排队在完整版与 Lite 版两种构建下都必须正常运作
     #[test]
-    fn test_lite_mode_disables_non_queue_modules() {
+    fn test_core_queue_works_in_both_build_flavors() {
         let state = AppState::new_test();
-        *state.config.lock().unwrap() = AppConfig {
-            is_lite_mode: true,
-            ..Default::default()
-        };
 
-        // 验证 Lite 模式下打卡与 AI 受阻
-        let is_lite = state.config.lock().unwrap().is_lite_mode;
-        assert!(is_lite);
+        // 编译期形态常量与当前 cargo 编译参数一致（双形态测试锚点）
+        assert_eq!(IS_LITE, cfg!(feature = "lite"));
 
-        // 核心点单排队正常运作
+        // 核心点单排队不受形态影响
         let mut q = state.queue_mgr.lock().unwrap();
         q.add_or_update(QueueItem {
             id: "lite-1".into(),
@@ -2310,36 +2277,38 @@ mod tests {
             icon_url: "".into(),
         });
         assert_eq!(q.items.len(), 1);
-        println!("[PASS] test_lite_mode_disables_non_queue_modules passed");
+        println!("[PASS] test_core_queue_works_in_both_build_flavors passed");
     }
 
-    /// E1：统一 Lite 守卫 —— 非排队模块在 Lite 下统一拒绝；Lite 保留模块不受影响
+    /// E1：统一 Lite 守卫 —— 按编译形态分门：Lite 构建下非排队模块统一拒绝；
+    /// 完整版构建放行。两种形态下 Lite 保留模块（点怪排队）都不受影响
     #[test]
-    fn test_ensure_not_lite_guard_blocks_non_lite_modules() {
+    fn test_ensure_not_lite_guard_matches_build_flavor() {
         let state = AppState::new_test();
 
-        // 非 Lite：守卫放行
-        assert!(ensure_not_lite(&state, "打卡模块").is_ok());
-        assert!(ensure_not_lite(&state, "TTS语音模块").is_ok());
-
-        // Lite：统一拒绝，文案与前端提示一致
-        state.config.lock().unwrap().is_lite_mode = true;
-        assert_eq!(
-            ensure_not_lite(&state, "打卡模块").unwrap_err(),
-            "Lite模式下打卡模块已停用"
-        );
-        for module in [
-            "补签卡模块",
-            "补签模块",
-            "GM运维打卡功能",
-            "GM功能",
-            "打卡导出功能",
-            "音效模块",
-            "点赞奖卡模块",
-            "TTS语音模块",
-        ] {
-            let err = ensure_not_lite(&state, module).unwrap_err();
-            assert_eq!(err, format!("Lite模式下{}已停用", module));
+        if IS_LITE {
+            // Lite 构建：统一拒绝，文案与前端提示一致
+            assert_eq!(
+                ensure_not_lite(&state, "打卡模块").unwrap_err(),
+                "Lite模式下打卡模块已停用"
+            );
+            for module in [
+                "补签卡模块",
+                "补签模块",
+                "GM运维打卡功能",
+                "GM功能",
+                "打卡导出功能",
+                "音效模块",
+                "点赞奖卡模块",
+                "TTS语音模块",
+            ] {
+                let err = ensure_not_lite(&state, module).unwrap_err();
+                assert_eq!(err, format!("Lite模式下{}已停用", module));
+            }
+        } else {
+            // 完整版构建：守卫放行
+            assert!(ensure_not_lite(&state, "打卡模块").is_ok());
+            assert!(ensure_not_lite(&state, "TTS语音模块").is_ok());
         }
 
         // Lite 保留：点怪排队不经过守卫，仍可正常运作
@@ -2356,7 +2325,7 @@ mod tests {
             icon_url: "".into(),
         });
         assert_eq!(q.items.len(), 1);
-        println!("[PASS] test_ensure_not_lite_guard_blocks_non_lite_modules passed");
+        println!("[PASS] test_ensure_not_lite_guard_matches_build_flavor passed");
     }
 
     /// E3：退出清理 —— 待写悬浮窗位置并入内存配置并清空 pending（不落盘）
@@ -2407,6 +2376,8 @@ mod tests {
         println!("[PASS] test_simulate_danmu_special_user_ordering passed");
     }
 
+    /// 打卡链路属完整版专属（Lite 构建下该链路被编译期守卫短路）
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_simulate_danmu_checkin_flow() {
         let state = AppState::new_test();
@@ -2468,6 +2439,8 @@ mod tests {
         println!("[PASS] test_simulate_danmu_checkin_flow passed");
     }
 
+    /// 补签链路属完整版专属（Lite 构建下该链路被编译期守卫短路）
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_simulate_danmu_retroactive_flow() {
         let state = AppState::new_test();
@@ -2536,6 +2509,8 @@ mod tests {
         println!("[PASS] test_parse_checkin_trigger_words_fullwidth_comma passed");
     }
 
+    /// 补签权限/查询词验证走完整弹幕管线，属完整版专属（Lite 构建下补签链路被短路）
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_retro_permission_and_query_words() {
         let state = AppState::new_test();
@@ -2599,6 +2574,8 @@ mod tests {
         println!("[PASS] test_retro_permission_and_query_words passed");
     }
 
+    /// 点赞奖卡链路属完整版专属（Lite 构建下 handle_incoming_like 直接返回空）
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_like_pipeline_dedup_and_rewards() {
         let state = AppState::new_test();
@@ -2650,19 +2627,11 @@ mod tests {
             }
         }
 
-        // Lite 模式点赞不处理
-        state.config.lock().unwrap().is_lite_mode = true;
-        let lite_ev = bilibili::LikeEvent {
-            uid: "lite_user".into(),
-            username: "Lite水友".into(),
-            msg_id: "lite_like_1".into(),
-            like_count: 30,
-            timestamp: now_ts,
-        };
-        assert!(handle_incoming_like(None, &state, &lite_ev).is_empty());
         println!("[PASS] test_like_pipeline_dedup_and_rewards passed");
     }
 
+    /// 弹幕学习链路属完整版专属（Lite 构建下不进行发言习惯学习）
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_danmu_learning_pipeline_and_duplicate_skip() {
         let mut state = AppState::new_test();
@@ -2766,6 +2735,7 @@ mod tests {
     }
 
     /// 指令类弹幕不写入发言习惯：避免「打卡」「补签」混进关键词与 AI 提示词的「最近发言」
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_command_danmu_excluded_from_learning() {
         let mut state = AppState::new_test();
@@ -2840,6 +2810,7 @@ mod tests {
         println!("[PASS] test_window_management_definitions passed");
     }
 
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_normal_danmu_read_aloud_queue() {
         let state = AppState::new_test();
@@ -2848,7 +2819,6 @@ mod tests {
             cfg.enable_voice = true;
             cfg.only_speek_wearing_medal = false;
             cfg.only_speek_guard_level = 0;
-            cfg.is_lite_mode = false;
         }
 
         // 普通弹幕（非点怪）：入普通朗读队列，格式 "{uname} 说：{msg}"
@@ -2888,6 +2858,7 @@ mod tests {
         println!("[PASS] test_normal_danmu_read_aloud_queue passed");
     }
 
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_read_aloud_respects_speak_filters() {
         let state = AppState::new_test();
@@ -2895,7 +2866,6 @@ mod tests {
             let mut cfg = state.config.lock().unwrap();
             cfg.enable_voice = true;
             cfg.only_speek_wearing_medal = true; // 仅播报佩戴粉丝牌
-            cfg.is_lite_mode = false;
         }
 
         // 无粉丝牌 → 不入队
@@ -2928,25 +2898,6 @@ mod tests {
         handle_incoming_danmu(None, &state, dm2);
         let task = state.tts_mgr.dequeue_speak().expect("有牌水友应入队");
         assert_eq!(task.text, "有牌水友 说：早上好");
-
-        // Lite 模式下不入队（TTS 停用）
-        {
-            let mut cfg = state.config.lock().unwrap();
-            cfg.is_lite_mode = true;
-        }
-        let dm3 = bilibili::DanmuData {
-            user_id: "u_with_medal".into(),
-            user_name: "有牌水友".into(),
-            message: "晚上好".into(),
-            timestamp: 3,
-            has_medal: true,
-            medal_level: 5,
-            guard_level: 0,
-            msg_id: "filter_3".into(),
-            is_paid_gift: false,
-        };
-        handle_incoming_danmu(None, &state, dm3);
-        assert!(state.tts_mgr.dequeue_speak().is_none());
         println!("[PASS] test_read_aloud_respects_speak_filters passed");
     }
 
@@ -2975,13 +2926,13 @@ mod tests {
         println!("[PASS] test_food_order_text_generation passed");
     }
 
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_food_order_danmu_enters_priority_queue() {
         let state = AppState::new_test();
         {
             let mut cfg = state.config.lock().unwrap();
             cfg.enable_voice = true;
-            cfg.is_lite_mode = false;
         }
         let dm = bilibili::DanmuData {
             user_id: "u_food".into(),
@@ -3008,13 +2959,13 @@ mod tests {
         println!("[PASS] test_food_order_danmu_enters_priority_queue passed");
     }
 
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_local_sound_danmu_bypasses_read_aloud() {
         let state = AppState::new_test();
         {
             let mut cfg = state.config.lock().unwrap();
             cfg.enable_voice = true;
-            cfg.is_lite_mode = false;
         }
         // "曼波"命中本地音效：直接播放，不进入朗读队列
         let dm = bilibili::DanmuData {
@@ -3033,13 +2984,13 @@ mod tests {
         println!("[PASS] test_local_sound_danmu_bypasses_read_aloud passed");
     }
 
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_gift_pipeline_combo_and_read_aloud() {
         let state = AppState::new_test();
         {
             let mut cfg = state.config.lock().unwrap();
             cfg.enable_voice = true;
-            cfg.is_lite_mode = false;
         }
 
         // 首件礼物（<3 且免费）：立即播报"感谢 X 赠送的 N 个 Y"
@@ -3085,6 +3036,7 @@ mod tests {
         println!("[PASS] test_gift_pipeline_combo_and_read_aloud passed");
     }
 
+    #[cfg(not(feature = "lite"))]
     #[test]
     fn test_gift_pipeline_only_paid_filter() {
         let state = AppState::new_test();
@@ -3092,7 +3044,6 @@ mod tests {
             let mut cfg = state.config.lock().unwrap();
             cfg.enable_voice = true;
             cfg.only_speek_paid_gift = true;
-            cfg.is_lite_mode = false;
         }
 
         // 免费礼物官方连击：准备池结算时被「仅付费礼物」开关静默丢弃
@@ -3142,13 +3093,14 @@ mod tests {
         println!("[PASS] test_gift_pipeline_only_paid_filter passed");
     }
 
+    /// SC / 上舰 / 进场播报链路属完整版专属
+    #[cfg(not(feature = "lite"))]
     #[test]
-    fn test_live_event_pipeline_and_lite_interception() {
+    fn test_live_event_pipeline_sc_guard_enter() {
         let state = AppState::new_test();
         {
             let mut cfg = state.config.lock().unwrap();
             cfg.enable_voice = true;
-            cfg.is_lite_mode = false;
         }
 
         // SC：入优先队列（文案对齐原工程）
@@ -3191,24 +3143,71 @@ mod tests {
             },
         );
         assert!(state.tts_mgr.dequeue_speak().is_none(), "进场事件不应播报");
+        println!("[PASS] test_live_event_pipeline_sc_guard_enter passed");
+    }
 
-        // Lite 模式下全部拦截
-        {
-            let mut cfg = state.config.lock().unwrap();
-            cfg.is_lite_mode = true;
-        }
+    /// Lite 构建：非排队链路（朗读 / 点赞 / 礼物 / 直播事件）在编译期即被短路，
+    /// 点怪排队不受影响（与 docs/LITE_COVERAGE_MATRIX.md 对齐）
+    #[cfg(feature = "lite")]
+    #[test]
+    fn test_lite_build_disables_non_queue_pipelines() {
+        let state = AppState::new_test();
+        state.config.lock().unwrap().enable_voice = true;
+
+        // 普通弹幕不朗读（即便语音开关与粉丝牌过滤全部放行）
+        let dm = bilibili::DanmuData {
+            user_id: "lite_u".into(),
+            user_name: "Lite水友".into(),
+            message: "早上好".into(),
+            timestamp: 1,
+            has_medal: true,
+            medal_level: 5,
+            guard_level: 0,
+            msg_id: "lite_dm_1".into(),
+            is_paid_gift: false,
+        };
+        handle_incoming_danmu(None, &state, dm);
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "Lite 构建不应朗读弹幕");
+
+        // 点赞不结算奖卡
+        let like = bilibili::LikeEvent {
+            uid: "lite_u".into(),
+            username: "Lite水友".into(),
+            msg_id: "lite_like_1".into(),
+            like_count: 30,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        assert!(handle_incoming_like(None, &state, &like).is_empty(), "Lite 构建点赞链路应返回空");
+
+        // 礼物不播报
+        handle_incoming_gift(
+            None,
+            &state,
+            tts::GiftEvent {
+                open_id: "lite_g".into(),
+                gift_id: "100".into(),
+                uname: "Lite水友".into(),
+                gift_name: "辣条".into(),
+                gift_num: 1,
+                paid: false,
+                combo: None,
+            },
+        );
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "Lite 构建不应播报礼物");
+
+        // SC 不播报
         handle_incoming_live_event(
             None,
             &state,
             bilibili::LiveEvent::SuperChat {
-                user_id: "sc_u2".into(),
+                user_id: "lite_sc".into(),
                 uname: "土豪水友".into(),
                 rmb: 50,
                 message: "再来".into(),
             },
         );
-        assert!(state.tts_mgr.dequeue_speak().is_none(), "Lite 模式应拦截 SC 播报");
-        println!("[PASS] test_live_event_pipeline_and_lite_interception passed");
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "Lite 构建不应播报 SC");
+        println!("[PASS] test_lite_build_disables_non_queue_pipelines passed");
     }
 
     #[test]
