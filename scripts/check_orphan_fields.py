@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """E6: 孤儿字段核查 —— 统计 AppConfig 各字段在 Rust 后端与前端的使用点。"""
+# io.open 而非内置 open：本机 `python` 可能解析到 Python 2.7（内置 open 不接受
+# encoding 关键字，会直接抛 TypeError）；io.open 在 py2/py3 下行为一致。
+import io
 import os
 import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.path.join(ROOT, "src-tauri/src/config.rs")
 
-content = open(CONFIG, encoding="utf-8-sig").read()
+content = io.open(CONFIG, encoding="utf-8-sig").read()
 m = re.search(r"pub struct AppConfig \{(.*?)\n\}", content, re.S)
 fields = re.findall(r"pub (\w+):", m.group(1))
 print("AppConfig fields:", len(fields))
@@ -21,7 +24,7 @@ for root in roots:
 
 cache = {}
 for p in files:
-    cache[p] = open(p, encoding="utf-8-sig", errors="ignore").read()
+    cache[p] = io.open(p, encoding="utf-8-sig", errors="ignore").read()
 
 orphans = []
 for f in fields:
