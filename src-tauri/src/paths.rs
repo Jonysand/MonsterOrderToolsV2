@@ -124,17 +124,31 @@ pub fn find_resource(rel: &str) -> Option<PathBuf> {
 }
 
 /// 首次运行播种：exe 同级配置目录缺失静态资源（怪物表 / 本地语音包 / 分词词典）时从安装资源复制。
-/// 不播种数据库与用户配置，避免覆盖历史数据
+/// 不播种数据库与用户配置，避免覆盖历史数据。
+///
+/// Lite 形态只播种点怪核心资源（怪物表）：本地语音包、分词词典与 voices/ 属 TTS 与打卡 AI
+/// 素材，Lite 下既不加载也不应复制，避免在与完整版共用数据目录时凭空写入无用文件。
 pub fn ensure_seeded() {
     let target_dir = config_dir();
     let Some(root) = resource_root() else { return };
+    seed_into(&target_dir, &root, crate::IS_LITE);
+}
 
-    for rel in [
-        "monster_list.json",
-        "local_voices.zip",
-        "dict/stop_words.utf8",
-        "dict/user.dict.utf8",
-    ] {
+/// 播种的实际实现（目录可注入，便于对 Lite / 完整版两条分支直接断言）。
+///
+/// `lite=true` 时**只**处理怪物表：语音包、分词词典、voices/ 一律不复制，
+/// 也不读取它们 —— 共用数据目录时不会写入 Lite 用不到的文件。
+pub fn seed_into(target_dir: &Path, root: &Path, lite: bool) {
+    let mut required: Vec<&str> = vec!["monster_list.json"];
+    if !lite {
+        required.extend_from_slice(&[
+            "local_voices.zip",
+            "dict/stop_words.utf8",
+            "dict/user.dict.utf8",
+        ]);
+    }
+
+    for rel in required {
         let target = target_dir.join(rel);
         if target.exists() {
             continue;
@@ -151,6 +165,10 @@ pub fn ensure_seeded() {
                 break;
             }
         }
+    }
+
+    if lite {
+        return;
     }
 
     let voices_target = target_dir.join("voices");
@@ -275,5 +293,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         println!("[PASS] test_copy_dir_recursive passed");
+    }
+
+    /// 播种分支：Lite 只复制怪物表；完整版还会复制语音包、分词词典与 voices/
+    #[test]
+    fn test_seed_into_lite_only_copies_core_resource() {
+        let base = std::env::temp_dir().join("mh_test_paths_seed");
+        let _ = std::fs::remove_dir_all(&base);
+        // 伪造"安装资源目录"：包含全部四类资源
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join(CONFIG_DIR_NAME).join("dict")).unwrap();
+        std::fs::write(root.join(CONFIG_DIR_NAME).join("monster_list.json"), b"{}").unwrap();
+        std::fs::write(root.join(CONFIG_DIR_NAME).join("local_voices.zip"), b"zip").unwrap();
+        std::fs::write(
+            root.join(CONFIG_DIR_NAME).join("dict").join("stop_words.utf8"),
+            b"sw",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(CONFIG_DIR_NAME).join("voices")).unwrap();
+        std::fs::write(root.join(CONFIG_DIR_NAME).join("voices").join("a.mp3"), b"a").unwrap();
+
+        // Lite：只有怪物表被播种
+        let lite_target = base.join("lite");
+        std::fs::create_dir_all(&lite_target).unwrap();
+        seed_into(&lite_target, &root, true);
+        assert!(lite_target.join("monster_list.json").is_file(), "核心资源应播种");
+        assert!(!lite_target.join("local_voices.zip").exists(), "Lite 不得复制语音包");
+        assert!(!lite_target.join("dict").exists(), "Lite 不得复制分词词典");
+        assert!(!lite_target.join("voices").exists(), "Lite 不得复制 voices/");
+
+        // 完整版：全部播种
+        let full_target = base.join("full");
+        std::fs::create_dir_all(&full_target).unwrap();
+        seed_into(&full_target, &root, false);
+        assert!(full_target.join("monster_list.json").is_file());
+        assert!(full_target.join("local_voices.zip").is_file());
+        assert!(full_target.join("dict").join("stop_words.utf8").is_file());
+        assert!(full_target.join("voices").join("a.mp3").is_file());
+
+        // 已存在的目标文件不得被覆盖（避免覆盖用户编辑过的词库）
+        std::fs::write(full_target.join("monster_list.json"), b"USER_EDIT").unwrap();
+        seed_into(&full_target, &root, false);
+        assert_eq!(
+            std::fs::read(full_target.join("monster_list.json")).unwrap(),
+            b"USER_EDIT",
+            "已存在的词库不得被安装资源覆盖"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        println!("[PASS] test_seed_into_lite_only_copies_core_resource passed");
     }
 }

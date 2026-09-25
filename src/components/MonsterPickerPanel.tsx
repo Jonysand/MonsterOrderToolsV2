@@ -47,10 +47,20 @@ export const MonsterPickerPanel: React.FC<Props> = ({ dict, roster, submitting, 
     [entries, game, keyword]
   );
 
-  // 选中项被禁点或被搜索过滤掉时，回落到当前列表里第一个可点的怪
+  /**
+   * 选中项必须始终来自**当前可见且未禁点**的候选。
+   *
+   * 早期实现在失效时静默回落到"第一个可点的怪"，导致实际提交目标与主播当下看到的选择不一致
+   * （筛选掉「黑龙」后确认卡仍提交黑龙，或被禁点后自动换成另一只）。现在一律清空选中，
+   * 由主播重新点选。
+   */
   useEffect(() => {
-    if (selected && !blockedSet.has(selected)) return;
-    setSelected(hits.find((e) => !blockedSet.has(e.name))?.name ?? null);
+    if (!selected) return;
+    const stillSelectable = hits.some((e) => e.name === selected) && !blockedSet.has(selected);
+    if (!stillSelectable) {
+      setSelected(null);
+      setFootMsg(`已取消选中「${selected}」（不在当前筛选结果中或已被禁点），请重新点选`);
+    }
   }, [blockedSet, hits, selected]);
 
   /** 底部状态文案：禁点名单基数决定基线，临时提示由点击行为覆盖 */
@@ -58,19 +68,32 @@ export const MonsterPickerPanel: React.FC<Props> = ({ dict, roster, submitting, 
     ? `禁点名单内的怪物已置灰不可点（共 ${roster.items.length} 种，弹幕点单同样被拦截）`
     : "禁点名单为空 · 所有怪物均可点";
 
+  /**
+   * 提交前的权威选择：再验一次当前可见性与禁点状态，
+   * 防止 `useEffect` 尚未运行就点了「加入排队」。
+   */
+  const currentSelection = (): typeof entries[number] | null => {
+    if (!selected) return null;
+    if (blockedSet.has(selected)) return null;
+    if (!hits.some((e) => e.name === selected)) return null;
+    return entryByName.get(selected) ?? null;
+  };
+
   const selectedEntry = selected ? entryByName.get(selected) : undefined;
   const selAliases = selectedEntry
     ? selectedEntry.aliases.filter((a) => a !== selectedEntry.name)
     : [];
 
   const handleGo = () => {
-    if (!selectedEntry) {
-      setFootMsg("请先在上方点选一个怪物");
+    const picked = currentSelection();
+    if (!picked) {
+      setFootMsg("当前选择已失效（被筛选掉或已禁点），请在列表中点选一个怪物");
+      setSelected(null);
       return;
     }
     onSubmit({
       userName: userName.trim(),
-      monsterName: selectedEntry.name,
+      monsterName: picked.name,
       guardLevel,
       temperedLevel: tempered === "default" ? null : tempered,
       isPriority,

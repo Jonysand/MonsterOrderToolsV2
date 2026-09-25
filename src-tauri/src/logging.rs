@@ -81,25 +81,6 @@ pub fn logs_dir() -> PathBuf {
     crate::paths::config_dir().join("Logs")
 }
 
-/// 历史留档目录（对齐原工程 `WriteLog::RecordHistory` 的 `History/` 目录）
-pub fn history_dir() -> PathBuf {
-    crate::paths::config_dir().join("History")
-}
-
-/// 崩溃转储目录（minidump 与崩溃报告）
-pub fn crashes_dir() -> PathBuf {
-    crate::paths::config_dir().join("Crashes")
-}
-
-/// 日志/留档文件写入串行锁：原工程 `WriteLog` 用 `writtingLock` 串行化
-/// 「判空→写 BOM→追加」全过程；V2 若不加锁，多线程同日首次写入会写出两个 BOM。
-static FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
-
-/// 单行格式，与原工程 `WriteLog` 逐字对齐
-pub fn format_line(time: &str, level: LogLevel, message: &str) -> String {
-    format!("[{}]:[{}] {}\n", time, level.as_str(), message)
-}
-
 /// 追加一行到 `dir/YYYY-MM-DD.txt`；文件为新建或空文件时先写入 UTF-8 BOM
 pub fn append_line(dir: &Path, date: &str, line: &str) -> std::io::Result<()> {
     let _guard = FILE_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -120,48 +101,110 @@ fn append_line_unlocked(dir: &Path, date: &str, line: &str) -> std::io::Result<(
 
 /// 历史留档：写入 `<数据目录>/History/YYYY.M.D.txt`，行格式 `[HH:MM:SS] msg`
 /// （与原工程 `WriteLog::RecordHistory` 的文件名与行格式逐字一致：月/日不补零）
+///
+/// 与诊断日志不同，History 保留**用户业务原文**：包含换行的补签查询文案会写成多行物理行，
+/// 但每次业务事件只调用一次本函数（因此"一次留档"是可断言的）。
 pub fn record_history(message: &str) {
     use chrono::Datelike;
     let now = chrono::Local::now();
     // 月/日不补零，与原工程 `_stprintf_s(fileName, "%d.%d.%d.txt", wYear, wMonth, wDay)` 一致
     let date = format!("{}.{}.{}", now.year(), now.month(), now.day());
     let line = format!("[{}] {}\n", now.format("%H:%M:%S"), message);
-    // 与 log 一致：测试构建不落盘，避免污染仓库数据目录（格式由单测覆盖）
-    #[cfg(not(test))]
-    let _ = append_line(&history_dir(), &date, &line);
-    #[cfg(test)]
-    let _ = (&date, &line);
+    write_history_line(&history_dir(), &date, &line);
 }
 
-/// 记录一条日志：写入内存环并落盘。落盘失败静默（日志本身不得影响主流程）
+/// 历史留档的实际写入（测试可注入临时目录，从而断言"确实写成功"）
+pub fn write_history_line(dir: &Path, date: &str, line: &str) {
+    // 与 log 一致：测试构建不落盘，避免污染仓库数据目录（格式由单测覆盖）
+    #[cfg(not(test))]
+    let _ = append_line(dir, date, line);
+    #[cfg(test)]
+    let _ = (dir, date, line);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 测试专用留档收集器：让单测能断言"业务调用链确实留档了一次"，
+    /// 而不只是断言格式化结果。生产路径不使用它。
+    static HISTORY_SINK: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 测试专用：记录一次留档调用（生产为空操作）
+pub fn record_history_for_test(message: &str) {
+    #[cfg(test)]
+    HISTORY_SINK.with(|s| s.borrow_mut().push(message.to_string()));
+    #[cfg(not(test))]
+    let _ = message;
+}
+
+/// 测试专用：取出并清空当前线程收集到的留档
+#[cfg(test)]
+pub fn take_history_sink() -> Vec<String> {
+    HISTORY_SINK.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+/// 历史留档目录（对齐原工程 `WriteLog::RecordHistory` 的 `History/` 目录）
+pub fn history_dir() -> PathBuf {
+    crate::paths::config_dir().join("History")
+}
+
+/// 崩溃转储目录（minidump 与崩溃报告）
+pub fn crashes_dir() -> PathBuf {
+    crate::paths::config_dir().join("Crashes")
+}
+
+/// 日志/留档文件写入串行锁：原工程 `WriteLog` 用 `writtingLock` 串行化
+/// 「判空→写 BOM→追加」全过程；V2 若不加锁，多线程同日首次写入会写出两个 BOM。
+static FILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 单行格式，与原工程 `WriteLog` 逐字对齐
+pub fn format_line(time: &str, level: LogLevel, message: &str) -> String {
+    format!("[{}]:[{}] {}\n", time, level.as_str(), message)
+}
+
+/// 把可能来自外部的字段压成**单行**：CR/LF 转义为可见字符。
+///
+/// 普通诊断日志里混入换行会凭空造出看起来像 `[ERROR]` 的行，
+/// 让事后复盘读到并不存在的错误。History 是业务原文留档，不做此转义。
+pub fn sanitize_field(s: &str) -> String {
+    s.replace('\r', "\\r").replace('\n', "\\n")
+}
+
+/// 记录一条日志：写入内存环并落盘。
+///
+/// 内存环与文件写在同一串行临界区内决定顺序 —— 早期实现先入环、释放锁后再取文件锁，
+/// 两个线程会让内存与文件的先后次序相反。文件写失败不影响内存记录可见性，
+/// 且不递归调用日志本身（只静默忽略）。
 pub fn log(level: LogLevel, message: impl AsRef<str>) {
-    let msg = message.as_ref().to_string();
+    let msg = sanitize_field(message.as_ref());
     let now = chrono::Local::now();
     let time = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let date = now.format("%Y-%m-%d").to_string();
 
-    {
-        let mut st = match state().lock() {
-            Ok(s) => s,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if level > st.verbose_level {
-            return;
-        }
-        st.recent.push_back(LogEntry {
-            time: time.clone(),
-            level: level.as_str().to_string(),
-            message: msg.clone(),
-        });
-        while st.recent.len() > MAX_RECENT_ENTRIES {
-            st.recent.pop_front();
-        }
+    let mut st = match state().lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if level > st.verbose_level {
+        return;
+    }
+    // 先入内存环：即便随后写盘失败，内存记录也必须可见
+    st.recent.push_back(LogEntry {
+        time: time.clone(),
+        level: level.as_str().to_string(),
+        message: msg.clone(),
+    });
+    while st.recent.len() > MAX_RECENT_ENTRIES {
+        st.recent.pop_front();
     }
 
     let line = format_line(&time, level, &msg);
     // 测试构建不落盘，避免污染仓库数据目录；落盘路径由 append_line 单测覆盖
     #[cfg(not(test))]
-    let _ = append_line(&logs_dir(), &date, &line);
+    {
+        // 锁序恒为 LOGGER → FILE_WRITE_LOCK，不存在反向获取
+        let _ = append_line(&logs_dir(), &date, &line);
+    }
     #[cfg(test)]
     let _ = (&date, &line);
 }
@@ -246,8 +289,17 @@ pub fn format_crash_report(message: &str, location: &str, backtrace: &str) -> St
 
 /// 写出崩溃报告文件，返回路径（失败返回 None）
 pub fn write_crash_report(message: &str, location: &str, backtrace: &str) -> Option<PathBuf> {
-    let dir = crashes_dir();
-    fs::create_dir_all(&dir).ok()?;
+    write_crash_report_at(&crashes_dir(), message, location, backtrace)
+}
+
+/// 崩溃报告写入的实际实现（目录可注入，便于单测断言"确实写成功"而不依赖真实数据目录）
+pub fn write_crash_report_at(
+    dir: &Path,
+    message: &str,
+    location: &str,
+    backtrace: &str,
+) -> Option<PathBuf> {
+    fs::create_dir_all(dir).ok()?;
     let path = dir.join(format!(
         "crash-{}.txt",
         chrono::Local::now().format("%Y%m%d-%H%M%S")
@@ -482,13 +534,102 @@ mod tests {
         assert!(report.contains("src/main.rs:1:1"));
         assert!(report.contains("backtrace-line"));
 
-        // write_crash_report 依赖 paths::config_dir()，仅验证其返回文件存在且内容可读
-        if let Some(path) = write_crash_report("测试 panic", "src/main.rs:1:1", "bt") {
-            let text = fs::read_to_string(&path).unwrap();
-            assert!(text.contains("测试 panic"));
-            let _ = fs::remove_file(&path);
-        }
+        // 写入隔离临时目录并**断言确实写成功**：早期测试写到真实数据目录，
+        // 写失败时静默"通过"，等于崩溃报告能力无人守护
+        let dir = std::env::temp_dir().join("mh_test_crash_report");
+        let _ = fs::remove_dir_all(&dir);
+        let path = write_crash_report_at(&dir, "测试 panic", "src/main.rs:1:1", "bt")
+            .expect("崩溃报告必须写入成功");
+        assert!(path.is_file(), "报告文件应存在: {:?}", path);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("测试 panic"));
+        assert!(text.contains("bt"));
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "只应产生一个报告文件"
+        );
+        let _ = fs::remove_dir_all(&dir);
         println!("[PASS] test_crash_report_format_and_write passed");
+    }
+
+    // ---------------- F3：诊断日志脱敏与同序 ----------------
+
+    /// 外部字段里的 CR/LF 必须被压成单行，不得凭空造出看起来像 `[ERROR]` 的行
+    #[test]
+    fn test_sanitize_field_prevents_forged_log_lines() {
+        assert_eq!(sanitize_field("正常一行"), "正常一行");
+        assert_eq!(sanitize_field("a\r\nb"), "a\\r\\nb");
+        assert_eq!(sanitize_field("a\n[2026-01-01 00:00:00]:[ERROR] 伪造"), "a\\n[2026-01-01 00:00:00]:[ERROR] 伪造");
+
+        // 经 format_line 后仍是单行
+        let line = format_line("2026-09-19 10:00:00", LogLevel::Info, &sanitize_field("x\ny"));
+        assert_eq!(line.matches('\n').count(), 1, "只应保留结尾那个换行: {:?}", line);
+        println!("[PASS] test_sanitize_field_prevents_forged_log_lines passed");
+    }
+
+    /// 内存环与落盘文件必须**同序**：两线程交替写入后，两边顺序完全一致
+    #[test]
+    fn test_ring_and_file_keep_same_order_under_concurrency() {
+        let dir = std::env::temp_dir().join("mh_test_log_order");
+        let _ = fs::remove_dir_all(&dir);
+        clear_recent();
+
+        let marker = format!("order-{}", std::process::id());
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let d = dir.clone();
+            let m = marker.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..10 {
+                    let msg = format!("{}-t{}-i{}", m, t, i);
+                    let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    // 与 log() 相同的临界区：先入环，再在持锁状态下写盘
+                    {
+                        let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+                        st.recent.push_back(LogEntry {
+                            time: time.clone(),
+                            level: "INFO".into(),
+                            message: msg.clone(),
+                        });
+                        while st.recent.len() > MAX_RECENT_ENTRIES {
+                            st.recent.pop_front();
+                        }
+                        let line = format_line(&time, LogLevel::Info, &msg);
+                        append_line(&d, &date, &line).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 内存环里本线程产生的条目顺序
+        let ring: Vec<String> = recent_entries(usize::MAX, Some(LogLevel::Info))
+            .into_iter()
+            .filter(|e| e.message.starts_with(&marker))
+            .map(|e| e.message)
+            .collect();
+        // 文件里的顺序
+        let mut file_lines: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            let text = fs::read_to_string(entry.path()).unwrap();
+            for l in text.lines() {
+                if let Some(pos) = l.find(&marker) {
+                    file_lines.push(l[pos..].to_string());
+                }
+            }
+        }
+
+        assert_eq!(ring.len(), 40, "内存环应记录全部 40 条");
+        assert_eq!(file_lines.len(), 40, "文件应记录全部 40 条");
+        assert_eq!(ring, file_lines, "内存环与文件的先后顺序必须完全一致");
+
+        let _ = fs::remove_dir_all(&dir);
+        clear_recent();
+        println!("[PASS] test_ring_and_file_keep_same_order_under_concurrency passed");
     }
 
     #[test]

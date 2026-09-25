@@ -4,14 +4,19 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import {
   QueueItem,
+  QueueSnapshot,
+  QueuePersistence,
   AppConfig,
   UserSearchItem,
   UserProfile,
   BatchCheckinResult,
   CredentialsStatus,
+  CheckinStatus,
+  CheckinUnavailablePayload,
   ConnectionStatusPayload,
   MonsterDict,
   RosterData,
+  RosterSnapshot,
 } from "../types";
 import { VirtualList } from "../components/VirtualList";
 import { MarqueeText } from "../components/MarqueeText";
@@ -67,13 +72,23 @@ export const MainWindow: React.FC = () => {
   // 编译期形态常量（vite --mode lite 注入）：完整版 false / Lite 版 true，运行期不可切换
   const isLite = __IS_LITE__;
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+  /** 拖拽起点：记 user_id 而不是下标 —— 拖动期间队列可能被弹幕改动，下标会漂移 */
+  const [draggedUserId, setDraggedUserId] = useState<string | null>(null);
+  /** 最近应用的权威快照（版本 + 落盘状态），所有队列写入都必须经由 applyQueueSnapshot */
+  const queueSnapRef = useRef<QueueSnapshot>({ items: [], revision: 0, persistence: "Saved" });
+  /** 磁盘落盘异常提示（内存已更新、磁盘待重试），成功后自动收起 */
+  const [queueSaveWarning, setQueueSaveWarning] = useState(false);
 
   // 怪物字典与禁点名单（名单内的怪不可被点：弹幕点怪与选怪面板共享同一份约束）
   const [monsterDict, setMonsterDict] = useState<MonsterDict>({});
   const [roster, setRoster] = useState<RosterData>({ items: [] });
   const [orderSubmitting, setOrderSubmitting] = useState(false);
   const rosterRef = useRef<RosterData>({ items: [] });
+  /** 后端名单版本（CAS 用）：提交时带上，旧版本会被后端拒绝 */
+  const rosterRevRef = useRef<number>(0);
+  /** 只允许一个 in-flight 整表提交；期间的新意图记在 latestIntent */
+  const rosterInFlightRef = useRef<boolean>(false);
+  const rosterLatestIntentRef = useRef<RosterData | null>(null);
   const rosterSaveTimerRef = useRef<number | null>(null);
 
   // B站直播连接五态状态机（D7）
@@ -105,6 +120,15 @@ export const MainWindow: React.FC = () => {
   // 敏感凭证加密托管状态
   const [credStatus, setCredStatus] = useState<CredentialsStatus | null>(null);
 
+  /** 打卡子系统可用性：冷启动读取快照，不依赖 setup 阶段可能丢失的单次事件 */
+  const [checkinStatus, setCheckinStatus] = useState<CheckinStatus | null>(null);
+  /** 运行期打卡不可用提示（数据库故障或 Lite 停用），由 checkin-unavailable 事件驱动 */
+  const [checkinDownMsg, setCheckinDownMsg] = useState<string | null>(null);
+
+  /** 缺失资源：事件与冷启动快照按名合并去重（F2） */
+  const [missingResources, setMissingResources] = useState<string[]>([]);
+  const missingRef = useRef<Set<string>>(new Set());
+
   // 通知消息
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
@@ -122,10 +146,27 @@ export const MainWindow: React.FC = () => {
     }
   };
 
+  /**
+   * 队列写入唯一入口（轮询、事件、IPC 成功回调都走这里）。
+   *
+   * 版本检查必须在**所有**路径生效，否则一个迟到的旧命令返回值就能把 UI 拉回旧队列：
+   * - 旧 revision 的快照直接丢弃（弹幕新单不会从界面上消失）；
+   * - 同 revision 只允许 `PendingRetry → Saved` 推进，迟到的失败状态不得盖回成功。
+   */
+  const applyQueueSnapshot = (snap: QueueSnapshot) => {
+    const prev = queueSnapRef.current;
+    if (snap.revision < prev.revision) return;
+    if (snap.revision === prev.revision && prev.persistence === "Saved" && snap.persistence === "PendingRetry") {
+      return;
+    }
+    queueSnapRef.current = snap;
+    setQueue(snap.items);
+    setQueueSaveWarning(snap.persistence === "PendingRetry");
+  };
+
   const fetchQueue = async () => {
     try {
-      const items = await invoke<QueueItem[]>("get_queue");
-      setQueue(items);
+      applyQueueSnapshot(await invoke<QueueSnapshot>("get_queue"));
     } catch (e) {
       console.error(e);
     }
@@ -177,11 +218,21 @@ export const MainWindow: React.FC = () => {
     }
   };
 
+  /** 打卡可用性快照：Lite 显示「按构建形态已停用」，完整版显示可用或数据库故障 */
+  const fetchCheckinStatus = async () => {
+    try {
+      setCheckinStatus(await invoke<CheckinStatus>("get_checkin_status"));
+    } catch (e) {
+      console.error("获取打卡状态异常:", e);
+    }
+  };
+
   useEffect(() => {
     fetchQueue();
     fetchConfig();
     fetchBiliStatus();
     fetchCredentialsStatus();
+    fetchCheckinStatus();
     fetchCurrentEngine();
     fetchOverlayLocked();
     fetchMonsterDict();
@@ -198,9 +249,17 @@ export const MainWindow: React.FC = () => {
       fetchCurrentEngine();
     }, 2500);
 
-    const unlistenQueue = listen<QueueItem[]>("queue-updated", (event) => {
-      setQueue(event.payload);
+    const unlistenQueue = listen<QueueSnapshot>("queue-updated", (event) => {
+      applyQueueSnapshot(event.payload);
     });
+
+    // 落盘状态边沿事件：同 revision 的 PendingRetry/Saved 切换也要即时反映
+    const unlistenPersist = listen<{ persistence: QueuePersistence }>(
+      "queue-persistence-changed",
+      (event) => {
+        setQueueSaveWarning(event.payload.persistence === "PendingRetry");
+      },
+    );
 
     // D7 五态连接状态
     const unlistenConn = listen<ConnectionStatusPayload>("connection-state-changed", (event) => {
@@ -225,10 +284,26 @@ export const MainWindow: React.FC = () => {
       fetchConfig();
     });
 
-    // D5 资源缺失提示（原运行日志页告警卡片改为主窗口即时 Toast）
+    // 打卡数据不可持久化：运行期数据库故障时也必须可见
+    const unlistenCheckinDown = __IS_LITE__
+      ? Promise.resolve(() => {})
+      : listen<CheckinUnavailablePayload>("checkin-unavailable", (event) => {
+          setCheckinDownMsg(event.payload.message);
+        });
+
+    // D5/F2 资源缺失提示：事件按名去重合并，且必须与冷启动快照合并 ——
+    // `resource-missing` 只在 setup 阶段 emit 一次，挂载晚于 setup 时会永久丢失
+    const reportMissing = (name: string) => {
+      if (!name || missingRef.current.has(name)) return;
+      missingRef.current.add(name);
+      setMissingResources([...missingRef.current]);
+    };
     const unlistenMissing = listen<string>("resource-missing", (event) => {
-      showToast(`资源缺失：${event.payload}（相关功能将降级运行）`);
+      reportMissing(event.payload);
     });
+    invoke<string[]>("get_missing_resources")
+      .then((list) => list.forEach(reportMissing))
+      .catch((e) => console.error("获取资源缺失快照异常:", e));
 
     return () => {
       clearInterval(interval);
@@ -236,6 +311,8 @@ export const MainWindow: React.FC = () => {
         window.clearTimeout(rosterSaveTimerRef.current);
       }
       unlistenQueue.then((f) => f());
+      unlistenPersist.then((f) => f());
+      unlistenCheckinDown.then((f) => f());
       unlistenConn.then((f) => f());
       unlistenCheckin.then((f) => f());
       unlistenLock.then((f) => f());
@@ -262,9 +339,10 @@ export const MainWindow: React.FC = () => {
 
   const fetchRoster = async () => {
     try {
-      const data = await invoke<RosterData>("get_monster_roster");
-      rosterRef.current = data;
-      setRoster(data);
+      const snap = await invoke<RosterSnapshot>("get_monster_roster");
+      rosterRef.current = snap.data;
+      rosterRevRef.current = snap.revision;
+      setRoster(snap.data);
     } catch (e) {
       console.error("获取禁点名单异常:", e);
     }
@@ -275,9 +353,15 @@ export const MainWindow: React.FC = () => {
     await Promise.all([fetchMonsterDict(), fetchRoster()]);
   };
 
-  /** 名单变更：本地乐观更新 + 300ms 防抖整表落盘；失败回滚并提示 */
+  /**
+   * 名单变更：本地乐观更新 + 300ms 防抖整表落盘。
+   *
+   * - 已发出的 IPC 不能用 clearTimeout 撤回，因此只允许**一个 in-flight 提交**；
+   *   期间的新意图记为 latestIntent，提交成功后用返回版本继续提交。
+   * - 提交带 expectedRevision（CAS）：旧请求被后端拒绝时**不无条件回滚旧画面**，
+   *   而是取回后端权威快照（可能已被字典改名/删除联动过）。
+   */
   const commitRoster = (next: RosterData, immediate = false) => {
-    const prev = rosterRef.current;
     rosterRef.current = next;
     setRoster(next);
     if (rosterSaveTimerRef.current !== null) {
@@ -286,12 +370,29 @@ export const MainWindow: React.FC = () => {
 
     const persist = async () => {
       rosterSaveTimerRef.current = null;
+      if (rosterInFlightRef.current) {
+        // 只保留最新意图，避免并发整表提交互相覆盖
+        rosterLatestIntentRef.current = next;
+        return;
+      }
+      rosterInFlightRef.current = true;
       try {
-        await invoke("set_monster_roster", { data: next });
+        let intent: RosterData | null = next;
+        while (intent) {
+          rosterLatestIntentRef.current = null;
+          const snap = await invoke<RosterSnapshot>("set_monster_roster", {
+            data: intent,
+            expectedRevision: rosterRevRef.current,
+          });
+          rosterRevRef.current = snap.revision;
+          intent = rosterLatestIntentRef.current;
+        }
       } catch (err) {
-        rosterRef.current = prev;
-        setRoster(prev);
-        showToast(`名单保存失败，已回滚: ${err}`);
+        showToast(`名单保存失败：${err}`);
+        // 失败后以后端权威快照为准，不用可能已过期的本地快照覆盖
+        await fetchRoster();
+      } finally {
+        rosterInFlightRef.current = false;
       }
     };
 
@@ -346,12 +447,12 @@ export const MainWindow: React.FC = () => {
     }
   };
 
-  /** 选怪面板入队（与弹幕点怪写入同一条队列） */
+  /** 选怪面板入队（与弹幕点怪写入同一条队列；按原名精确取键 + 后端禁点校验） */
   const handlePickerOrder = async (payload: PickerOrderPayload) => {
     setOrderSubmitting(true);
     try {
       const name = payload.userName || "房管";
-      const updated = await invoke<QueueItem[]>("add_order", {
+      const snap = await invoke<QueueSnapshot>("add_picked_order", {
         userId: `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         userName: name,
         monsterName: payload.monsterName,
@@ -359,10 +460,14 @@ export const MainWindow: React.FC = () => {
         guardLevel: payload.guardLevel,
         temperedLevel: payload.temperedLevel,
       });
-      setQueue(updated);
-      showToast(`${name} 点怪 ${payload.monsterName} 已入队${payload.isPriority ? "（优先置前）" : ""}`);
+      applyQueueSnapshot(snap);
+      // Toast 只报后端实际确认的条目，不复述未校验的请求文案
+      const confirmed = snap.items.find((i) => i.user_name === name)?.monster_name ?? payload.monsterName;
+      showToast(`${name} 点怪 ${confirmed} 已入队${payload.isPriority ? "（优先置前）" : ""}`);
     } catch (err) {
+      // 禁点/未知怪物等都在这里被后端拒绝
       showToast(`加入排队失败: ${err}`);
+      await fetchRoster();
     } finally {
       setOrderSubmitting(false);
     }
@@ -370,8 +475,7 @@ export const MainWindow: React.FC = () => {
 
   const handleDelete = async (userId: string) => {
     try {
-      const updated = await invoke<QueueItem[]>("dequeue_by_user_id", { userId });
-      setQueue(updated);
+      applyQueueSnapshot(await invoke<QueueSnapshot>("dequeue_by_user_id", { userId }));
       showToast("已完成条目并保序出队");
     } catch (e) {
       console.error(e);
@@ -381,17 +485,16 @@ export const MainWindow: React.FC = () => {
   const handleClear = async () => {
     if (!(await askConfirm("确认清空当前点单排队队列吗？", "清空队列"))) return;
     try {
-      await invoke("clear_queue");
-      setQueue([]);
+      applyQueueSnapshot(await invoke<QueueSnapshot>("clear_queue"));
       showToast("队列已清空");
     } catch (e) {
       console.error(e);
     }
   };
 
-  // 控制台条目拖拽排序
-  const handleItemDragStart = (e: React.DragEvent, index: number) => {
-    setDraggedIndex(index);
+  // 控制台条目拖拽排序：按下标取元素只用于渲染，提交时一律换算成 user_id 顺序
+  const handleItemDragStart = (e: React.DragEvent, userId: string) => {
+    setDraggedUserId(userId);
     e.dataTransfer.effectAllowed = "move";
   };
 
@@ -402,23 +505,31 @@ export const MainWindow: React.FC = () => {
 
   const handleItemDrop = async (e: React.DragEvent, targetIndex: number) => {
     e.preventDefault();
-    if (draggedIndex === null || draggedIndex === targetIndex) {
-      setDraggedIndex(null);
-      return;
-    }
+    const draggedId = draggedUserId;
+    setDraggedUserId(null);
+    if (draggedId === null) return;
+
+    // 按 user_id 定位当前下标：拖动期间弹幕可能已插入新单，拖动起点的下标不再可信
+    const fromIndex = queue.findIndex((i) => i.user_id === draggedId);
+    if (fromIndex < 0 || fromIndex === targetIndex) return;
 
     const nextQueue = [...queue];
-    const [moved] = nextQueue.splice(draggedIndex, 1);
+    const [moved] = nextQueue.splice(fromIndex, 1);
     nextQueue.splice(targetIndex, 0, moved);
 
-    setQueue(nextQueue);
-    setDraggedIndex(null);
-
     try {
-      await invoke("reorder_queue", { items: nextQueue });
+      // 只提交「预期版本 + 用户 ID 顺序」：后端按 ID 从当前条目重组，
+      // 一次拖拽不可能删掉另一路新订单、复活完成单或撤回提权
+      const snap = await invoke<QueueSnapshot>("reorder_queue", {
+        orderedUserIds: nextQueue.map((i) => i.user_id),
+        expectedRevision: queueSnapRef.current.revision,
+      });
+      applyQueueSnapshot(snap);
       showToast("排队顺序已调整并同步保存！");
     } catch (err) {
       showToast(`排序更新失败: ${err}`);
+      // 冲突时取最新权威快照，提示主播重新拖动
+      await fetchQueue();
     }
   };
 
@@ -545,9 +656,14 @@ export const MainWindow: React.FC = () => {
     try {
       const status = await invoke<CredentialsStatus>("import_credentials_file");
       setCredStatus(status);
-      showToast("凭据导入成功，已即时生效");
+      // 「即时生效」只对**下一次连接**成立：运行中的长连以值持有旧凭据，
+      // 因此活动会话期间后端会直接拒绝导入
+      showToast("凭据导入成功：下次连接将使用新凭据（现有连接不会被切换）");
+      fetchBiliStatus();
     } catch (err) {
       showToast(`凭据导入失败: ${err}`);
+      // 失败后以权威状态为准（可能因发布失败进入暂禁开播状态）
+      fetchCredentialsStatus();
     }
   };
 
@@ -602,6 +718,35 @@ export const MainWindow: React.FC = () => {
       {toastMsg && (
         <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-amber-500/90 text-black font-bold px-4 py-2 rounded-xl shadow-2xl backdrop-blur animate-in fade-in slide-in-from-top-4 duration-200">
           {toastMsg}
+        </div>
+      )}
+
+      {/* 队列磁盘落盘异常：内存已更新但尚未确认落盘，退出一律提示而不是谎报成功 */}
+      {queueSaveWarning && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 bg-red-600/95 text-white text-xs font-bold px-4 py-2 rounded-xl shadow-2xl">
+          队列已更新，但写入磁盘失败，正在自动重试（请检查磁盘空间与目录权限）
+        </div>
+      )}
+
+      {/* 打卡不可用常驻告警：Lite 形态为预期行为，完整版为数据库故障（核心点怪不受影响） */}
+      {checkinStatus && !checkinStatus.available && !isLite && (
+        <div className="fixed top-28 left-1/2 -translate-x-1/2 z-50 max-w-2xl bg-red-700/95 text-white text-xs font-bold px-4 py-2 rounded-xl shadow-2xl">
+          打卡不可持久化：{checkinDownMsg ?? checkinStatus.message}
+        </div>
+      )}
+
+      {/* 双库冲突常驻告警：另一份打卡库未展示、未删除 */}
+      {checkinStatus?.available && checkinStatus.has_shadow_db && (
+        <div className="fixed top-28 left-1/2 -translate-x-1/2 z-50 max-w-2xl bg-amber-600/95 text-black text-xs font-bold px-4 py-2 rounded-xl shadow-2xl">
+          检测到两份打卡库：本次使用「{checkinStatus.active_db_file}」，另一份既未展示也未删除。
+          请勿删除任何文件，退出应用后备份整个数据目录再离线合并。
+        </div>
+      )}
+
+      {/* 资源缺失常驻告警：合并事件与冷启动快照，按名去重 */}
+      {missingResources.length > 0 && (
+        <div className="fixed top-40 left-1/2 -translate-x-1/2 z-50 max-w-2xl bg-amber-700/95 text-white text-xs font-bold px-4 py-2 rounded-xl shadow-2xl">
+          资源缺失：{missingResources.join("、")}（相关功能将降级运行）
         </div>
       )}
 
@@ -812,12 +957,12 @@ export const MainWindow: React.FC = () => {
                           <div
                             key={item.id}
                             draggable
-                            onDragStart={(e) => handleItemDragStart(e, idx)}
+                            onDragStart={(e) => handleItemDragStart(e, item.user_id)}
                             onDragOver={handleItemDragOver}
                             onDrop={(e) => handleItemDrop(e, idx)}
                             style={{ height: QUEUE_ROW_HEIGHT - 8, marginBottom: 8 }}
                             className={`flex items-center justify-between p-2.5 rounded-xl border transition-all select-none ${
-                              draggedIndex === idx ? "opacity-40 scale-95 border-dashed border-amber-400" : ""
+                              draggedUserId === item.user_id ? "opacity-40 scale-95 border-dashed border-amber-400" : ""
                             } ${
                               item.tempered_level === 2
                                 ? "bg-gradient-to-r from-orange-950/50 via-red-950/30 to-black/60 border-orange-500/80 arch-tempered-glow text-orange-200"

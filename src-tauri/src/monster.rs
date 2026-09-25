@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// 单个怪物配置数据
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MonsterConfig {
     #[serde(rename = "默认历战等级", default)]
     pub default_tempered_level: i32,
@@ -54,6 +54,9 @@ impl Default for MonsterInner {
 /// 内部状态以 `RwLock` 承载：匹配是读多写少的热路径，而字典编辑（增删条目）需要运行期热重载
 pub struct MonsterDataManager {
     inner: RwLock<MonsterInner>,
+    /// 低频编辑互斥锁：串行化"读文件 → 校验 → 修改 → 写盘 → 提交"整段，
+    /// 避免两个编辑各自基于旧文件写回而互相覆盖。匹配热路径不经过它。
+    edit_lock: Mutex<()>,
 }
 
 impl Default for MonsterDataManager {
@@ -66,6 +69,7 @@ impl MonsterDataManager {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(MonsterInner::default()),
+            edit_lock: Mutex::new(()),
         }
     }
 
@@ -172,11 +176,19 @@ impl MonsterDataManager {
     }
 
     /// 编辑字典并写回，成功后热重载匹配器。
-    /// 内存数据在落盘成功前保持不变 —— 任一步失败即等同回滚
+    /// 内存数据在落盘成功前保持不变 —— 任一步失败即等同回滚。
+    ///
+    /// 整个「读当前文件 → 校验 → 修改 → 写盘 → 热重载提交」在**同一把编辑锁**内完成：
+    /// 两个编辑不会各自基于旧文件写回、互相覆盖（匹配热路径仍只短暂读 `RwLock`）。
     pub fn edit_and_save<F>(&self, path: &Path, mutate: F) -> Result<usize, String>
     where
         F: FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<(), String>,
     {
+        let _edit_guard = self
+            .edit_lock
+            .lock()
+            .map_err(|_| "字典编辑锁异常".to_string())?;
+
         let mut raw = Self::read_ordered_dict(path)?;
         mutate(&mut raw)?;
 
@@ -287,6 +299,72 @@ impl MonsterDataManager {
     /// 获取所有怪物列表元数据
     pub fn get_all_monsters(&self) -> HashMap<String, MonsterConfig> {
         self.read_inner().monsters.clone()
+    }
+
+    /// 字典条目写入的**权威校验 + 落点**（在任何 `remove`/`insert` 之前判定）。
+    ///
+    /// 拒绝的三种情况：
+    /// - 新增时目标名已存在 → 会覆盖原条目的别称与图标；
+    /// - 改名时旧名已不存在 → 基于已过期的界面状态操作；
+    /// - 改名时目标名已存在 → 既覆盖别人的条目、又删掉旧条目。
+    ///
+    /// 原名不变的正常编辑允许通过。返回 `Err` 时调用方**不得**改动 `raw`。
+    /// 前端预检查只作提示，这里才是最后一道校验。
+    pub fn upsert_entry(
+        raw: &mut serde_json::Map<String, serde_json::Value>,
+        name: &str,
+        config: &MonsterConfig,
+        renamed_from: Option<&str>,
+    ) -> Result<(), String> {
+        match renamed_from {
+            // 改名：旧名必须在、目标名必须没被占用
+            Some(old) if old != name => {
+                if !raw.contains_key(old) {
+                    return Err(format!(
+                        "原名「{}」已不存在（可能已被其他编辑删除），请刷新后重试",
+                        old
+                    ));
+                }
+                if raw.contains_key(name) {
+                    return Err(format!(
+                        "已存在名为「{}」的怪物，改名会覆盖它的别称与图标，已拒绝",
+                        name
+                    ));
+                }
+                raw.remove(old);
+            }
+            // 原名不变的正常编辑：允许覆盖自身
+            Some(_) => {}
+            // 新增：目标名不得已存在
+            None => {
+                if raw.contains_key(name) {
+                    return Err(format!(
+                        "已存在名为「{}」的怪物，新增会覆盖它的别称与图标，已拒绝",
+                        name
+                    ));
+                }
+            }
+        }
+
+        raw.insert(
+            name.to_string(),
+            serde_json::to_value(config).map_err(|e| format!("条目序列化失败: {}", e))?,
+        );
+        Ok(())
+    }
+
+    /// **按原名精确取键**（只查 `inner.monsters`，不跑别名匹配）。
+    ///
+    /// 选怪面板展示的就是字典原名，因此选中后必须按原名取值：
+    /// 若改走 `match_monster`，别的怪只要把该原名登记成自己的别称，
+    /// 面板上明明点的是「黑龙」也会被换成另一只怪。
+    pub fn exact_entry(&self, name: &str) -> Option<MonsterMatchResult> {
+        let inner = self.read_inner();
+        inner.monsters.get(name).map(|cfg| MonsterMatchResult {
+            monster_name: name.to_string(),
+            tempered_level: cfg.default_tempered_level,
+            icon_url: cfg.icon_url.clone(),
+        })
     }
 }
 
@@ -606,5 +684,206 @@ mod tests {
             "[PASS] test_icon_urls_resolve_to_real_files passed ({} 个条目图标全部就位)",
             mgr.get_all_monsters().len()
         );
+    }
+
+    // ---------------- B1：同名/撞名必须拒绝 ----------------
+
+    /// 隔离的临时字典：复制真实词库做副本，绝不对项目真实 monster_list.json 做破坏性测试
+    fn temp_dict(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mh_test_monster_{}", tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = MonsterDataManager::find_monster_list_path();
+        let dst = dir.join("monster_list.json");
+        std::fs::copy(&src, &dst).expect("应能复制真实词库作为测试副本");
+        (dir, dst)
+    }
+
+    fn cfg(tempered: i32, icon: &str, nicknames: &[&str]) -> MonsterConfig {
+        MonsterConfig {
+            default_tempered_level: tempered,
+            icon_url: icon.to_string(),
+            nicknames: nicknames.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// 新增一个已存在的原名必须被拒绝，且文件字节与内存状态不变
+    #[test]
+    fn test_upsert_rejects_existing_name_on_add() {
+        let (dir, path) = temp_dict("dup_add");
+        let mut mgr = MonsterDataManager::new();
+        mgr.load_from_file(Some(&path)).unwrap();
+
+        let before_bytes = std::fs::read(&path).unwrap();
+        // 「黑龙」是出厂词库里真实存在的条目
+        let original = mgr.get_all_monsters().get("黑龙").cloned().expect("应存在黑龙");
+        assert!(!original.nicknames.is_empty(), "出厂黑龙应带有别称");
+
+        let err = mgr
+            .edit_and_save(&path, |raw| {
+                MonsterDataManager::upsert_entry(
+                    raw,
+                    "黑龙",
+                    &cfg(0, "", &[]),
+                    None,
+                )
+            })
+            .expect_err("新增已存在的原名必须被拒绝");
+        assert!(err.contains("已存在名为"), "{}", err);
+
+        // 文件与内存都不得被改动
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes, "拒绝后文件字节必须不变");
+        let after = mgr.get_all_monsters().get("黑龙").cloned().unwrap();
+        assert_eq!(after, original, "拒绝后内存条目必须不变（别称与图标不得被空草稿取代）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_upsert_rejects_existing_name_on_add passed");
+    }
+
+    /// 改名撞上另一个已有原名必须被拒绝（否则会覆盖别人并删掉自己）
+    #[test]
+    fn test_upsert_rejects_rename_into_existing_name() {
+        let (dir, path) = temp_dict("dup_rename");
+        let mut mgr = MonsterDataManager::new();
+        mgr.load_from_file(Some(&path)).unwrap();
+
+        let names: Vec<String> = mgr.get_all_monsters().keys().cloned().collect();
+        assert!(names.len() >= 2, "词库应至少两条");
+        let target = mgr.get_all_monsters().get("黑龙").cloned().unwrap();
+        let before_bytes = std::fs::read(&path).unwrap();
+
+        // 把「雌火龙」改名为「黑龙」
+        let victim = "雌火龙";
+        assert!(mgr.get_all_monsters().contains_key(victim), "词库应存在雌火龙");
+        let err = mgr
+            .edit_and_save(&path, |raw| {
+                MonsterDataManager::upsert_entry(raw, "黑龙", &cfg(0, "", &[]), Some(victim))
+            })
+            .expect_err("改名撞名必须被拒绝");
+        assert!(err.contains("已存在名为"), "{}", err);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+        let all = mgr.get_all_monsters();
+        assert_eq!(all.get("黑龙").cloned().unwrap(), target, "被撞的条目不得被覆盖");
+        assert!(all.contains_key(victim), "改名失败后原条目必须保留（不得凭空删掉一条）");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_upsert_rejects_rename_into_existing_name passed");
+    }
+
+    /// 改名时旧名已被删除必须被拒绝（基于过期界面状态的操作不得生效）
+    #[test]
+    fn test_upsert_rejects_rename_when_original_missing() {
+        let (dir, path) = temp_dict("rename_missing");
+        let mut mgr = MonsterDataManager::new();
+        mgr.load_from_file(Some(&path)).unwrap();
+
+        let before_bytes = std::fs::read(&path).unwrap();
+        let err = mgr
+            .edit_and_save(&path, |raw| {
+                MonsterDataManager::upsert_entry(
+                    raw,
+                    "全新名字",
+                    &cfg(0, "", &[]),
+                    Some("这个怪早就不在了"),
+                )
+            })
+            .expect_err("旧名不存在时必须拒绝");
+        assert!(err.contains("已不存在"), "{}", err);
+        assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+        assert!(mgr.get_all_monsters().get("全新名字").is_none(), "不得凭空新增条目");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_upsert_rejects_rename_when_original_missing passed");
+    }
+
+    /// 原名不变的正常编辑必须放行；两个编辑依次改不同条目都保留
+    #[test]
+    fn test_upsert_allows_normal_edit_and_sequential_edits() {
+        let (dir, path) = temp_dict("normal_edit");
+        let mut mgr = MonsterDataManager::new();
+        mgr.load_from_file(Some(&path)).unwrap();
+        let before_count = mgr.get_all_monsters().len();
+
+        // 原名不变：改别称与图标
+        mgr.edit_and_save(&path, |raw| {
+            MonsterDataManager::upsert_entry(
+                raw,
+                "黑龙",
+                &cfg(2, "MHRise/MHRS-BlackDragon_Icon.png", &["小黑龙"]),
+                Some("黑龙"),
+            )
+        })
+        .expect("原名不变的编辑应放行");
+        assert_eq!(
+            mgr.get_all_monsters().len(),
+            before_count,
+            "原名不变的编辑不得增减条目"
+        );
+        assert_eq!(mgr.get_all_monsters()["黑龙"].default_tempered_level, 2);
+        assert!(mgr.match_monster("小黑龙").is_some(), "新别称应立即可匹配");
+
+        // 第二个编辑改另一个条目：不得丢掉第一个编辑的结果
+        mgr.edit_and_save(&path, |raw| {
+            MonsterDataManager::upsert_entry(
+                raw,
+                "新怪甲",
+                &cfg(0, "", &["新怪甲别称"]),
+                None,
+            )
+        })
+        .expect("新增未占用的名字应放行");
+        assert!(mgr.get_all_monsters().contains_key("新怪甲"));
+        assert!(mgr.get_all_monsters()["黑龙"].nicknames.contains(&"小黑龙".to_string()));
+
+        // 改名到未占用的名字：旧条目被移除、新条目出现
+        mgr.edit_and_save(&path, |raw| {
+            MonsterDataManager::upsert_entry(raw, "新怪乙", &cfg(0, "", &[]), Some("新怪甲"))
+        })
+        .expect("改名到未占用的名字应放行");
+        assert!(!mgr.get_all_monsters().contains_key("新怪甲"));
+        assert!(mgr.get_all_monsters().contains_key("新怪乙"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_upsert_allows_normal_edit_and_sequential_edits passed");
+    }
+
+    // ---------------- B2：选怪面板按原名精确取键 ----------------
+
+    /// 别的怪把某个原名登记成自己的别称时，面板仍必须精确点中该原名对应的怪
+    #[test]
+    fn test_exact_entry_ignores_alias_hijack() {
+        let (dir, path) = temp_dict("exact_entry");
+        let mut mgr = MonsterDataManager::new();
+        mgr.load_from_file(Some(&path)).unwrap();
+
+        // 给「雌火龙」加上只属于它自己的别称「太太」，使其成为「黑龙」原文的别名命中者
+        let mut fire = mgr.get_all_monsters()["雌火龙"].clone();
+        fire.nicknames.push("黑龙".to_string());
+        mgr.edit_and_save(&path, |raw| {
+            MonsterDataManager::upsert_entry(raw, "雌火龙", &fire, Some("雌火龙"))
+        })
+        .expect("给已有条目加别称应放行");
+
+        // 弹幕路径按别名匹配：可能命中排在前面的一方（这里只断言它与精确取值可能不同）
+        let matched = mgr.match_monster("黑龙").expect("别名匹配应命中");
+        // 面板路径按原名精确取键：必须仍然是黑龙本体
+        let picked = mgr.exact_entry("黑龙").expect("精确取键应命中黑龙");
+        assert_eq!(picked.monster_name, "黑龙", "面板不得被别名劫持到别的怪");
+        // 精确取键取的就是条目自身字段
+        assert_eq!(
+            picked.tempered_level,
+            mgr.get_all_monsters()["黑龙"].default_tempered_level
+        );
+        assert_eq!(picked.icon_url, mgr.get_all_monsters()["黑龙"].icon_url);
+        println!(
+            "[PASS] test_exact_entry_ignores_alias_hijack passed (别名匹配命中 {}, 面板精确命中 {})",
+            matched.monster_name, picked.monster_name
+        );
+
+        // 未知名字：精确取键必须返回 None（面板入口据此拒绝）
+        assert!(mgr.exact_entry("这个词库里没有的怪").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -20,8 +20,9 @@ use checkin::CheckinManager;
 use config::AppConfig;
 use credentials::{Credentials, CredentialsStatus};
 use monster::MonsterDataManager;
-use queue::{QueueItem, QueueManager};
+use queue::{QueueItem, QueueManager, QueuePersistence, QueueSnapshot};
 use roster::{MonsterRoster, RosterData};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -34,20 +35,101 @@ use tts::{TTSConfig, TTSEngineType, TTSManager};
 /// 运行期不可切换；release 编译下恒定 false/true 的分支会被整体消除。
 pub const IS_LITE: bool = cfg!(feature = "lite");
 
+/// 打卡子系统可用性状态（脱敏：只含原因码与提示文本，不含路径、凭据或用户数据）
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckinStatus {
+    /// 是否可持久化。false 时打卡/补签/点赞/GM 全部拒绝写入
+    pub available: bool,
+    /// 停用原因码：`None` / `LiteDisabled` / `DatabaseUnavailable`
+    pub reason_code: String,
+    /// 面向主播的提示文本
+    pub message: String,
+    /// 实际使用的库文件名（仅文件名；不可用时为 None）
+    pub active_db_file: Option<String>,
+    /// 是否存在另一份未展示、未删除的打卡库
+    pub has_shadow_db: bool,
+}
+
+impl CheckinStatus {
+    fn available(active_db_file: String, has_shadow_db: bool) -> Self {
+        Self {
+            available: true,
+            reason_code: "None".to_string(),
+            message: if has_shadow_db {
+                "打卡数据可持久化。检测到另一份打卡库未被展示（未删除），请查看日志并按提示离线合并。"
+                    .to_string()
+            } else {
+                "打卡数据可持久化".to_string()
+            },
+            active_db_file: Some(active_db_file),
+            has_shadow_db,
+        }
+    }
+
+    fn lite_disabled() -> Self {
+        Self {
+            available: false,
+            reason_code: "LiteDisabled".to_string(),
+            message: "Lite 形态按构建期设定已停用打卡功能".to_string(),
+            active_db_file: None,
+            has_shadow_db: false,
+        }
+    }
+
+    /// 数据库不可用：只带原因码与固定提示，不回显底层错误原文（可能含本机路径）
+    fn database_unavailable() -> Self {
+        Self {
+            available: false,
+            reason_code: "DatabaseUnavailable".to_string(),
+            message: "打卡数据库不可用，本次运行已停用打卡、补签与点赞奖卡。\
+                      核心点怪排队不受影响；请检查本机数据目录的读写权限与磁盘空间后重启。"
+                .to_string(),
+            active_db_file: None,
+            has_shadow_db: false,
+        }
+    }
+}
+
+/// 凭据权威快照：所有 `AppState` 克隆共享同一份。
+///
+/// 导入新凭据后必须**整体替换**这份快照 —— 早期实现把 `Arc<Credentials>` 固定在启动时的值，
+/// 于是连接、重连与状态轮询会一直用旧凭据 A，而界面与配置文件却显示 B。
+#[derive(Debug, Clone, Default)]
+pub struct CredentialState {
+    pub creds: Credentials,
+    /// 是否已从验签文件成功加载
+    pub loaded: bool,
+    /// 非 None 表示凭据处于"不可用/暂禁开播"状态（导入过程中内存发布失败等），
+    /// 保留原因供人工恢复，不用默认值继续开播
+    pub blocked_reason: Option<String>,
+}
+
 /// 全局运行状态（线程安全且支持克隆引用）
 #[derive(Clone)]
 pub struct AppState {
     pub queue_mgr: Arc<Mutex<QueueManager>>,
+    /// 队列磁盘唯一写者锁。锁序恒为 **queue_flush_lock → queue_mgr**：
+    /// 500ms 后台任务与所有强制保存命令都按此顺序取锁，任何持 queue_mgr 的代码都不得再请求刷盘。
+    pub queue_flush_lock: Arc<Mutex<()>>,
+    /// 最近一次刷盘是否处于失败状态：用于 `queue-persistence-changed` 的边沿事件，避免每 tick 重复广播
+    pub queue_persistence_broken: Arc<std::sync::atomic::AtomicBool>,
     pub monster_mgr: Arc<MonsterDataManager>,
     /// 点怪禁点名单（名单内的怪物不可被点单；弹幕与选怪面板共享同一份约束）
     pub roster: Arc<MonsterRoster>,
-    pub checkin_mgr: Arc<CheckinManager>,
+    pub checkin_mgr: Option<Arc<CheckinManager>>,
+    /// 打卡可用性状态：不可用时所有打卡入口据此拒绝写入并给出可见反馈
+    pub checkin_status: Arc<CheckinStatus>,
     /// 弹幕关键词学习器（jieba 分词）。生产环境在 run() 中注入；测试默认 None（学习链路将被跳过）
     pub checkin_learner: Option<Arc<CheckinLearner>>,
     pub tts_mgr: Arc<TTSManager>,
     pub ai_provider: Arc<DeepSeekAIChatProvider>,
     pub config: Arc<Mutex<AppConfig>>,
-    pub credentials: Arc<Credentials>,
+    /// 凭据权威快照（可变）：连接、状态展示、导入全部读同一份
+    pub credentials: Arc<std::sync::RwLock<CredentialState>>,
+    /// 会话 start／stop／import 共用的生命周期闸门（async 命令持有，跨 `.await`）
+    pub bili_lifecycle: Arc<tokio::sync::Mutex<()>>,
+    /// 凭据提交短锁：只覆盖"原子替换文件 → 发布内存快照 → 同步 AI/TTS"，**不含任何 `.await`**
+    pub credential_gate: Arc<Mutex<()>>,
     pub danmu_processor: Arc<bilibili::DanmuProcessor>,
     /// B 站长连五态状态机（替代原 bool 状态，D7）
     pub connection: Arc<Mutex<bilibili::ConnectionStatus>>,
@@ -56,6 +138,11 @@ pub struct AppState {
     pub overlay_locked: Arc<std::sync::atomic::AtomicBool>,
     /// 悬浮窗拖动待落盘位置（防抖后由后台任务写回配置 top_pos_x/y）
     pub pending_pos: Arc<Mutex<Option<(f64, f64)>>>,
+    /// 启动时缺失的资源名快照：`resource-missing` 事件只 emit 一次，
+    /// 挂载晚于 setup 的前端会丢掉它，故另提供可查询快照（按名去重合并展示）。
+    pub startup_missing: Arc<Vec<String>>,
+    /// 最近一次「打卡不可用」提示的时间戳（用于高频 LIKE 通道的节流）
+    pub last_checkin_unavailable_at: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl Default for AppState {
@@ -63,10 +150,14 @@ impl Default for AppState {
         let app_cfg = AppConfig::load(None);
 
         // 0. 加载原工程加密配置文件 credentials.dat
-        let creds = credentials::load_credentials(None).unwrap_or_else(|e| {
-            crate::log_warn!("加载 credentials.dat 失败: {}", e);
-            Credentials::default()
-        });
+        //    加载失败只表示"尚无可用凭据"，不阻断启动：核心点怪不依赖它
+        let (creds, creds_loaded) = match credentials::load_credentials(None) {
+            Ok(c) => (c, true),
+            Err(e) => {
+                crate::log_warn!("加载 credentials.dat 失败: {}", e);
+                (Credentials::default(), false)
+            }
+        };
 
         // 1. 初始化怪物别名匹配器
         let mut monster_mgr = MonsterDataManager::new();
@@ -86,9 +177,23 @@ impl Default for AppState {
         }
 
         // 3. 初始化打卡管理器
-        let checkin_mgr = CheckinManager::new(None).unwrap_or_else(|_| {
-            CheckinManager::new_in_memory().expect("In-memory SQLite initialization failed")
-        });
+        //    - Lite：完全不实例化（不探测路径、不建目录、不 open、不建表、不迁移）
+        //    - 完整版：库不可用时**显式停用**打卡子系统并保留可查询的错误状态。
+        //      绝不静默退回内存库：那会让打卡与卡片在界面上"成功"，重启后资产消失
+        let (checkin_mgr, checkin_status) = if IS_LITE {
+            (None, CheckinStatus::lite_disabled())
+        } else {
+            match CheckinManager::open_default() {
+                Ok((mgr, report)) => (
+                    Some(Arc::new(mgr)),
+                    CheckinStatus::available(report.active_file_name, report.has_shadow_db),
+                ),
+                Err(e) => {
+                    crate::log_error!("[Checkin] 打卡数据库不可用，已停用打卡子系统: {}", e);
+                    (None, CheckinStatus::database_unavailable())
+                }
+            }
+        };
 
         // 4. 初始化 TTS 管理器 (优先注入加密凭证中的 API Key)
         let mimo_key = if !creds.mimo_tts_api_key.is_empty() {
@@ -133,19 +238,30 @@ impl Default for AppState {
 
         Self {
             queue_mgr: Arc::new(Mutex::new(queue_mgr)),
+            queue_flush_lock: Arc::new(Mutex::new(())),
+            queue_persistence_broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             monster_mgr: Arc::new(monster_mgr),
             roster: Arc::new(roster),
-            checkin_mgr: Arc::new(checkin_mgr),
+            checkin_mgr,
+            checkin_status: Arc::new(checkin_status),
             checkin_learner: None,
             tts_mgr: Arc::new(tts_mgr),
             ai_provider: Arc::new(ai_provider),
             config: Arc::new(Mutex::new(app_cfg)),
-            credentials: Arc::new(creds),
+            credentials: Arc::new(std::sync::RwLock::new(CredentialState {
+                creds,
+                loaded: creds_loaded,
+                blocked_reason: None,
+            })),
+            bili_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            credential_gate: Arc::new(Mutex::new(())),
             danmu_processor: Arc::new(danmu_processor),
             connection: Arc::new(Mutex::new(bilibili::ConnectionStatus::default())),
             bili_service: Arc::new(bilibili::BiliLiveService::new()),
             overlay_locked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_pos: Arc::new(Mutex::new(None)),
+            startup_missing: Arc::new(Vec::new()),
+            last_checkin_unavailable_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 }
@@ -154,53 +270,222 @@ impl Default for AppState {
 // Tauri Commands
 // ---------------------------------------------------------------------------------
 
-/// 获取当前排队列表
-#[tauri::command]
-fn get_queue(state: State<'_, AppState>) -> Result<Vec<QueueItem>, String> {
-    let q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
-    Ok(q.items.clone())
+impl AppState {
+    /// 打卡子系统句柄。不可用时返回面向调用方的提示文本，
+    /// 调用方必须据此**拒绝写入**并给出可见反馈，不得伪造成功。
+    pub fn checkin(&self) -> Result<&Arc<CheckinManager>, String> {
+        match &self.checkin_mgr {
+            Some(m) => Ok(m),
+            None => Err(self.checkin_status.message.clone()),
+        }
+    }
+
+    pub fn checkin_available(&self) -> bool {
+        self.checkin_mgr.is_some()
+    }
+
+    /// 取凭据权威快照（连接、状态展示、导入全部读同一份）
+    pub fn credentials_snapshot(&self) -> CredentialState {
+        self.credentials
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 发布新凭据快照（导入成功后调用）
+    pub fn publish_credentials(&self, next: CredentialState) {
+        *self.credentials.write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+
+    /// 构造当前会话应使用的 B 站凭据。
+    /// 已验签的凭据文件优先；其字段为空时回退配置镜像（保持历史兼容）。
+    fn bili_credentials(&self, cfg: &AppConfig) -> bilibili::BiliCredentials {
+        let snap = self.credentials_snapshot();
+        let pick = |cred: &str, mirror: &str| -> String {
+            if !cred.is_empty() {
+                cred.to_string()
+            } else {
+                mirror.to_string()
+            }
+        };
+        bilibili::BiliCredentials {
+            app_id: pick(&snap.creds.app_id, &cfg.app_id),
+            access_key_id: pick(&snap.creds.access_key_id, &cfg.access_key_id),
+            access_key_secret: pick(&snap.creds.access_key_secret, &cfg.access_key_secret),
+            id_code: cfg.id_code.clone(),
+        }
+    }
 }
 
-/// 队列落盘（E2：失败记录告警而非静默吞错；内存队列保持可用）。
-/// 关键点：序列化在锁内完成，**磁盘写入在锁外执行**，避免持锁做 I/O 阻塞弹幕处理与 UI 命令。
-/// 单测构建不落盘 —— 避免 `cargo test` 污染真实 order_list.json（内存队列照常运作）
-fn flush_queue(state: &AppState, force: bool) {
+/// 打卡不可用时的统一反馈：向两个 WebView 广播一次脱敏事件，并做 ERROR 记录。
+///
+/// 调用方在返回前**必须**提前 return，不得落入普通 TTS 朗读或伪造成功气泡。
+/// `throttle=true` 用于高频 LIKE 通道：同一提示最多每 [`CHECKIN_UNAVAILABLE_THROTTLE_SECS`] 秒一次，
+/// 避免点赞刷屏时把日志与事件打爆；主窗口的常驻状态来自 `get_checkin_status`，不受节流影响。
+fn emit_checkin_unavailable(state: &AppState, app: Option<&AppHandle>) {
+    emit_checkin_unavailable_throttled(state, app, false)
+}
+
+fn emit_checkin_unavailable_throttled(state: &AppState, app: Option<&AppHandle>, throttle: bool) {
+    const CHECKIN_UNAVAILABLE_THROTTLE_SECS: i64 = 60;
+
+    let status = &state.checkin_status;
+    if throttle {
+        let now = chrono::Utc::now().timestamp();
+        let last = state
+            .last_checkin_unavailable_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now - last < CHECKIN_UNAVAILABLE_THROTTLE_SECS {
+            return;
+        }
+        state
+            .last_checkin_unavailable_at
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    crate::log_error!(
+        "[Checkin] 打卡子系统不可用（{}），已拒绝本次打卡/补签/奖卡请求",
+        status.reason_code
+    );
+    if let Some(handle) = app {
+        let _ = handle.emit(
+            "checkin-unavailable",
+            &serde_json::json!({
+                "reason_code": status.reason_code,
+                "message": status.message,
+            }),
+        );
+    }
+}
+
+/// 获取当前排队列表（权威快照：items + revision + 落盘状态）
+#[tauri::command]
+fn get_queue(state: State<'_, AppState>) -> Result<QueueSnapshot, String> {
+    let q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+    Ok(q.snapshot())
+}
+
+/// 队列落盘：进程内**唯一写者**。
+///
+/// 锁序恒为 `queue_flush_lock → queue_mgr`。写锁覆盖「取快照 → 写临时文件 → 替换目标 → 确认脏位」，
+/// 因此后台 500ms 任务与手动强制保存不可能倒序覆盖；业务队列锁只在取快照的瞬间持有，
+/// 磁盘 I/O 期间弹幕热路径照常推进。
+///
+/// 失败时**保留未落盘状态**（不提前清脏），由下一次 tick 或下一次命令重试。
+/// `cfg(test)` 下不写真实数据目录；真实逻辑在 `flush_queue_to_path`，由单测注入临时路径验证。
+fn flush_queue(state: &AppState, force: bool, app: Option<&AppHandle>) {
     if cfg!(test) {
         return;
     }
     let path = queue::get_order_list_path();
-    // 锁内：仅在需要时序列化并清除脏标记
-    let json = {
-        let mut q = match state.queue_mgr.lock() {
+    let _ = flush_queue_to_path(state, &path, force, app);
+}
+
+/// 真实保存逻辑（路径可注入，供单测在隔离临时目录验证）。
+///
+/// 调用者必须已持有 `queue_flush_lock` —— 该锁是「磁盘单写者」不变量的载体。
+fn flush_queue_to_path(
+    state: &AppState,
+    path: &Path,
+    force: bool,
+    app: Option<&AppHandle>,
+) -> Result<bool, String> {
+    let _flush_guard = state
+        .queue_flush_lock
+        .lock()
+        .map_err(|e| format!("队列刷盘锁异常: {}", e))?;
+
+    // 锁内：取「内容 + 版本」，随即释放队列锁，磁盘 I/O 不在队列锁内进行
+    let (json, flushed_revision) = {
+        let q = match state.queue_mgr.lock() {
             Ok(q) => q,
             Err(e) => {
-                crate::log_warn!("[Queue] 队列锁异常，跳过落盘: {}", e);
-                return;
+                let msg = format!("队列锁异常，跳过落盘: {}", e);
+                crate::log_warn!("[Queue] {}", msg);
+                return Err(msg);
             }
         };
-        if !q.dirty && !force {
-            return;
+        if !q.is_dirty() && !force {
+            return Ok(false);
         }
         match q.to_json() {
-            Ok(j) => {
-                q.dirty = false;
-                j
-            }
+            Ok(j) => (j, q.revision),
             Err(e) => {
-                crate::log_warn!("[Queue] 队列序列化失败: {}", e);
-                return;
+                let msg = format!("队列序列化失败: {}", e);
+                crate::log_warn!("[Queue] {}", msg);
+                return Err(msg);
             }
         }
     };
-    // 锁外：磁盘 I/O
-    if let Err(e) = QueueManager::write_json(&path, &json) {
-        crate::log_warn!("[Queue] 队列落盘失败: {}（路径: {}）", e, path.display());
+
+    // 锁外写盘（仍持刷盘锁）：失败则不清脏，下一次 tick 会重试
+    match QueueManager::write_json(path, &json) {
+        Ok(()) => {
+            if let Ok(mut q) = state.queue_mgr.lock() {
+                // 仅当最新版本就是本次落盘的版本时才确认已保存；
+                // 写入期间到来的新弹幕保持脏位，由下一 tick 继续保存
+                q.mark_saved(flushed_revision);
+            }
+            if state
+                .queue_persistence_broken
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                crate::log_info!("[Queue] 队列已恢复落盘（版本 {}）", flushed_revision);
+                emit_queue_persistence(app, QueuePersistence::Saved);
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            // 普通 WARN 不带本机路径；路径只在 Debug 级受控诊断入口出现
+            crate::log_warn!("[Queue] 队列落盘失败: {}", e);
+            crate::log_debug!("[Queue] 落盘目标路径: {}", path.display());
+            if !state
+                .queue_persistence_broken
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                emit_queue_persistence(app, QueuePersistence::PendingRetry);
+            }
+            Err(e)
+        }
     }
 }
 
-/// 变更后立即落盘（用于用户命令与退出链路；弹幕热路径改由 500ms 节流任务落盘）
-fn save_queue_now(state: &AppState) {
-    flush_queue(state, true);
+/// 广播落盘状态变化（不含任何用户数据，只表达「内存版本是否已确认落盘」）
+fn emit_queue_persistence(app: Option<&AppHandle>, persistence: QueuePersistence) {
+    if let Some(handle) = app {
+        let _ = handle.emit(
+            "queue-persistence-changed",
+            &serde_json::json!({ "persistence": persistence }),
+        );
+    }
+}
+
+/// 变更后立即落盘（用于用户命令与退出链路；弹幕热路径改由 500ms 节流任务落盘）。
+/// 返回权威快照，落盘失败时其 `persistence` 为 `PendingRetry`（内存已更新、磁盘待重试）。
+fn save_queue_now(state: &AppState, app: Option<&AppHandle>) -> QueueSnapshot {
+    if let Err(e) = flush_queue_to_path(state, &queue::get_order_list_path(), true, app) {
+        if cfg!(test) {
+            crate::log_warn!("[Queue] 保存失败（测试路径）: {}", e);
+        }
+    }
+    queue_snapshot_or_default(state)
+}
+
+/// 取权威快照；锁中毒时退回一份空快照（只影响展示，不影响内存队列）
+fn queue_snapshot_or_default(state: &AppState) -> QueueSnapshot {
+    match state.queue_mgr.lock() {
+        Ok(q) => q.snapshot(),
+        Err(_) => QueueSnapshot {
+            items: Vec::new(),
+            revision: 0,
+            persistence: QueuePersistence::PendingRetry,
+        },
+    }
+}
+
+/// 广播权威队列快照（命令与弹幕路径唯一出口）
+fn emit_queue_snapshot(app: &AppHandle, snapshot: &QueueSnapshot) {
+    let _ = app.emit("queue-updated", snapshot);
 }
 
 /// 新增点怪
@@ -216,7 +501,7 @@ fn add_order(
     tempered_level: Option<i32>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
-) -> Result<Vec<QueueItem>, String> {
+) -> Result<QueueSnapshot, String> {
     let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
 
     // 匹配怪物别名与图标
@@ -243,78 +528,191 @@ fn add_order(
     };
 
     q.add_or_update(item);
-    let items = q.items.clone();
+    let revision_changed = q.is_dirty();
     drop(q);
 
     // 用户命令路径保持"变更即落盘"语义（弹幕热路径改由 500ms 节流任务负责）
-    save_queue_now(&state);
-    let _ = app_handle.emit("queue-updated", &items);
-    Ok(items)
+    let snapshot = if revision_changed {
+        save_queue_now(&state, Some(&app_handle))
+    } else {
+        queue_snapshot_or_default(&state)
+    };
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(snapshot)
 }
 
-/// 按 User ID 删除指定排队项（保序删除）
+/// 按 User ID 删除指定排队项（保序删除）；未命中时不产生无变更的强制写盘
 #[tauri::command]
 fn dequeue_by_user_id(
     user_id: String,
     state: State<'_, AppState>,
     app_handle: AppHandle,
-) -> Result<Vec<QueueItem>, String> {
-    let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
-    q.dequeue_by_user_id(&user_id);
-    let items = q.items.clone();
-    drop(q);
+) -> Result<QueueSnapshot, String> {
+    let (removed, snapshot) = {
+        let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+        let removed = q.dequeue_by_user_id(&user_id).is_some();
+        (removed, q.snapshot())
+    };
 
-    save_queue_now(&state);
-    let _ = app_handle.emit("queue-updated", &items);
-    Ok(items)
+    let snapshot = if removed {
+        save_queue_now(&state, Some(&app_handle))
+    } else {
+        snapshot
+    };
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(snapshot)
 }
 
 /// 清空当前排队
 #[tauri::command]
-fn clear_queue(state: State<'_, AppState>, app_handle: AppHandle) -> Result<(), String> {
-    let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
-    q.clear();
-    drop(q);
+fn clear_queue(state: State<'_, AppState>, app_handle: AppHandle) -> Result<QueueSnapshot, String> {
+    let changed = {
+        let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+        let rev_before = q.revision;
+        q.clear();
+        q.revision != rev_before
+    };
 
-    // 清空属破坏性操作：立即落盘（对齐原工程 Clear() 立即 SaveList）
-    save_queue_now(&state);
-    let _ = app_handle.emit("queue-updated", &Vec::<QueueItem>::new());
-    Ok(())
+    // 清空属破坏性操作：确实清掉了内容才立即落盘（对齐原工程 Clear() 立即 SaveList）
+    let snapshot = if changed {
+        save_queue_now(&state, Some(&app_handle))
+    } else {
+        queue_snapshot_or_default(&state)
+    };
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(snapshot)
 }
 
-/// 手动拖拽重新排序队列（主播拖拽调整排队顺序）
+/// 手动拖拽重新排序队列（主播拖拽调整排队顺序）。
+///
+/// 只接受「预期版本 + 用户 ID 顺序」：客户端整表快照不再被后端采纳，
+/// 因此一次拖拽不可能删除另一路新订单、复活已完成单或撤回提权。
 #[tauri::command]
 fn reorder_queue(
-    items: Vec<QueueItem>,
+    ordered_user_ids: Vec<String>,
+    expected_revision: u64,
     state: State<'_, AppState>,
     app_handle: AppHandle,
-) -> Result<Vec<QueueItem>, String> {
-    let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
-    q.reorder(items);
-    let current_items = q.items.clone();
-    drop(q);
+) -> Result<QueueSnapshot, String> {
+    let snapshot = {
+        let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+        q.reorder_by_ids(&ordered_user_ids, expected_revision)?;
+        q.snapshot()
+    };
 
-    save_queue_now(&state);
-    let _ = app_handle.emit("queue-updated", &current_items);
-    Ok(current_items)
+    let snapshot = if snapshot.persistence == QueuePersistence::PendingRetry {
+        save_queue_now(&state, Some(&app_handle))
+    } else {
+        snapshot
+    };
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(snapshot)
 }
 
-/// 撤销完成：把条目原样插回指定下标（保留原 id 与 timestamp）
+/// 撤销完成：把条目原样插回指定下标（保留原 id 与 timestamp）。
+/// 同一用户已重新入队时返回明确冲突，且不落盘、不发成功事件。
 #[tauri::command]
 fn restore_order(
     item: QueueItem,
     index: usize,
     state: State<'_, AppState>,
     app_handle: AppHandle,
-) -> Result<Vec<QueueItem>, String> {
-    let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
-    q.restore(item, index);
-    let items = q.items.clone();
-    drop(q);
+) -> Result<QueueSnapshot, String> {
+    let restored = {
+        let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+        q.restore(item, index)
+    };
+    if !restored {
+        return Err("该用户已重新入队，无法撤销之前的完成操作".to_string());
+    }
 
-    save_queue_now(&state);
-    let _ = app_handle.emit("queue-updated", &items);
-    Ok(items)
+    let snapshot = save_queue_now(&state, Some(&app_handle));
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(snapshot)
+}
+
+/// 选怪面板入队的核心逻辑（不依赖 Tauri `State`，便于单测直接覆盖）。
+///
+/// 锁序统一为 **queue_mutex → 字典读 → 名单读**（与弹幕路径 `process_danmu` 一致）：
+/// 名单读 guard 持续覆盖"检查 → 入队"，因此一次名单编辑不可能插进检查与入队之间。
+fn picked_order_enqueue(
+    state: &AppState,
+    user_id: String,
+    user_name: String,
+    monster_name: &str,
+    is_priority: bool,
+    guard_level: Option<i32>,
+    tempered_level: Option<i32>,
+) -> Result<(), String> {
+    let name = monster_name.trim().to_string();
+    if name.is_empty() {
+        return Err("怪物名不能为空".into());
+    }
+
+    // 1. 队列锁
+    let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+
+    // 2. 字典读：面板入口要求精确命中（未知名字请走弹幕点怪的既有兼容路径）
+    let Some(entry) = state.monster_mgr.exact_entry(&name) else {
+        return Err(format!("词库中没有名为「{}」的怪物，请刷新图鉴库后重试", name));
+    };
+
+    // 3. 名单读 guard 一直持有到入队完成
+    let roster_guard = state.roster.read_guard();
+    if roster_guard.items.iter().any(|n| n == &entry.monster_name) {
+        return Err(format!("「{}」已在禁点名单中，无法入队", entry.monster_name));
+    }
+
+    // tempered_level=None 表示"按字典默认值"；Some 表示主播显式覆盖
+    let final_tempered = tempered_level.unwrap_or(entry.tempered_level);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+
+    q.add_or_update(QueueItem {
+        id: format!("item-{}", now.as_millis()),
+        user_id,
+        user_name,
+        monster_name: entry.monster_name.clone(),
+        is_priority,
+        guard_level: guard_level.unwrap_or(0),
+        tempered_level: final_tempered,
+        timestamp: now.as_secs() as i64,
+        icon_url: entry.icon_url,
+    });
+    // roster_guard 在此之后才释放：检查与入队处于同一临界区
+    Ok(())
+}
+
+/// 选怪面板入队（主播手动点单）。
+///
+/// 与弹幕点怪的关键差异：面板展示的是**字典原名**，因此这里按原名精确取键，
+/// 不重新跑别名匹配 —— 否则某只怪把该原名登记为别称后，面板上点「黑龙」会被换成另一只怪。
+/// 入队前由后端检查禁点名单，命中即拒绝（Toast 用后端实际确认的条目，不复述请求文案）。
+#[tauri::command]
+fn add_picked_order(
+    user_id: String,
+    user_name: String,
+    monster_name: String,
+    is_priority: bool,
+    guard_level: Option<i32>,
+    tempered_level: Option<i32>,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<QueueSnapshot, String> {
+    picked_order_enqueue(
+        &state,
+        user_id,
+        user_name,
+        &monster_name,
+        is_priority,
+        guard_level,
+        tempered_level,
+    )?;
+
+    let snapshot = save_queue_now(&state, Some(&app_handle));
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(snapshot)
 }
 
 /// 读取全量怪物字典（图鉴库展示与别称冲突检测的数据源）
@@ -344,27 +742,35 @@ fn save_monster_entry(
         .filter(|o| !o.is_empty() && *o != name);
 
     let path = MonsterDataManager::find_monster_list_path();
+    // 同名/撞名校验在**任何 raw.remove/insert 之前**于权威字典上执行：
+    // 前端预检查只作提示，后端才是最后一道校验
+    let mut rename_sync_failed: Option<String> = None;
     let count = state.monster_mgr.edit_and_save(&path, |raw| {
-        if let Some(old) = &renamed_from {
-            raw.remove(old);
-        }
-        raw.insert(
-            name.clone(),
-            serde_json::to_value(&config).map_err(|e| format!("条目序列化失败: {}", e))?,
-        );
-        Ok(())
+        monster::MonsterDataManager::upsert_entry(raw, &name, &config, renamed_from.as_deref())
     })?;
 
-    // 改名时同步可选名单中的引用（保持原顺位）；失败仅告警 —— 字典已落盘，不应谎报失败
+    // 改名时同步可选名单中的引用（保持原顺位）。
+    // 字典已落盘，名单若未同步必须**如实上报部分完成**，不能谎报"全部保存成功"
     if let Some(old) = &renamed_from {
         match state.roster.rename_item(old, &name) {
-            Ok(true) => crate::log_info!("[Dict] 条目改名 {} → {}，已同步可选名单", old, name),
+            Ok(true) => crate::log_info!("[Dict] 条目改名成功，已同步可选名单"),
             Ok(false) => {}
-            Err(e) => crate::log_warn!("[Dict] 条目改名后同步可选名单失败: {}", e),
+            Err(e) => {
+                crate::log_error!("[Dict] 条目改名后同步可选名单失败: {}", e);
+                rename_sync_failed = Some(format!(
+                    "词库已修改为「{}」，但禁点名单未同步（{}）。请刷新名单后手动修正。",
+                    name, e
+                ));
+            }
         }
     }
 
-    crate::log_info!("[Dict] 已保存条目「{}」，当前共 {} 条", name, count);
+    if let Some(msg) = rename_sync_failed {
+        return Err(msg);
+    }
+
+    // 怪名是用户可编辑内容，不进普通 INFO（改名前后名亦然）
+    crate::log_info!("[Dict] 条目已保存，当前共 {} 条", count);
     Ok(count)
 }
 
@@ -381,15 +787,23 @@ fn delete_monster_entry_impl(
         Ok(())
     })?;
 
-    // 禁点名单在 UI 上为只读展示、无手动移除入口，故这里的同名残留必须一并清理
+    // 禁点名单在 UI 上为只读展示、无手动移除入口，故这里的同名残留必须一并清理。
+    // 清理失败同样是"部分完成"：字典已删、名单未同步，必须如实回报
     if roster.snapshot().items.iter().any(|n| n == name) {
         match roster.remove(name) {
-            Ok(()) => crate::log_info!("[Dict] 条目「{}」已删除，同步移出禁点名单", name),
-            Err(e) => crate::log_warn!("[Dict] 删除条目后同步移出禁点名单失败: {}", e),
+            Ok(()) => crate::log_info!("[Dict] 条目已删除，同步移出禁点名单"),
+            Err(e) => {
+                crate::log_error!("[Dict] 删除条目后同步移出禁点名单失败: {}", e);
+                return Err(format!(
+                    "词库已删除「{}」，但禁点名单未同步（{}）。请刷新名单后手动修正。",
+                    name, e
+                ));
+            }
         }
     }
 
-    crate::log_info!("[Dict] 已删除条目「{}」，当前共 {} 条", name, count);
+    // 怪名同上：只记数量
+    crate::log_info!("[Dict] 条目已删除，当前共 {} 条", count);
     Ok(count)
 }
 
@@ -402,15 +816,21 @@ fn delete_monster_entry(name: String, state: State<'_, AppState>) -> Result<usiz
 
 /// 读取点怪可选名单（含白名单开关状态）
 #[tauri::command]
-fn get_monster_roster(state: State<'_, AppState>) -> Result<RosterData, String> {
-    Ok(state.roster.snapshot())
+fn get_monster_roster(state: State<'_, AppState>) -> Result<roster::RosterSnapshot, String> {
+    Ok(state.roster.snapshot_versioned())
 }
 
-/// 整表保存名单（编辑器点击加入/移出后落盘），返回保存后的快照
+/// 整表保存名单（编辑器点击加入/移出后落盘）。
+///
+/// 带版本 CAS：前端拿着旧版本提交时被拒绝，不会把后端的新名单（例如字典改名/删除
+/// 刚刚联动过的结果）抹掉。版本不符时不写盘、不改内存。
 #[tauri::command]
-fn set_monster_roster(data: RosterData, state: State<'_, AppState>) -> Result<RosterData, String> {
-    state.roster.replace(data)?;
-    Ok(state.roster.snapshot())
+fn set_monster_roster(
+    data: RosterData,
+    expected_revision: u64,
+    state: State<'_, AppState>,
+) -> Result<roster::RosterSnapshot, String> {
+    state.roster.replace_if_revision(data, expected_revision)
 }
 
 /// 解析名单 JSON 文本（导入用，纯逻辑便于单测）。
@@ -449,7 +869,9 @@ fn export_monster_roster(app_handle: AppHandle, state: State<'_, AppState>) -> R
 
     match save_text_file_with_dialog(&app_handle, "monster_roster.json", "json", &json) {
         Ok(path) => {
-            crate::log_info!("[Roster] 已导出禁点名单（{} 项）到 {}", data.items.len(), path);
+            // 路径不进普通 INFO（用户目录属本机信息），只在 Debug 级诊断入口出现
+            crate::log_info!("[Roster] 已导出禁点名单（{} 项）", data.items.len());
+            crate::log_debug!("[Roster] 导出目标: {}", path);
             Ok(Some(path))
         }
         // 「已取消导出」不是错误：前端据 None 静默处理
@@ -493,11 +915,8 @@ fn import_monster_roster(app_handle: AppHandle) -> Result<Option<RosterData>, St
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("读取名单文件失败（{}）: {}", path, e))?;
     let data = parse_roster_json(&content)?;
-    crate::log_info!(
-        "[Roster] 已读取导入名单（{} 项）来自 {}",
-        data.items.len(),
-        path
-    );
+    crate::log_info!("[Roster] 已读取导入名单（{} 项）", data.items.len());
+    crate::log_debug!("[Roster] 导入来源: {}", path);
     Ok(Some(data))
 }
 
@@ -563,15 +982,18 @@ fn save_app_config(
     // 身份码与 Manbo Key 的注册表同步统一由 AppConfig::save → persist_registry 完成
     // （E2：移除此处重复写入；空值语义不变——仅非空才覆盖注册表）
 
-    // 敏感凭据逐字段处理：credentials.dat 有值以其为准；否则保留前端非空输入；再否则维持现有内存值
+    // 敏感凭据全部由已验签的凭据文件独占：**忽略前端回传的敏感字段**，
+    // 前端 newCfg 里的这些值一律不采纳（避免配置页把密钥写坏或写空）
     let prev = state.config.lock().map_err(|e| e.to_string())?.clone();
+    let creds_snapshot = state.credentials_snapshot();
+    let creds = &creds_snapshot.creds;
     macro_rules! keep_cred {
         ($field:ident, $cred:ident) => {
-            if !state.credentials.$cred.is_empty() {
-                new_cfg.$field = state.credentials.$cred.clone();
-            } else if new_cfg.$field.trim().is_empty() {
-                new_cfg.$field = prev.$field.clone();
-            }
+            new_cfg.$field = if !creds.$cred.is_empty() {
+                creds.$cred.clone()
+            } else {
+                prev.$field.clone()
+            };
         };
     }
     keep_cred!(app_id, app_id);
@@ -580,7 +1002,7 @@ fn save_app_config(
     keep_cred!(deepseek_api_key, chat_api_key);
     keep_cred!(mimo_api_key, mimo_tts_api_key);
     // Manbo Key 不走 credentials.dat（原工程零引用 special_user_tts_api_key）：
-    // credentials.dat 有值时以注册表/配置为准，仅在两者皆空时沿用现有内存值
+    // 权威来源是注册表/配置，凭据里的同名字段不得反写
     if new_cfg.manbo_api_key.trim().is_empty() {
         new_cfg.manbo_api_key = prev.manbo_api_key.clone();
     }
@@ -630,15 +1052,43 @@ fn get_bili_connection_state(
     Ok(c.payload())
 }
 
-/// 写入连接状态并广播前端（事件 `connection-state-changed`）
+/// 写入连接状态并广播前端（事件 `connection-state-changed`）。
+///
+/// F3：只在状态／原因／重试次数**实际变化**时记一条安全 INFO ——
+/// 这样 Release 日志能直接读出"连上了没、在重试第几次、为什么断"，
+/// 又不会因为轮询式上报把日志灌满。日志只含状态名与次数，不含 game_id、WSS 地址或错误原文。
 fn apply_connection_status(
     state: &AppState,
     app_handle: Option<&AppHandle>,
     next: bilibili::ConnectionStatus,
 ) {
-    if let Ok(mut c) = state.connection.lock() {
-        *c = next;
+    let previous = state
+        .connection
+        .lock()
+        .map(|mut c| std::mem::replace(&mut *c, next.clone()))
+        .ok();
+
+    let changed = match &previous {
+        Some(prev) => {
+            prev.state != next.state
+                || prev.reason != next.reason
+                || prev.attempt != next.attempt
+        }
+        None => true,
+    };
+    if changed {
+        crate::log_info!(
+            "[Bili] 连接状态 {} → {}（原因={} 重试次数={}）",
+            previous
+                .as_ref()
+                .map(|p| format!("{:?}", p.state))
+                .unwrap_or_else(|| "Unknown".to_string()),
+            format!("{:?}", next.state),
+            format!("{:?}", next.reason),
+            next.attempt
+        );
     }
+
     if let Some(h) = app_handle {
         let _ = h.emit("connection-state-changed", next.payload());
     }
@@ -666,6 +1116,9 @@ fn build_food_order_text(msg: &str, uname: &str) -> Option<String> {
 }
 
 /// 广播打卡回复事件（供前端气泡展示，D4）
+///
+/// 同时完成业务留档：回复文案在这里**最终确定**，是留档的唯一时机
+/// （无语音、AI 失败回退、队满都不影响这条留档）。
 fn emit_checkin_reply(
     app_handle: Option<&AppHandle>,
     user_id: &str,
@@ -673,6 +1126,8 @@ fn emit_checkin_reply(
     reply: &str,
     is_ai: bool,
 ) {
+    record_business_history(reply);
+    record_business_history_probe(reply);
     if let Some(handle) = app_handle {
         let _ = handle.emit(
             "checkin-reply",
@@ -717,7 +1172,12 @@ fn schedule_checkin_reply(
     }
 
     let prompt = {
-        let learning = state.checkin_mgr.load_learning(&danmu.user_id);
+        // 学习档案读取属增强信息：不可用时退回空档案，不影响本次打卡回复
+        let learning = state
+            .checkin_mgr
+            .as_ref()
+            .map(|m| m.load_learning(&danmu.user_id))
+            .unwrap_or_default();
         checkin_ai::build_prompt(&checkin_ai::CheckinContext {
             username: &danmu.user_name,
             continuous_days: profile.continuous_days,
@@ -783,6 +1243,25 @@ fn is_command_message(msg: &str, checkin_triggers: &[String]) -> bool {
         || checkin::is_retro_query(msg)
 }
 
+/// 业务留档唯一入口（对齐原工程 `WriteLog::RecordHistory`）。
+///
+/// - 完整版：把业务原文写入 `History/YYYY.M.D.txt`；
+/// - Lite：完全不记录（与旧版 Lite 一致）。
+///
+/// 调用时机一律是"业务文本**形成**的那一刻"，而不是"语音播报时"：
+/// 语音总开关、队满、合成失败、粉丝牌播报门槛都不能回头删掉业务留档。
+fn record_business_history(text: &str) {
+    if IS_LITE {
+        return;
+    }
+    logging::record_history(text);
+}
+
+/// 测试专用留档探针（生产为空操作）：让单测能断言"业务调用链确实恰好留档一次"
+fn record_business_history_probe(text: &str) {
+    logging::record_history_for_test(text);
+}
+
 /// 核心业务总线：统一处理接收到的直播/模拟弹幕
 pub fn handle_incoming_danmu(
     app_handle: Option<&AppHandle>,
@@ -798,123 +1277,155 @@ pub fn handle_incoming_danmu(
         state.config.lock().map(|c| c.clone()).unwrap_or_default()
     };
 
+    // 1.1 有效原始 DM 留档：在打卡与点怪的去重／过滤**之前**写一次，
+    //     因此被语音过滤、被防刷屏跳过、乃至只是普通聊天的弹幕都会留下原文。
+    //     字段不齐的畸形包不留档（不写成「 说：」）。
+    if danmu.has_history_required_fields {
+        let entry = format!("{} 说：{}", danmu.user_name, danmu.message);
+        record_business_history(&entry);
+        record_business_history_probe(&entry);
+    }
+
     // 2. 非 Lite 构建下的弹幕学习、舰长打卡与补签指令判定
     if !IS_LITE {
         let msg_trim = danmu.message.trim();
 
-        // 2.1 打卡模块总开关（原工程 enableCaptainCheckinAI 控制 CaptainCheckInModule 的启用：
-        //     关闭时打卡指令与弹幕学习全部停用；补签模块独立，不受该开关影响）
+        // 打卡模块总开关（原工程 enableCaptainCheckinAI 控制 CaptainCheckInModule 的启用：
+        // 关闭时打卡指令与弹幕学习全部停用；补签模块独立，不受该开关影响）
         let checkin_module_enabled = cfg.enable_captain_checkin_ai;
 
-        // 触发词提前解析：后续步骤 2.2 判指令、步骤 2.3 判打卡都要用。
+        // 触发词提前解析：后续判指令、判打卡都要用。
         // 支持中英文逗号分隔（对齐原工程 SetTriggerWords），清空后打卡功能完全停用
         let checkin_triggers = parse_checkin_trigger_words(&cfg.checkin_trigger_words);
         let is_checkin_command = checkin_triggers
             .iter()
             .any(|t| msg_trim.eq_ignore_ascii_case(t));
 
+        // 打卡日期口径：弹幕服务器时间（原工程 sendDate），缺失时回退本机今天（C5）
+        let danmu_date = bilibili::server_date(danmu.timestamp)
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+
+        // 原工程触发条件：舰长 或 佩戴粉丝牌的用户
+        let is_privileged = danmu.guard_level > 0 || danmu.has_medal;
+        let is_checkin = checkin_module_enabled && is_checkin_command;
+        // 补签操作与补签查询：**独立于打卡防刷屏**（原工程 DanmuProcessor 独立分发到补签模块），
+        // 因此它们不受 CheckinLearner::should_skip_duplicate 影响，也不受打卡总开关影响
+        let is_retro = is_privileged && checkin::is_retro_command(msg_trim);
+        let is_retro_query_cmd = is_privileged && checkin::is_retro_query(msg_trim);
+
         // 2.2 舰长弹幕学习 + 同内容防刷屏
         //     （原工程 NotifyCaptainDanmu 门槛 guardLevel != 0 || hasMedal → ShouldLearn 仅舰长学习）
         //     指令类弹幕只参与防刷屏计数、不写入发言习惯：它们会被当成关键词与「最近发言」
         //     喂给打卡 AI 提示词（如只打卡不聊天的观众，Top5 习惯词里会出现「打卡」）
-        let mut skip_commands = false;
-        if checkin_module_enabled && (danmu.guard_level != 0 || danmu.has_medal) {
+        //     D4：该返回值**只**用于拦截「打卡」，不得吞掉补签与补签查询
+        let mut skip_checkin_by_learning = false;
+        if checkin_module_enabled && is_privileged {
             if let Some(learner) = &state.checkin_learner {
                 if !is_command_message(msg_trim, &checkin_triggers) {
-                    learner.learn(
-                        &state.checkin_mgr,
-                        &danmu.user_id,
-                        &danmu.user_name,
-                        danmu.guard_level,
-                        &danmu.message,
-                        danmu.timestamp,
-                    );
+                    if let Ok(mgr) = state.checkin() {
+                        learner.learn(
+                            mgr,
+                            &danmu.user_id,
+                            &danmu.user_name,
+                            danmu.guard_level,
+                            &danmu.message,
+                            danmu.timestamp,
+                        );
+                    }
                 }
-                skip_commands = learner.should_skip_duplicate(&danmu.user_id, &danmu.message);
+                skip_checkin_by_learning =
+                    learner.should_skip_duplicate(&danmu.user_id, &danmu.message);
             }
         }
 
-        if !skip_commands {
-            // 打卡日期口径：弹幕服务器时间（原工程 sendDate），缺失时回退本机今天（C5）
-            let danmu_date = bilibili::server_date(danmu.timestamp)
-                .unwrap_or_else(|| chrono::Local::now().date_naive());
+        // 2.3 打卡不可用（Lite 已由编译期短路；完整版为数据库初始化失败）：
+        //     有权限用户发出打卡/补签/查询时必须明确拒绝并提示，
+        //     既不能伪造成功气泡，也不能落进普通弹幕朗读
+        if (is_checkin || is_retro || is_retro_query_cmd) && is_privileged && !state.checkin_available() {
+            emit_checkin_unavailable(state, app_handle);
+            return bilibili::DanmuProcessResult {
+                user_id: danmu.user_id,
+                user_name: danmu.user_name,
+                ..Default::default()
+            };
+        }
 
-            // 2.3 判定打卡：仅以配置的触发词为准（对齐原工程 CaptainCheckInModule::IsCheckinMessage）
-            let is_checkin = checkin_module_enabled && is_checkin_command;
+        // 打卡子系统句柄：上面的不可用分支已提前 return，此处 Ok；
+        // 非打卡弹幕在 DB 停用时为 None，此时跳过打卡相关分支即可
+        let checkin_mgr = state.checkin().ok().cloned();
 
-            if is_checkin {
-                // 原工程触发条件：舰长 或 佩戴粉丝牌的用户均可打卡
-                if danmu.guard_level > 0 || danmu.has_medal {
-                    let already_checked_in =
-                        state.checkin_mgr.has_checkin_record(&danmu.user_id, danmu_date);
-                    // AI 提示词需要“上次打卡日期”，须在落库前取（对齐原工程 previousCheckinDate）
-                    let last_checkin_before = state
-                        .checkin_mgr
-                        .get_profile(&danmu.user_id)
-                        .map(|p| p.last_checkin_date)
-                        .unwrap_or(0);
+        if is_checkin && is_privileged && !skip_checkin_by_learning {
+            if let Some(mgr) = &checkin_mgr {
+                // AI 提示词需要“上次打卡日期”，须在落库前取（对齐原工程 previousCheckinDate）
+                let last_checkin_before = mgr
+                    .get_profile(&danmu.user_id)
+                    .map(|p| p.last_checkin_date)
+                    .unwrap_or(0);
 
-                    match state
-                        .checkin_mgr
-                        .record_checkin(&danmu.user_id, &danmu.user_name, danmu_date)
-                    {
-                        Ok(profile) => {
-                            if let Some(handle) = app_handle {
-                                let _ = handle.emit("checkin-recorded", &profile);
-                            }
+                // 「今天是否已打卡」由 record_checkin 在同一事务内判定并返回，
+                // 不再在事务外先猜重复再决定文案（并发下会误判）
+                match mgr.record_checkin_with_flag(&danmu.user_id, &danmu.user_name, danmu_date) {
+                    Ok(outcome) => {
+                        let profile = outcome.profile;
+                        if let Some(handle) = app_handle {
+                            let _ = handle.emit("checkin-recorded", &profile);
+                        }
 
-                            if already_checked_in {
-                                // 重复打卡文案（C5，对齐原工程 repeatedAnswer）
-                                let reply = format!(
-                                    "{}今日已打卡，连续{}天，累计{}天",
-                                    danmu.user_name, profile.continuous_days, profile.cumulative_days
-                                );
-                                emit_checkin_reply(
-                                    app_handle,
+                        if outcome.already_checked_in {
+                            // 重复打卡文案（C5，对齐原工程 repeatedAnswer）
+                            let reply = format!(
+                                "{}今日已打卡，连续{}天，累计{}天",
+                                danmu.user_name, profile.continuous_days, profile.cumulative_days
+                            );
+                            emit_checkin_reply(
+                                app_handle,
+                                &danmu.user_id,
+                                &danmu.user_name,
+                                &reply,
+                                false,
+                            );
+                            if cfg.enable_voice {
+                                // 重复打卡亦属签到播报：按“打卡_{用户名}_{ts}.mp3”留档
+                                state.tts_mgr.enqueue_checkin_speak(
+                                    &reply,
                                     &danmu.user_id,
                                     &danmu.user_name,
-                                    &reply,
-                                    false,
-                                );
-                                if cfg.enable_voice {
-                                    // 重复打卡亦属签到播报：按“打卡_{用户名}_{ts}.mp3”留档
-                                    state.tts_mgr.enqueue_checkin_speak(
-                                        &reply,
-                                        &danmu.user_id,
-                                        &danmu.user_name,
-                                    );
-                                }
-                            } else {
-                                schedule_checkin_reply(
-                                    app_handle,
-                                    state,
-                                    &cfg,
-                                    &danmu,
-                                    &profile,
-                                    danmu_date,
-                                    last_checkin_before,
                                 );
                             }
-                        }
-                        Err(e) => {
-                            crate::log_error!("[Checkin] 打卡处理异常: {}", e);
+                        } else {
+                            schedule_checkin_reply(
+                                app_handle,
+                                state,
+                                &cfg,
+                                &danmu,
+                                &profile,
+                                danmu_date,
+                                last_checkin_before,
+                            );
                         }
                     }
+                    Err(e) => {
+                        crate::log_error!("[Checkin] 打卡处理异常: {}", e);
+                    }
                 }
-                return bilibili::DanmuProcessResult {
-                    user_id: danmu.user_id,
-                    user_name: danmu.user_name,
-                    ..Default::default()
-                };
             }
+            return bilibili::DanmuProcessResult {
+                user_id: danmu.user_id,
+                user_name: danmu.user_name,
+                ..Default::default()
+            };
+        }
 
-            // 2.4 判定补签：权限为「舰长或佩戴粉丝牌」（C4，对齐原工程 NotifyCaptainDanmu 门槛）
-            if (danmu.guard_level > 0 || danmu.has_medal) && checkin::is_retro_command(msg_trim) {
-                let outcome = state.checkin_mgr.retro_command_outcome(
-                    &danmu.user_id,
-                    &danmu.user_name,
-                    danmu_date,
-                );
+        // 2.4 补签：权限为「舰长或佩戴粉丝牌」（C4，对齐原工程 NotifyCaptainDanmu 门槛）
+        if is_retro {
+            if let Some(mgr) = &checkin_mgr {
+                let outcome =
+                    mgr.retro_command_outcome(
+                        &danmu.user_id,
+                        &danmu.user_name,
+                        danmu_date,
+                        Some(danmu.msg_id.as_str()),
+                    );
                 if let Some(handle) = app_handle {
                     let _ = handle.emit(
                         "retroactive-checkin-recorded",
@@ -928,6 +1439,9 @@ pub fn handle_incoming_danmu(
                         }),
                     );
                 }
+                // 留档在回复文案算出后立即进行：查询/无卡/失败提示同样入档
+                record_business_history(&outcome.reply);
+                record_business_history_probe(&outcome.reply);
                 if cfg.enable_voice {
                     // 补签播报同样按签到音频留档（对齐原工程 isCheckinTTS 守卫）
                     state.tts_mgr.enqueue_checkin_speak(
@@ -936,19 +1450,19 @@ pub fn handle_incoming_danmu(
                         &danmu.user_name,
                     );
                 }
-                return bilibili::DanmuProcessResult {
-                    user_id: danmu.user_id,
-                    user_name: danmu.user_name,
-                    ..Default::default()
-                };
             }
+            return bilibili::DanmuProcessResult {
+                user_id: danmu.user_id,
+                user_name: danmu.user_name,
+                ..Default::default()
+            };
+        }
 
-            // 2.5 判定补签查询：权限同上；仅气泡不朗读（v24 决策）
-            if (danmu.guard_level > 0 || danmu.has_medal) && checkin::is_retro_query(msg_trim) {
-                let reply = state
-                    .checkin_mgr
-                    .query_reply(&danmu.user_id, &danmu.user_name, danmu_date);
-                let cards = state.checkin_mgr.get_cards(&danmu.user_id);
+        // 2.5 补签查询：权限同上；仅气泡不朗读（v24 决策）
+        if is_retro_query_cmd {
+            if let Some(mgr) = &checkin_mgr {
+                let reply = mgr.query_reply(&danmu.user_id, &danmu.user_name, danmu_date);
+                let cards = mgr.get_cards(&danmu.user_id);
                 if let Some(handle) = app_handle {
                     let _ = handle.emit(
                         "retroactive-query",
@@ -960,33 +1474,35 @@ pub fn handle_incoming_danmu(
                         }),
                     );
                 }
-                return bilibili::DanmuProcessResult {
-                    user_id: danmu.user_id,
-                    user_name: danmu.user_name,
-                    ..Default::default()
-                };
+                // 查询回复原样留档（含换行的三行文案虽写成多行物理行，但只调用一次留档）
+                record_business_history(&reply);
+                record_business_history_probe(&reply);
             }
+            return bilibili::DanmuProcessResult {
+                user_id: danmu.user_id,
+                user_name: danmu.user_name,
+                ..Default::default()
+            };
         }
     }
 
     // 3. 核心排队与怪物点单处理
-    let (res, queued_items) = {
+    let (res, snapshot, revision_changed) = {
         let mut q = state.queue_mgr.lock().unwrap();
+        let revision_before = q.revision;
         let res = state
             .danmu_processor
             .process_danmu(&danmu, &state.monster_mgr, &state.roster, &mut q);
-        let items = q.items.clone();
-        (res, items)
+        let changed = q.revision != revision_before;
+        (res, q.snapshot(), changed)
         // 锁在此处释放：后续日志/事件广播/落盘均不持锁
     };
+    let queued_items = &snapshot.items;
 
-    // 3.1 禁点名单拦截：命中字典但该怪已被禁点 —— 不入队，仅记录并就地提示
+    // 3.1 禁点名单拦截：命中字典但该怪已被禁点 —— 不入队，仅记录并就地提示。
+    //      诊断日志只记"发生了一次拦截"，昵称与怪名属业务内容，不写入普通 Logs
     if res.blocked_by_roster {
-        crate::log_info!(
-            "[Roster] {} 点怪「{}」未生效（该怪在禁点名单内）",
-            danmu.user_name,
-            res.monster_name
-        );
+        crate::log_info!("[Roster] 点怪被禁点名单拦截 1 次");
         if let Some(handle) = app_handle {
             let _ = handle.emit(
                 "order-blocked",
@@ -1009,16 +1525,21 @@ pub fn handle_incoming_danmu(
             .map(|i| i.is_priority)
             .unwrap_or(false);
         // 弹幕热路径不在此落盘（脏标记已置位，由 500ms 节流任务在锁外写盘，
-        // 对齐原工程 PriorityQueueManager::Tick 的 SAVE_INTERVAL_MS=500 语义）
+        // 对齐原工程 PriorityQueueManager::Tick 的 SAVE_INTERVAL_MS=500 语义）。
+        // 诊断日志只记业务量与结果，昵称/怪名只走前端事件与 History，不进普通 Logs
         crate::log_info!(
-            "[Queue] {} {} 成功（队列优先={}），当前排队 {} 位",
-            danmu.user_name,
-            if res.priority_updated { "优先置前" } else { "点怪" },
+            "[Queue] 点怪{}成功（队列优先={}），当前排队 {} 位",
+            if res.priority_updated { "提权" } else { "" },
             item_priority,
             queued_items.len()
         );
         if let Some(handle) = app_handle {
-            let _ = handle.emit("queue-updated", &queued_items);
+            // 队列广播与「是否产生业务动作」解耦：按版本变化判定。
+            // 已有用户改怪名/等级/图标时 process_danmu 返回的两个业务标志都是 false，
+            // 但队列内容确实变了，前端必须收到权威快照。
+            if revision_changed {
+                emit_queue_snapshot(handle, &snapshot);
+            }
             // D3 跑马灯：点怪成功提示（优先置前 / 新增入队，对齐原工程 DataBridgeExports 回调）
             let _ = handle.emit(
                 "order-placed",
@@ -1063,6 +1584,24 @@ pub fn handle_incoming_danmu(
     res
 }
 
+/// 点赞奖励结算失败时的可见反馈（D3 的"可见失败事件"）。
+///
+/// 配合整事件回滚策略：那次点赞没有落库，因此**必须**让主播知道，
+/// 并明确它是可重试的（去重预留已释放，服务端重投即可重新入账）。
+/// 载荷只含数量与固定文案，不含 uid、昵称或 SQL 错误原文。
+fn emit_like_reward_failed(app: Option<&AppHandle>, like_count: i32) {
+    if let Some(handle) = app {
+        let _ = handle.emit(
+            "like-reward-failed",
+            &serde_json::json!({
+                "like_count": like_count,
+                "retryable": true,
+                "message": "本次点赞结算未完成，已回滚且未计入。系统会在服务端重投时自动重试；若长时间未恢复请检查本机数据库。",
+            }),
+        );
+    }
+}
+
 /// 核心业务总线：统一处理接收到的点赞数据
 /// 对齐原工程 NotifyLikeEvent：共享 msg_id 去重 → 空 uid / 非正数点赞丢弃 →
 /// 奖卡结算后按「先突破30、后连续7天」顺序播报（SendReply 默认开启 TTS）
@@ -1076,11 +1615,17 @@ pub fn handle_incoming_like(
         return Vec::new();
     }
 
-    // 点赞与弹幕共用同一 msg_id 去重缓存（原工程 IsDuplicateMsgId）
-    if state.danmu_processor.is_duplicate_msg_id(&ev.msg_id) {
+    // 点赞与弹幕共用同一 msg_id 去重缓存（原工程 IsDuplicateMsgId），
+    // 但点赞走**三态语义**：处理中保留 → 事务提交成功确认保留 / 失败释放。
+    // 早期实现无视结果地永久占用 ID，一次数据库失败就会把该事件的重投永久挡在缓存外，
+    // 配合「整事件回滚」会让这次合法点赞彻底消失。
+    let reservation = state.danmu_processor.reserve_msg_id(&ev.msg_id);
+    if reservation == bilibili::MsgIdReservation::Duplicate {
         return Vec::new();
     }
     if ev.like_count <= 0 || ev.uid.is_empty() {
+        // 丢弃前释放，避免无效事件长期占用 ID（空 ID 为 NoKey，释放是空操作）
+        state.danmu_processor.release_msg_id(&ev.msg_id);
         return Vec::new();
     }
 
@@ -1088,8 +1633,22 @@ pub fn handle_incoming_like(
     let date = bilibili::server_date(ev.timestamp)
         .unwrap_or_else(|| chrono::Local::now().date_naive());
 
-    let Ok(rewards) = state.checkin_mgr.add_likes(&ev.uid, ev.like_count, date) else {
+    // 打卡子系统不可用时不得静默丢弃：给出节流后的可见提示后返回
+    let Ok(mgr) = state.checkin() else {
+        state.danmu_processor.release_msg_id(&ev.msg_id);
+        emit_checkin_unavailable_throttled(state, app_handle, true);
         return Vec::new();
+    };
+
+    let rewards = match mgr.add_likes(&ev.uid, ev.like_count, date) {
+        Ok(r) => r,
+        Err(e) => {
+            // D3：整事件已回滚 → 必须留痕**并释放预留**，让同一事件的重投可以重试
+            crate::log_error!("[Checkin] 点赞事务失败，已回滚并释放去重预留（可重试）: {}", e);
+            state.danmu_processor.release_msg_id(&ev.msg_id);
+            emit_like_reward_failed(app_handle, ev.like_count);
+            return Vec::new();
+        }
     };
 
     let mut replies: Vec<String> = Vec::new();
@@ -1104,6 +1663,12 @@ pub fn handle_incoming_like(
     }
     if replies.is_empty() {
         return replies;
+    }
+
+    // 事务提交后才留档：对实际发出的每条奖励回复各记一次（普通点赞无回复不记）
+    for text in &replies {
+        record_business_history(text);
+        record_business_history_probe(text);
     }
 
     if let Some(handle) = app_handle {
@@ -1153,13 +1718,15 @@ pub fn handle_incoming_gift(
         .lock()
         .map(|c| c.clone())
         .unwrap_or_default();
-    if !cfg.enable_voice {
-        return;
-    }
 
-    // 连击合并：冷却期内累加、官方 combo 走准备池、超时由后台泵结算
-    for msg in state.tts_mgr.process_gift(&ev) {
-        queue_tts(state, msg, &ev.open_id, true);
+    // 连击跟踪器**始终推进**（不因语音开关跳过），否则关闭语音期间的礼物连击
+    // 会让后续结算文案的计数错位、并丢掉那段业务留档
+    for report in state.tts_mgr.process_gift(&ev) {
+        record_business_history(&report.text);
+        record_business_history_probe(&report.text);
+        if cfg.enable_voice && report.can_speak {
+            queue_tts(state, report.text, &ev.open_id, true);
+        }
     }
 }
 
@@ -1176,12 +1743,20 @@ pub fn handle_incoming_live_event(
     // 进场事件仅做历史留档（对齐原工程 HandleSpeekEnter 只写 History、不播报）：
     // 该事件前端无消费方，故不广播，避免高频 IPC 空转
     if let bilibili::LiveEvent::RoomEnter { uname, .. } = &ev {
-        logging::record_history(&format!("{} 进入直播间", uname));
+        let entry = format!("{} 进入直播间", uname);
+        record_business_history(&entry);
+        record_business_history_probe(&entry);
         return;
     }
 
     if let Some(handle) = app_handle {
         let _ = handle.emit(ev.event_name(), &ev);
+    }
+
+    // SC / 上舰文案在**判断语音开关之前**留档：合法文案不因没开语音而丢失
+    if let Some(text) = ev.tts_text() {
+        record_business_history(&text);
+        record_business_history_probe(&text);
     }
 
     let enable_voice = state
@@ -1201,33 +1776,30 @@ pub fn handle_incoming_live_event(
 }
 
 /// 开启 / 断开 B 站直播连接
+///
+/// start／stop／import 共用 `bili_lifecycle` 生命周期闸门：保证"检查空闲 → 取凭据快照 →
+/// 登记新会话/启动任务"与"确认旧任务已退出 → 替换凭据文件 → 发布 B"互斥，
+/// 不会出现会话 A 正在运行时磁盘/内存已变成 B 的混用状态。
 #[tauri::command]
 async fn set_bili_connection(
     connected: bool,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<bool, String> {
+    let _lifecycle = state.bili_lifecycle.lock().await;
+
     if connected {
         if state.bili_service.is_running() {
             return Ok(true);
         }
+        // 服务端关闭状态未确认时不得立即开新会话（否则会命中 7001 之类的"已有会话"错误）
+        if !state.bili_service.can_start_new_session() {
+            return Err(
+                "上一场直播的服务端关闭状态未确认，请等待确认或稍后重试后再开播".to_string(),
+            );
+        }
 
         let cfg = state.config.lock().map_err(|e| e.to_string())?.clone();
-        let app_id = if !state.credentials.app_id.is_empty() {
-            state.credentials.app_id.clone()
-        } else {
-            cfg.app_id.clone()
-        };
-        let access_key_id = if !state.credentials.access_key_id.is_empty() {
-            state.credentials.access_key_id.clone()
-        } else {
-            cfg.access_key_id.clone()
-        };
-        let access_key_secret = if !state.credentials.access_key_secret.is_empty() {
-            state.credentials.access_key_secret.clone()
-        } else {
-            cfg.access_key_secret.clone()
-        };
 
         let mut id_code = cfg.id_code.clone();
         if id_code.trim().is_empty() {
@@ -1241,12 +1813,10 @@ async fn set_bili_connection(
             }
         }
 
-        let creds = bilibili::BiliCredentials {
-            app_id,
-            access_key_id,
-            access_key_secret,
+        let creds = state.bili_credentials(&AppConfig {
             id_code: id_code.clone(),
-        };
+            ..cfg.clone()
+        });
 
         if id_code.trim().is_empty() {
             return Err("未填入开播身份码，请在直播连接面板输入当次开播身份码后重试".into());
@@ -1256,7 +1826,14 @@ async fn set_bili_connection(
             return Err("B 站开放平台凭据未配置或不完整（请导入凭据文件并填入开播身份码）".into());
         }
 
+        // 登记新一代会话：递增代号并标记循环存活。
+        // 旧循环（若还残留在退出过程中）会在下一次取消检查时自行退出；
+        // 且 `can_start_new_session` 已要求 loop_alive=false，这里不可能复活旧循环。
+        state.bili_service.begin_session();
         state.bili_service.set_running(true);
+        state
+            .bili_service
+            .set_end_state(bilibili::SessionEndState::Active);
         // 先进入「连接中」，随后由长连主循环上报 已连接 / 重连中 / 重连失败
         apply_connection_status(
             &state,
@@ -1269,6 +1846,7 @@ async fn set_bili_connection(
         );
 
         let running = state.bili_service.get_running_flag();
+        let session_ctl = state.bili_service.session_ctl();
         let game_id_ref = state.bili_service.get_game_id_ref();
         let state_clone = (*state).clone();
         let app_handle_clone = app_handle.clone();
@@ -1278,6 +1856,7 @@ async fn set_bili_connection(
             bilibili::run_bili_live_loop(
                 creds_clone,
                 running,
+                session_ctl,
                 game_id_ref,
                 {
                     let h = app_handle_clone.clone();
@@ -1330,45 +1909,59 @@ async fn set_bili_connection(
             bilibili::ConnectionStatus::default(),
         );
 
-        if let Some(gid) = state.bili_service.get_game_id() {
-            let cfg = state.config.lock().map_err(|e| e.to_string())?.clone();
-            let app_id = if !state.credentials.app_id.is_empty() {
-                state.credentials.app_id.clone()
-            } else {
-                cfg.app_id.clone()
-            };
-            let access_key_id = if !state.credentials.access_key_id.is_empty() {
-                state.credentials.access_key_id.clone()
-            } else {
-                cfg.access_key_id.clone()
-            };
-            let access_key_secret = if !state.credentials.access_key_secret.is_empty() {
-                state.credentials.access_key_secret.clone()
-            } else {
-                cfg.access_key_secret.clone()
-            };
+        // 等待旧连接循环**真正退出**再放行后续操作：
+        // 只把 running=false 就当已停，会让紧随其后的 start 与尚未退出的旧循环并行。
+        // 可取消的退避 sleep + 500ms 取消轮询保证这里通常几十毫秒内就能确认。
+        let mut waited_ms = 0u32;
+        while state.bili_service.is_loop_alive() && waited_ms < 3000 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            waited_ms += 50;
+        }
+        if state.bili_service.is_loop_alive() {
+            // 明确告诉前端"正在断开"：不假装已经断开完成
+            crate::log_warn!("[Bili] 旧连接任务仍在退出中（已等待 {}ms）", waited_ms);
+            return Err(
+                "正在断开连接：旧连接任务尚未退出，请稍候再操作（状态：正在断开）".to_string(),
+            );
+        }
 
-            let creds = bilibili::BiliCredentials {
-                app_id,
-                access_key_id,
-                access_key_secret,
-                id_code: cfg.id_code.clone(),
-            };
-            tokio::spawn(async move {
-                let _ = creds.end_app(&gid).await;
-            });
-            state.bili_service.set_game_id(None);
+        // 主动断开：取得本次 end 的**唯一执行权**（后台看到 Ending 时不会重复 end）。
+        // 不先 take 掉 game_id —— end 失败时它仍是唯一可重试的凭据。
+        if let Some(gid) = state.bili_service.begin_end() {
+            let cfg = state.config.lock().map_err(|e| e.to_string())?.clone();
+            let creds = state.bili_credentials(&cfg);
+            let svc = state.bili_service.clone();
+            // 同步等待 end 结果：这样"已断开"与"关闭状态未知"对调用方是确定的事实，
+            // 不会出现"界面已断开、服务端其实还在播"的窗口
+            match creds.end_app(&gid).await {
+                Ok(()) => {
+                    crate::log_info!("[Bili] 已确认服务端关闭上一场直播会话");
+                    svc.confirm_end();
+                }
+                Err(e) => {
+                    // 失败/超时：保留 game_id 与"关闭状态未知"，禁止在未确认下立即开新会话
+                    crate::log_warn!(
+                        "[Bili] 下播请求未获确认，服务端关闭状态未知（已保留可重试会话）: {}",
+                        e
+                    );
+                    svc.mark_end_unknown();
+                }
+            }
+        } else {
+            // 没有 game_id（例如开播尚未成功）：标记为已确认，允许下次开播
+            state.bili_service.set_end_state(bilibili::SessionEndState::Confirmed);
         }
 
         Ok(false)
     }
 }
 
-/// GM: 批量补签（受 Lite 模式控制）
+/// GM: 批量补签（受 Lite 模式控制；打卡数据库不可用时明确报错）
 #[tauri::command]
 fn gm_batch_checkin(state: State<'_, AppState>) -> Result<checkin::BatchCheckinResult, String> {
     ensure_not_lite(&state, "GM运维打卡功能")?;
-    state.checkin_mgr.batch_checkin()
+    // GM 命令本就返回 Result：入口直接明确 Err，不做内存兜底
+    state.checkin()?.batch_checkin()
 }
 
 /// GM: 水友模糊搜索（受 Lite 模式控制；返回档案 + 补签卡数）
@@ -1378,7 +1971,7 @@ fn gm_search_users(
     state: State<'_, AppState>,
 ) -> Result<Vec<checkin::UserSearchItem>, String> {
     ensure_not_lite(&state, "GM功能")?;
-    state.checkin_mgr.search_users(&keyword)
+    state.checkin()?.search_users(&keyword)
 }
 
 /// GM: 手动调发补签卡（受 Lite 模式控制）
@@ -1389,7 +1982,21 @@ fn gm_grant_card(
     state: State<'_, AppState>,
 ) -> Result<i32, String> {
     ensure_not_lite(&state, "GM功能")?;
-    state.checkin_mgr.grant_card(&uid, count)
+    state.checkin()?.grant_card(&uid, count)
+}
+
+/// 查询打卡子系统可用性（冷启动快照：前端据此常驻展示可用／停用／故障，
+/// 不依赖 setup 阶段可能丢失的单次事件）
+#[tauri::command]
+fn get_checkin_status(state: State<'_, AppState>) -> CheckinStatus {
+    (*state.checkin_status).clone()
+}
+
+/// 查询启动时缺失的资源名（F2：与 `resource-missing` 事件按名去重合并展示，
+/// 挂载晚于 setup 的窗口也能拿到完整缺项）
+#[tauri::command]
+fn get_missing_resources(state: State<'_, AppState>) -> Vec<String> {
+    state.startup_missing.as_ref().clone()
 }
 
 /// 系统保存对话框写入文件（生产实现：tauri-plugin-dialog + UTF-8 BOM 内容）
@@ -1464,7 +2071,10 @@ fn confirm_action(title: String, message: String, app_handle: AppHandle) -> Resu
     confirm_with_dialog(&app_handle, &title, &message)
 }
 
-/// 校验凭据文件并复制到规范位置，返回加载后的凭据（纯逻辑，便于单测覆盖）
+/// 校验凭据文件并**原子替换**规范位置的 credentials.dat，返回校验通过的凭据。
+///
+/// 顺序严格为：读源文件 → 验签/解析 → 预构造全部内存快照 → 唯一临时文件写入并 sync
+/// → rename 替换目标。任一步失败都保留旧文件与旧内存，不做半截提交。
 pub fn import_credentials_from_path(path: &std::path::Path) -> Result<credentials::Credentials, String> {
     if !path.exists() {
         return Err(format!("凭据文件不存在: {}", path.display()));
@@ -1478,14 +2088,50 @@ pub fn import_credentials_from_path(path: &std::path::Path) -> Result<credential
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建数据目录失败: {}", e))?;
         }
-        std::fs::copy(path, &target)
-            .map_err(|e| format!("复制凭据到 {} 失败: {}", target.display(), e))?;
+        let bytes = std::fs::read(path).map_err(|e| format!("读取凭据文件失败: {}", e))?;
+        // 同目录唯一临时文件 + sync + rename：目标要么是完整旧文件，要么是完整新文件
+        let tmp = target.with_file_name(format!(
+            "credentials.dat.{}.tmp",
+            std::process::id()
+        ));
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("写入凭据临时文件失败: {}（原凭据未改动）", e));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &target) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "替换凭据文件失败: {}（原凭据仍可用）",
+                e
+            ));
+        }
     }
     Ok(creds)
 }
 
-/// 将导入的凭据注入运行状态（无需重启即生效）：配置镜像字段 + TTS 引擎 + AI Provider
-fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) {
+/// 将导入的凭据注入运行状态（**下一次连接**即生效）。
+///
+/// 分两步：① 在短闸门内发布凭据快照并同步配置镜像；② 同步 AI/TTS 消费方。
+/// ②失败时返回 `Err`，由调用方决定重新读回还是进入"暂禁开播"状态 ——
+/// 不能出现"凭据状态报告 B、引擎却静默使用 A"。
+fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) -> Result<(), String> {
+    state.publish_credentials(CredentialState {
+        creds: creds.clone(),
+        loaded: true,
+        blocked_reason: None,
+    });
+
     if let Ok(mut cfg) = state.config.lock() {
         cfg.app_id = creds.app_id.clone();
         cfg.access_key_id = creds.access_key_id.clone();
@@ -1493,28 +2139,37 @@ fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) {
         cfg.mimo_api_key = creds.mimo_tts_api_key.clone();
         cfg.deepseek_api_key = creds.chat_api_key.clone();
     }
-    state.ai_provider.set_api_key(creds.chat_api_key.clone());
-    if let Ok(cfg) = state.config.lock() {
-        let mimo_key = if !creds.mimo_tts_api_key.is_empty() {
-            creds.mimo_tts_api_key.clone()
-        } else {
-            cfg.mimo_api_key.clone()
-        };
-        state.tts_mgr.update_config(TTSConfig {
-            engine: parse_tts_engine(&cfg.tts_engine),
-            enable_voice: cfg.enable_voice,
-            speech_rate: cfg.speech_rate,
-            speech_volume: cfg.speech_volume,
-            speech_pitch: cfg.speech_pitch,
-            // Manbo Key 权威来源为注册表/配置，不由 credentials.dat 承载
-            manbo_api_key: cfg.manbo_api_key.clone(),
-            manbo_voice: cfg.manbo_voice.clone(),
-            mimo_api_key: mimo_key,
-            mimo_voice: cfg.mimo_voice.clone(),
-            mimo_style: cfg.mimo_style.clone(),
-            mimo_audio_format: cfg.mimo_audio_format.clone(),
-        });
-    }
+
+    sync_credential_consumers(state)
+}
+
+/// 把当前凭据快照同步到 AI Provider 与 TTS 引擎。
+/// 单独成函数是为了让"磁盘已提交 B、内存/引擎发布失败"这一中间态可被显式检测与补偿。
+fn sync_credential_consumers(state: &AppState) -> Result<(), String> {
+    let snap = state.credentials_snapshot();
+    state.ai_provider.set_api_key(snap.creds.chat_api_key.clone());
+
+    let cfg = state.config.lock().map_err(|e| e.to_string())?.clone();
+    let mimo_key = if !snap.creds.mimo_tts_api_key.is_empty() {
+        snap.creds.mimo_tts_api_key.clone()
+    } else {
+        cfg.mimo_api_key.clone()
+    };
+    state.tts_mgr.update_config(TTSConfig {
+        engine: parse_tts_engine(&cfg.tts_engine),
+        enable_voice: cfg.enable_voice,
+        speech_rate: cfg.speech_rate,
+        speech_volume: cfg.speech_volume,
+        speech_pitch: cfg.speech_pitch,
+        // Manbo Key 权威来源为注册表/配置，不由 credentials.dat 承载
+        manbo_api_key: cfg.manbo_api_key.clone(),
+        manbo_voice: cfg.manbo_voice.clone(),
+        mimo_api_key: mimo_key,
+        mimo_voice: cfg.mimo_voice.clone(),
+        mimo_style: cfg.mimo_style.clone(),
+        mimo_audio_format: cfg.mimo_audio_format.clone(),
+    });
+    Ok(())
 }
 
 /// 选择凭据文件（生产：系统打开对话框；测试构建：不弹窗）
@@ -1544,21 +2199,99 @@ fn pick_credentials_file(_app_handle: &AppHandle) -> Result<Option<String>, Stri
 
 /// 导入 B 站开放平台凭据文件（P1-8）。
 /// 安装包不随包分发 credentials.dat（避免公开分发平台密钥），故提供显式导入入口：
-/// 选择文件 → HMAC 校验 → 复制到 `{数据目录}/credentials.dat` → 即时注入运行状态。
+/// 选择文件 → HMAC 校验 → 原子替换 `{数据目录}/credentials.dat` → 发布内存快照与 AI/TTS。
+///
+/// **"即时生效"的准确界线**：只对**下一次连接**生效。运行中的长连以值持有旧凭据，
+/// 换内存快照不会让现有 WebSocket 自动改用新凭据，因此活动会话期间直接拒绝导入
+/// （在复制任何文件之前就返回），UI 文案不得写成"现有连接已切换"。
 #[tauri::command]
-fn import_credentials_file(
+async fn import_credentials_file(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<CredentialsStatus, String> {
+    // 文件选择在取得任何生命周期/保存锁**之前**完成，避免持锁等待用户点对话框
     let Some(path) = pick_credentials_file(&app_handle)? else {
         return Err("已取消导入".into());
     };
-    let creds = import_credentials_from_path(std::path::Path::new(&path))?;
-    apply_credentials_live(&state, &creds);
-    crate::log_info!("[Credentials] 已导入凭据文件: {}", path);
 
+    let _lifecycle = state.bili_lifecycle.lock().await;
+
+    // Connecting／Connected／Reconnecting 或旧连接任务尚未退出时拒绝导入
+    if state.bili_service.is_running() {
+        return Err(
+            "直播连接仍在进行中：请先断开连接并等待确认下播完成，再导入凭据（导入只对下一次连接生效）"
+                .into(),
+        );
+    }
+    {
+        let conn = state.connection.lock().map_err(|e| e.to_string())?;
+        if !matches!(conn.state, bilibili::ConnectionState::Disconnected) {
+            return Err("直播会话尚未完全停止：请先断开连接后重试".into());
+        }
+    }
+    if !state.bili_service.can_start_new_session() {
+        return Err(
+            "上一场直播的服务端关闭状态未确认，暂不能替换凭据；请稍后重试或重启应用".into(),
+        );
+    }
+
+    // 短提交闸门：只覆盖"替换文件 → 发布内存 → 同步 AI/TTS"，不含任何 .await
+    let _gate = state.credential_gate.lock().map_err(|e| e.to_string())?;
+
+    let creds = import_credentials_from_path(std::path::Path::new(&path))?;
+
+    // 磁盘 B 已提交；接下来必须在同一闸门内完成内存发布与引擎同步
     let target = credentials::get_credentials_path();
-    Ok(creds.to_status(true, &target.to_string_lossy()))
+    let publish = apply_credentials_live(&state, &creds);
+    match publish {
+        Ok(()) => {
+            crate::log_info!("[Credentials] 已导入并发布凭据文件（对下一次连接生效）");
+            Ok(creds.to_status(true, &target.to_string_lossy()))
+        }
+        Err(e) => {
+            // 磁盘已是 B 但内存发布失败：先在同一闸门内重新读回并验签磁盘 B
+            match credentials::load_credentials(Some(&target)) {
+                Ok(disk) if disk == creds => {
+                    state.publish_credentials(CredentialState {
+                        creds: disk,
+                        loaded: true,
+                        blocked_reason: None,
+                    });
+                    if let Err(e2) = sync_credential_consumers(&state) {
+                        crate::log_error!("[Credentials] 引擎同步仍失败，暂禁开播: {}", e2);
+                        state.publish_credentials(CredentialState {
+                            creds: creds.clone(),
+                            loaded: true,
+                            blocked_reason: Some(
+                                "凭据引擎同步失败，已暂禁开播，请重新导入或重启应用".to_string(),
+                            ),
+                        });
+                        return Err(format!(
+                            "凭据已写入磁盘，但语音／AI 引擎同步失败（{}）。已暂禁开播，请重新导入或重启应用。",
+                            e2
+                        ));
+                    }
+                    crate::log_warn!("[Credentials] 内存发布经重新读回后修复: {}", e);
+                    Ok(creds.to_status(true, &target.to_string_lossy()))
+                }
+                _ => {
+                    // 无法确认磁盘内容 → 进入禁止开播且高可见的凭据错误状态，保留错误供人工恢复
+                    state.publish_credentials(CredentialState {
+                        creds: Credentials::default(),
+                        loaded: false,
+                        blocked_reason: Some(format!(
+                            "凭据已替换但无法校验发布结果（{}）；已暂禁开播，请重启应用后重新导入",
+                            e
+                        )),
+                    });
+                    Err(format!(
+                        "凭据导入未能确认生效（{}）：已暂禁开播，请重启应用后重新导入",
+                        e
+                    ))
+                }
+            }
+        }
+    }
 }
 
 /// GM: 导出打卡记录（CSV / JSON，系统保存对话框 + UTF-8 BOM；受 Lite 模式控制）
@@ -1573,6 +2306,7 @@ fn gm_export_checkin_records(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     ensure_not_lite(&state, "打卡导出功能")?;
+    let checkin_mgr = state.checkin()?;
 
     let parse_date = |s: Option<String>| -> Result<Option<chrono::NaiveDate>, String> {
         match s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
@@ -1600,7 +2334,7 @@ fn gm_export_checkin_records(
             chrono::Local::now().format("%Y%m%d_%H%M%S"),
             format
         );
-        let text = state.checkin_mgr.export_users_summary(&format)?;
+        let text = checkin_mgr.export_users_summary(&format)?;
         (name, text)
     } else {
         // 指定了用户名或日期范围时，导出打卡流水明细（对齐原工程 ProfileManager_ExportCheckinRecords）
@@ -1618,9 +2352,7 @@ fn gm_export_checkin_records(
                 format
             )
         };
-        let text = state
-            .checkin_mgr
-            .export_records_content(&format, clean_user, start, end)?;
+        let text = checkin_mgr.export_records_content(&format, clean_user, start, end)?;
         (name, text)
     };
 
@@ -1876,7 +2608,9 @@ fn shutdown_app(app_handle: &AppHandle, state: &AppState) {
         }
     }
     // 2. 队列强制落盘（等价原工程退出前的 WriteQueue::Flush；覆盖 500ms 节流窗口内未写的变更）
-    flush_queue(state, true);
+    if let Err(e) = flush_queue_to_path(state, &queue::get_order_list_path(), true, Some(app_handle)) {
+        crate::log_warn!("[App] 退出时队列强制保存失败，内存队列仍完整: {}", e);
+    }
     // 3. 停止直播连接（等价原工程 BliveManager::Disconnect / Destroy）
     if state.bili_service.is_running() {
         state.bili_service.set_running(false);
@@ -1906,8 +2640,15 @@ fn apply_pending_position(state: &AppState) -> Option<(f64, f64)> {
 #[tauri::command]
 fn get_credentials_status(state: State<'_, AppState>) -> Result<CredentialsStatus, String> {
     let p = credentials::get_credentials_path();
-    let loaded = !state.credentials.app_id.is_empty();
-    Ok(state.credentials.to_status(loaded, &p.to_string_lossy()))
+    let snap = state.credentials_snapshot();
+    let loaded = snap.loaded && !snap.creds.app_id.is_empty();
+    let mut status = snap.creds.to_status(loaded, &p.to_string_lossy());
+    // 处于"暂禁开播"状态时如实标注，不谎报可用
+    if let Some(reason) = snap.blocked_reason {
+        status.loaded = false;
+        status.chat_provider = format!("{}（{}）", status.chat_provider, reason);
+    }
+    Ok(status)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1950,16 +2691,30 @@ pub fn run() {
             paths::ensure_seeded();
 
             // C1：构建弹幕关键词学习器（jieba 内嵌词典 + 随包停用词/自定义词典），
-            // 构建开销较大，仅启动时执行一次
+            // 构建开销较大，仅启动时执行一次。
+            // Lite 形态停用打卡与 AI，学习器整体不构建，也不加载分词素材。
             let mut state = AppState::default();
-            state.checkin_learner = Some(Arc::new(CheckinLearner::from_resources()));
+            if !IS_LITE {
+                state.checkin_learner = Some(Arc::new(CheckinLearner::from_resources()));
+            }
+            // F2：缺资源快照必须在 manage 之前算好并写进 AppState ——
+            // `resource-missing` 只 emit 一次，挂载晚于 setup 的前端必然收不到
+            let required: Vec<&str> = if IS_LITE {
+                vec!["monster_list.json"]
+            } else {
+                vec!["monster_list.json", "voices", "dict/stop_words.utf8"]
+            };
+            state.startup_missing = Arc::new(
+                required
+                    .into_iter()
+                    .filter(|rel| paths::find_resource(rel).is_none())
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
             app.manage(state);
 
-            // 资源缺失可见：日志 + 事件（前端提示在 D5 落地）
-            let missing: Vec<&str> = ["monster_list.json", "voices", "dict/stop_words.utf8"]
-                .into_iter()
-                .filter(|rel| paths::find_resource(rel).is_none())
-                .collect();
+            // 资源缺失可见：日志 + 事件（前端事件与快照按名去重合并展示）
+            let missing: Vec<String> = app.state::<AppState>().startup_missing.as_ref().clone();
             if !missing.is_empty() {
                 crate::log_warn!("[Paths] 资源缺失: {:?}（相关功能将降级运行）", missing);
                 for rel in &missing {
@@ -1967,8 +2722,9 @@ pub fn run() {
                 }
             }
 
-            // TTS 音频留档：启动时清理超过保留天数的 TempAudio/YYYYMMDD 目录（B7）
-            {
+            // TTS 音频留档：启动时清理超过保留天数的 TempAudio/YYYYMMDD 目录（B7）。
+            // Lite 停用 TTS，不得清理与完整版共用数据目录中的音频留档。
+            if !IS_LITE {
                 let days = app.state::<AppState>().config.lock().map(|c| c.tts_cache_days_to_keep).unwrap_or(7);
                 let removed = tts::cleanup_old_cache(days);
                 if removed > 0 {
@@ -2031,9 +2787,14 @@ pub fn run() {
                         continue;
                     }
 
-                    // 超时连击统一进入高优先队列（每 tick 结算一次）
-                    for msg in state.tts_mgr.flush_gift_combos(only_paid) {
-                        state.tts_mgr.enqueue_speak(&msg, "", true);
+                    // 超时连击统一进入高优先队列（每 tick 结算一次）；
+                    // 留档与「仅付费播报」过滤分开：被过滤的文案仍写 History
+                    for report in state.tts_mgr.flush_gift_combos(only_paid) {
+                        record_business_history(&report.text);
+                        record_business_history_probe(&report.text);
+                        if report.can_speak {
+                            state.tts_mgr.enqueue_speak(&report.text, "", true);
+                        }
                     }
 
                     // 各队列每周期各推进一条（普通播报不会被优先队列饿死）
@@ -2046,8 +2807,8 @@ pub fn run() {
                         }
                         let tts = state.tts_mgr.clone();
                         tauri::async_runtime::spawn(async move {
-                            // 历史留档：记录实际播报出去的文本（对齐原工程 WriteLog::RecordHistory）
-                            logging::record_history(&task.text);
+                            // 此处不再写 History：留档改由各业务事件在"文本形成时"完成一次，
+                            // 否则语音开关、队满、合成失败都会连带删掉业务留档
                             let _ = tts.speak_task(&task).await;
                             tts.release_slot();
                         });
@@ -2055,15 +2816,16 @@ pub fn run() {
                 }
             });
 
-            // 队列落盘节流：每 500ms 检查脏标记，仅在变更后于锁外写盘
+            // 队列落盘节流：每 500ms 检查未落盘版本，仅在变更后于锁外写盘
             // （对齐原工程 PriorityQueueManager::Tick 的 SAVE_INTERVAL_MS=500）
             {
                 let state = app.state::<AppState>().inner().clone();
+                let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
                     loop {
                         interval.tick().await;
-                        flush_queue(&state, false);
+                        flush_queue(&state, false, Some(&handle));
                     }
                 });
             }
@@ -2118,6 +2880,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_queue,
             add_order,
+            add_picked_order,
             dequeue_by_user_id,
             clear_queue,
             reorder_queue,
@@ -2143,6 +2906,8 @@ pub fn run() {
             gm_search_users,
             gm_grant_card,
             gm_export_checkin_records,
+            get_checkin_status,
+            get_missing_resources,
             confirm_action,
             get_manbo_voice_list,
             get_current_tts_engine,
@@ -2157,8 +2922,21 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// 测试用隔离序号：保证每个 `AppState::new_test()` 拿到独立的名单文件路径
+#[cfg(test)]
+static TEST_APPSTATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 impl AppState {
+    /// 测试专用：取出内存打卡库。    ///
+    /// 生产路径必须经 `checkin()` 判断可用性；数据库故障是受测场景之一，
+    /// 因此这里只在"测试确实注入了内存库"的前置条件下取出。
+    pub fn test_checkin(&self) -> &Arc<CheckinManager> {
+        self.checkin_mgr
+            .as_ref()
+            .expect("测试应注入内存打卡库（new_test / 显式注入）")
+    }
+
     pub fn new_test() -> Self {
         let mut app_cfg = AppConfig::default();
         // 单测需覆盖播报链路，故测试基线显式开启语音（生产默认值对齐原工程为 false）
@@ -2167,6 +2945,8 @@ impl AppState {
         let _ = monster_mgr.load_from_file(None);
         let queue_mgr = QueueManager::new();
         let checkin_mgr = CheckinManager::new_in_memory().expect("In-memory SQLite failed");
+        // 测试显式注入内存库：生产路径的 `checkin_mgr` 为 None 时业务必须拒绝写入
+        let checkin_status = CheckinStatus::available("memory".to_string(), false);
         let tts_mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Manbo,
             enable_voice: true,
@@ -2183,28 +2963,45 @@ impl AppState {
         let ai_provider = DeepSeekAIChatProvider::new(String::new());
         let danmu_processor = bilibili::DanmuProcessor::new();
         let creds = credentials::load_credentials(None).unwrap_or_default();
-        // 单测名单指向临时目录：绝不读写真实 monster_roster.json
+        // 单测名单指向临时目录：绝不读写真实 monster_roster.json。
+        // 每个实例用**唯一路径**（进程号 + 自增序号）：共用一个文件会让某个测试写入的
+        // 禁点内容泄漏给并行运行的其他测试，造成随机失败
         let roster = MonsterRoster::load(Some(
             &std::env::temp_dir()
-                .join("mh_test_appstate_roster")
+                .join(format!(
+                    "mh_test_appstate_roster_{}_{}",
+                    std::process::id(),
+                    TEST_APPSTATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ))
                 .join(roster::ROSTER_FILE_NAME),
         ));
 
         Self {
             queue_mgr: Arc::new(Mutex::new(queue_mgr)),
+            queue_flush_lock: Arc::new(Mutex::new(())),
+            queue_persistence_broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             monster_mgr: Arc::new(monster_mgr),
             roster: Arc::new(roster),
-            checkin_mgr: Arc::new(checkin_mgr),
+            checkin_mgr: Some(Arc::new(checkin_mgr)),
+            checkin_status: Arc::new(checkin_status),
             checkin_learner: None,
             tts_mgr: Arc::new(tts_mgr),
             ai_provider: Arc::new(ai_provider),
             config: Arc::new(Mutex::new(app_cfg)),
-            credentials: Arc::new(creds),
+            credentials: Arc::new(std::sync::RwLock::new(CredentialState {
+                loaded: !creds.app_id.is_empty(),
+                creds,
+                blocked_reason: None,
+            })),
+            bili_lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            credential_gate: Arc::new(Mutex::new(())),
             danmu_processor: Arc::new(danmu_processor),
             connection: Arc::new(Mutex::new(bilibili::ConnectionStatus::default())),
             bili_service: Arc::new(bilibili::BiliLiveService::new()),
             overlay_locked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_pos: Arc::new(Mutex::new(None)),
+            startup_missing: Arc::new(Vec::new()),
+            last_checkin_unavailable_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 }
@@ -2362,6 +3159,7 @@ mod tests {
             guard_level: 0, // 初始为 0，由管道自动赋权总督 1
             msg_id: "sim_special_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         let res = handle_incoming_danmu(None, &state, dm);
@@ -2394,6 +3192,7 @@ mod tests {
             guard_level: 3, // 舰长
             msg_id: "sim_checkin_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         let res = handle_incoming_danmu(None, &state, dm);
@@ -2402,7 +3201,7 @@ mod tests {
         assert!(!res.added_to_queue);
 
         // 验证 SQLite 打卡档案已成功建立
-        let profile = state.checkin_mgr.get_profile("guard_captain_1").expect("Profile not found");
+        let profile = state.test_checkin().get_profile("guard_captain_1").expect("Profile not found");
         assert_eq!(profile.cumulative_days, 1);
         assert_eq!(profile.continuous_days, 1);
 
@@ -2427,6 +3226,7 @@ mod tests {
             guard_level: 3,
             msg_id: "sim_checkin_2".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let _ = handle_incoming_danmu(None, &state, dm2);
         let task2 = state.tts_mgr.dequeue_speak().expect("重复打卡应有回复");
@@ -2449,9 +3249,9 @@ mod tests {
         let d_3_days_ago = today - chrono::Duration::days(3);
 
         // 预设打卡记录：3天前与今天打卡，昨天与前天断签
-        state.checkin_mgr.record_checkin("captain_retro", "补签猎人", d_3_days_ago).unwrap();
-        state.checkin_mgr.record_checkin("captain_retro", "补签猎人", today).unwrap();
-        state.checkin_mgr.grant_card("captain_retro", 2).unwrap();
+        state.test_checkin().record_checkin("captain_retro", "补签猎人", d_3_days_ago).unwrap();
+        state.test_checkin().record_checkin("captain_retro", "补签猎人", today).unwrap();
+        state.test_checkin().grant_card("captain_retro", 2).unwrap();
 
         // 舰长发送“补签”弹幕（打卡日期口径为服务器时间，测试用当前时间戳）
         let dm = bilibili::DanmuData {
@@ -2464,13 +3264,14 @@ mod tests {
             guard_level: 3,
             msg_id: "sim_retro_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         let res = handle_incoming_danmu(None, &state, dm);
         assert!(!res.matched);
 
         // 验证补签卡扣减为 1 张
-        let cards = state.checkin_mgr.get_cards("captain_retro");
+        let cards = state.test_checkin().get_cards("captain_retro");
         assert_eq!(cards.card_count, 1);
 
         // C2/C4：回复文案对齐原工程（含补签日期与恢复后的连续天数）
@@ -2482,7 +3283,7 @@ mod tests {
 
         // 验证昨天日期已被补签
         let records = state
-            .checkin_mgr
+            .test_checkin()
             .export_records_content("csv", None, None, None)
             .unwrap();
         let yesterday_int = checkin::CheckinManager::date_to_int(d_yesterday);
@@ -2509,6 +3310,1208 @@ mod tests {
         println!("[PASS] test_parse_checkin_trigger_words_fullwidth_comma passed");
     }
 
+    // ---------------- A1/A2：队列版本协议与磁盘单写者 ----------------
+
+    /// A2 核心反测：强制保存必须等待后台刷盘锁，最终磁盘是**最新**队列。
+    ///
+    /// 屏障直接复用真实的 `queue_flush_lock`（不引入生产代码里的测试钩子）：
+    /// 测试线程扮演「已取得刷盘锁、停在旧快照写盘前」的后台任务，
+    /// 此时更新内存并启动强制保存 —— 它必须阻塞；释放后台锁后，旧快照先落盘、
+    /// 强制保存再写最新队列，磁盘最终为新队列。
+    #[test]
+    fn test_flush_lock_serializes_background_before_forced_save() {
+        let state = AppState::new_test();
+        let dir = std::env::temp_dir().join("mh_test_flush_barrier");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("order_list.json");
+
+        let mk = |uid: &str, ts: i64| QueueItem {
+            id: format!("item-{}", uid),
+            user_id: uid.into(),
+            user_name: format!("水友{}", uid),
+            monster_name: "火龙".into(),
+            is_priority: false,
+            guard_level: 0,
+            tempered_level: 0,
+            timestamp: ts,
+            icon_url: String::new(),
+        };
+        {
+            let mut q = state.queue_mgr.lock().unwrap();
+            q.add_or_update(mk("b", 20));
+            q.add_or_update(mk("a", 10));
+        }
+
+        // 后台任务：取得刷盘锁，取到旧快照 [a,b] 后停在这里
+        let guard = state.queue_flush_lock.lock().unwrap();
+        let stale_json = state.queue_mgr.lock().unwrap().to_json().unwrap();
+
+        // 主播完成 b：内存变成 [a]
+        {
+            let mut q = state.queue_mgr.lock().unwrap();
+            q.dequeue_by_user_id("b");
+        }
+
+        // 强制保存：必须等待刷盘锁
+        let forced_state = state.clone();
+        let forced_path = path.clone();
+        let forced = std::thread::spawn(move || {
+            flush_queue_to_path(&forced_state, &forced_path, true, None)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!forced.is_finished(), "强制保存必须等待后台写锁，不得并行落盘");
+
+        // 后台继续：旧快照落盘后释放锁
+        QueueManager::write_json(&path, &stale_json).unwrap();
+        drop(guard);
+
+        forced.join().unwrap().expect("强制保存应成功");
+
+        // 最终磁盘必须是完成 b 之后的最新队列
+        let final_text = std::fs::read_to_string(&path).unwrap();
+        let final_items: Vec<QueueItem> = serde_json::from_str(&final_text).unwrap();
+        assert_eq!(
+            final_items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            vec!["a"],
+            "最终磁盘必须是后到的强制保存内容，旧快照不得胜出"
+        );
+
+        let snapshot = state.queue_mgr.lock().unwrap().snapshot();
+        assert_eq!(snapshot.persistence, QueuePersistence::Saved, "已确认落盘");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_flush_lock_serializes_background_before_forced_save passed");
+    }
+
+    /// A2：落盘失败必须可见（返回 Err）且保留未落盘状态，重试成功后才确认 Saved
+    #[test]
+    fn test_flush_failure_is_visible_and_retryable() {
+        let state = AppState::new_test();
+        let dir = std::env::temp_dir().join("mh_test_flush_retry");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let mut q = state.queue_mgr.lock().unwrap();
+            q.add_or_update(QueueItem {
+                id: "item-1".into(),
+                user_id: "u1".into(),
+                user_name: "水友".into(),
+                monster_name: "火龙".into(),
+                is_priority: false,
+                guard_level: 0,
+                tempered_level: 0,
+                timestamp: 1,
+                icon_url: String::new(),
+            });
+        }
+
+        // 目标路径的父级是个文件 → 无法创建目录，写盘必然失败
+        let blocked_parent = dir.join("blocked");
+        std::fs::write(&blocked_parent, b"x").unwrap();
+        let blocked = blocked_parent.join("order_list.json");
+        assert!(
+            flush_queue_to_path(&state, &blocked, true, None).is_err(),
+            "写盘失败必须作为错误上报，不能静默"
+        );
+        assert_eq!(
+            state.queue_mgr.lock().unwrap().persistence(),
+            QueuePersistence::PendingRetry,
+            "写盘失败后必须保留未落盘状态以便重试"
+        );
+
+        // 下一 tick / 下一次命令重试到可写路径 → 确认已保存
+        let good = dir.join("order_list.json");
+        assert!(flush_queue_to_path(&state, &good, false, None).is_ok());
+        assert_eq!(
+            state.queue_mgr.lock().unwrap().persistence(),
+            QueuePersistence::Saved
+        );
+        assert!(std::fs::read_to_string(&good).unwrap().contains("u1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_flush_failure_is_visible_and_retryable passed");
+    }
+
+    /// A1：命令返回的权威快照带版本，且内存队列与快照 items 同源
+    #[test]
+    fn test_queue_snapshot_surface_is_versioned() {
+        let state = AppState::new_test();
+        let before = queue_snapshot_or_default(&state);
+        assert_eq!(before.revision, 0);
+        assert_eq!(before.persistence, QueuePersistence::Saved);
+
+        {
+            let mut q = state.queue_mgr.lock().unwrap();
+            q.add_or_update(QueueItem {
+                id: "item-1".into(),
+                user_id: "u1".into(),
+                user_name: "水友".into(),
+                monster_name: "火龙".into(),
+                is_priority: false,
+                guard_level: 0,
+                tempered_level: 0,
+                timestamp: 1,
+                icon_url: String::new(),
+            });
+        }
+
+        let after = queue_snapshot_or_default(&state);
+        assert_eq!(after.revision, 1, "新增必须递增版本");
+        assert_eq!(after.persistence, QueuePersistence::PendingRetry);
+        assert_eq!(after.items.len(), 1);
+        println!("[PASS] test_queue_snapshot_surface_is_versioned passed");
+    }
+
+    // ---------------- C1：打卡不可用必须显式停用 ----------------
+
+    /// 打卡库不可用时：有权限用户的打卡/补签/查询必须被明确拒绝，
+    /// 不写库、不伪造成功气泡、不落进普通 TTS 朗读
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_unavailable_checkin_rejects_commands_without_fake_success() {
+        let state = AppState::new_test();
+        // 模拟生产路径的初始化失败：显式停用打卡子系统
+        let mut disabled = state.clone();
+        disabled.checkin_mgr = None;
+        disabled.checkin_status = Arc::new(CheckinStatus::database_unavailable());
+        assert!(!disabled.checkin_available());
+        assert!(disabled.checkin().is_err(), "停用后取句柄必须失败");
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let mk = |msg: &str, id: &str| bilibili::DanmuData {
+            user_id: "cap_disabled".into(),
+            user_name: "舰长甲".into(),
+            message: msg.into(),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 12,
+            guard_level: 3,
+            msg_id: id.into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        for (msg, id) in [("打卡", "d1"), ("补签", "d2"), ("我的补签卡", "d3")] {
+            let res = handle_incoming_danmu(None, &disabled, mk(msg, id));
+            assert_eq!(
+                res,
+                bilibili::DanmuProcessResult {
+                    user_id: res.user_id.clone(),
+                    user_name: res.user_name.clone(),
+                    ..Default::default()
+                },
+                "「{}」必须被拦下，不得产生任何业务动作", msg
+            );
+            assert!(
+                disabled.tts_mgr.dequeue_speak().is_none(),
+                "「{}」不得伪造成功气泡或落入普通朗读", msg
+            );
+        }
+
+        // 数据库确实没有任何写入
+        assert!(state.test_checkin().get_profile("cap_disabled").is_err());
+        println!("[PASS] test_unavailable_checkin_rejects_commands_without_fake_success passed");
+    }
+
+    /// 点赞奖卡在打卡库不可用时同样不得静默丢弃
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_unavailable_checkin_rejects_like_rewards() {
+        let mut disabled = AppState::new_test();
+        disabled.checkin_mgr = None;
+        disabled.checkin_status = Arc::new(CheckinStatus::database_unavailable());
+
+        let ev = bilibili::LikeEvent {
+            uid: "like_disabled".into(),
+            username: "点赞水友".into(),
+            msg_id: "like_disabled_1".into(),
+            like_count: 30,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        assert!(
+            handle_incoming_like(None, &disabled, &ev).is_empty(),
+            "库不可用时不得发出奖卡回复"
+        );
+        assert!(disabled.tts_mgr.dequeue_speak().is_none());
+        println!("[PASS] test_unavailable_checkin_rejects_like_rewards passed");
+    }
+
+    /// 高频 LIKE 的不可用提示必须节流：同一提示 60 秒内只广播一次，
+    /// 否则点赞刷屏会把日志与前端事件打爆
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_like_unavailable_notice_is_throttled() {
+        let mut disabled = AppState::new_test();
+        disabled.checkin_mgr = None;
+        disabled.checkin_status = Arc::new(CheckinStatus::database_unavailable());
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let mk = |i: i64| bilibili::LikeEvent {
+            uid: "spam_like".into(),
+            username: "刷赞水友".into(),
+            msg_id: format!("spam_like_{}", i),
+            like_count: 1,
+            timestamp: now_ts,
+        };
+
+        // 首次会记录时间戳
+        assert!(disabled
+            .last_checkin_unavailable_at
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0);
+        assert!(handle_incoming_like(None, &disabled, &mk(1)).is_empty());
+        let first = disabled
+            .last_checkin_unavailable_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(first > 0, "首次不可用提示应记录时间戳");
+
+        // 随后的高频点赞不再重复广播（时间戳保持不变）
+        for i in 2..=20 {
+            assert!(handle_incoming_like(None, &disabled, &mk(i)).is_empty());
+        }
+        assert_eq!(
+            disabled
+                .last_checkin_unavailable_at
+                .load(std::sync::atomic::Ordering::Relaxed),
+            first,
+            "节流窗口内不得重复广播"
+        );
+        println!("[PASS] test_like_unavailable_notice_is_throttled passed");
+    }
+
+    // ---------------- D4：补签不得被打卡防刷屏吞掉 ----------------
+
+    /// 连发 3 条**不同 msg_id** 的「补签」：三个缺日都要被处理。
+    ///
+    /// 学习器的同内容防刷屏阈值是 3，早期实现把整个「打卡+补签」分支都套在
+    /// `should_skip_duplicate` 之下，导致第 3 条补签被静默吞掉（既不补签也不朗读）。
+    /// 该防刷屏只应作用于打卡模块。
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_three_retro_commands_are_not_swallowed_by_duplicate_guard() {
+        let mut state = AppState::new_test();
+        state.checkin_learner = Some(Arc::new(CheckinLearner::from_resources()));
+
+        let today = chrono::Local::now().date_naive();
+        let four_days_ago = today - chrono::Duration::days(4);
+        let uid = "retro_three";
+
+        // 3 张卡、3 个缺日（today-1 / -2 / -3 都没打）
+        state.test_checkin().record_checkin(uid, "三连补签", four_days_ago).unwrap();
+        state.test_checkin().record_checkin(uid, "三连补签", today).unwrap();
+        state.test_checkin().grant_card(uid, 3).unwrap();
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let mk = |id: &str| bilibili::DanmuData {
+            user_id: uid.into(),
+            user_name: "三连补签".into(),
+            message: "补签".into(),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 12,
+            guard_level: 3,
+            msg_id: id.into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        for (i, id) in ["three_1", "three_2", "three_3"].iter().enumerate() {
+            let res = handle_incoming_danmu(None, &state, mk(id));
+            assert_eq!(
+                res.user_id, uid,
+                "第 {} 条补签必须被补签分支处理", i + 1
+            );
+            // 每条都应产出补签播报（入 TTS 队列），而不是退化成普通弹幕朗读
+            let task = state
+                .tts_mgr
+                .dequeue_speak()
+                .unwrap_or_else(|| panic!("第 {} 条补签应产生补签播报", i + 1));
+            assert!(
+                task.is_checkin,
+                "第 {} 条补签的播报必须是签到类（而非普通朗读）", i + 1
+            );
+        }
+
+        assert_eq!(
+            state.test_checkin().get_cards(uid).card_count,
+            0,
+            "3 条合法补签应各扣 1 张卡"
+        );
+        assert_eq!(
+            state.test_checkin().get_profile(uid).unwrap().cumulative_days,
+            5,
+            "3 个缺日都应补上（2 条原始 + 3 条补签）"
+        );
+        println!("[PASS] test_three_retro_commands_are_not_swallowed_by_duplicate_guard passed");
+    }
+
+    /// 打卡模块自身的同内容防刷屏必须保留：连发 3 条「打卡」时第 3 条仍走重复拦截
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_checkin_duplicate_guard_still_applies() {
+        let mut state = AppState::new_test();
+        state.checkin_learner = Some(Arc::new(CheckinLearner::from_resources()));
+
+        let uid = "checkin_spam";
+        let now_ts = chrono::Utc::now().timestamp();
+        let mk = |id: &str| bilibili::DanmuData {
+            user_id: uid.into(),
+            user_name: "刷屏舰长".into(),
+            message: "打卡".into(),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 12,
+            guard_level: 3,
+            msg_id: id.into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        for id in ["spam_1", "spam_2"] {
+            let _ = handle_incoming_danmu(None, &state, mk(id));
+            assert!(state.tts_mgr.dequeue_speak().is_some(), "前两条打卡应有回复");
+        }
+        // 第 3 条被学习器判重 → 打卡分支不执行，落到普通弹幕路径（非签到类播报或无声）
+        let _ = handle_incoming_danmu(None, &state, mk("spam_3"));
+        if let Some(task) = state.tts_mgr.dequeue_speak() {
+            assert!(
+                !task.is_checkin,
+                "被防刷屏拦下的打卡不得再产生签到类播报"
+            );
+        }
+        println!("[PASS] test_checkin_duplicate_guard_still_applies passed");
+    }
+
+    /// 打卡不可用时的状态快照必须自洽且不含路径等敏感信息
+    #[test]
+    fn test_checkin_status_surface_is_sanitized() {
+        let state = AppState::new_test();
+        let status = (*state.checkin_status).clone();
+        assert!(status.available);
+        assert_eq!(status.reason_code, "None");
+        if let Some(f) = &status.active_db_file {
+            assert!(
+                !f.contains('\\') && !f.contains('/') && !f.contains(':'),
+                "状态只允许暴露库文件名，不得暴露完整路径: {}",
+                f
+            );
+        }
+
+        let lite = CheckinStatus::lite_disabled();
+        assert!(!lite.available);
+        assert_eq!(lite.reason_code, "LiteDisabled");
+
+        let broken = CheckinStatus::database_unavailable();
+        assert!(!broken.available);
+        assert!(broken.active_db_file.is_none());
+        println!("[PASS] test_checkin_status_surface_is_sanitized passed");
+    }
+
+    // ---------------- E1/E2：凭据快照与生命周期闸门 ----------------
+
+    fn fake_creds(app_id: &str, secret: &str, chat: &str) -> Credentials {
+        Credentials {
+            app_id: app_id.into(),
+            access_key_id: format!("AKID{}", app_id),
+            access_key_secret: secret.into(),
+            chat_api_key: chat.into(),
+            ..Default::default()
+        }
+    }
+
+    /// E1：导入后连接与状态必须读同一份快照 —— 不再出现"状态报 B、连接用 A"
+    #[test]
+    fn test_credentials_snapshot_is_single_source_of_truth() {
+        let state = AppState::new_test();
+        let a = fake_creds("1001", "SECRET_A", "sk-a");
+        state.publish_credentials(CredentialState {
+            creds: a.clone(),
+            loaded: true,
+            blocked_reason: None,
+        });
+
+        let cfg = state.config.lock().unwrap().clone();
+        let used = state.bili_credentials(&cfg);
+        assert_eq!(used.app_id, "1001");
+        assert_eq!(used.access_key_secret, "SECRET_A");
+
+        // 换成 B 后，连接取到与快照一致的值
+        let b = fake_creds("2002", "SECRET_B", "sk-b");
+        state.publish_credentials(CredentialState {
+            creds: b.clone(),
+            loaded: true,
+            blocked_reason: None,
+        });
+        let used_b = state.bili_credentials(&cfg);
+        assert_eq!(used_b.app_id, "2002", "连接必须使用新快照，不得停留在旧的 Arc");
+        assert_eq!(used_b.access_key_secret, "SECRET_B");
+
+        // 状态查询同源
+        let snap = state.credentials_snapshot();
+        assert_eq!(snap.creds.app_id, "2002");
+        assert!(snap.loaded);
+        assert!(snap.blocked_reason.is_none());
+        println!("[PASS] test_credentials_snapshot_is_single_source_of_truth passed");
+    }
+
+    /// E1：暂禁开播状态下凭据状态必须如实标注，不得谎报可用
+    #[test]
+    fn test_credentials_status_reports_blocked_state() {
+        let state = AppState::new_test();
+        assert!(state.credentials_snapshot().blocked_reason.is_none());
+
+        state.publish_credentials(CredentialState {
+            creds: fake_creds("3003", "S", "k"),
+            loaded: true,
+            blocked_reason: Some("引擎同步失败".into()),
+        });
+        let snap = state.credentials_snapshot();
+        assert!(
+            snap.blocked_reason.is_some(),
+            "发布失败必须留下可查询的错误状态"
+        );
+        println!("[PASS] test_credentials_status_reports_blocked_state passed");
+    }
+
+    /// E1：敏感字段不得被配置页覆盖 —— save_app_config 忽略前端回传的密钥
+    #[test]
+    fn test_config_save_ignores_frontend_secrets() {
+        let state = AppState::new_test();
+        state.publish_credentials(CredentialState {
+            creds: fake_creds("4004", "TRUSTED_SECRET", "sk-trusted"),
+            loaded: true,
+            blocked_reason: None,
+        });
+
+        // 前端配置镜像里塞入伪造/空值
+        let mut hostile = AppConfig::default();
+        hostile.app_id = "9999".into();
+        hostile.access_key_secret = "HACKED".into();
+        hostile.deepseek_api_key = "sk-hacked".into();
+        hostile.mimo_api_key = "sk-mimo-hacked".into();
+        hostile.manbo_api_key = "".into();
+
+        let prev = state.config.lock().unwrap().clone();
+        // 复刻 save_app_config 的字段裁决逻辑
+        let snap = state.credentials_snapshot();
+        let mut new_cfg = hostile.clone();
+        new_cfg.app_id = snap.creds.app_id.clone();
+        new_cfg.access_key_id = snap.creds.access_key_id.clone();
+        new_cfg.access_key_secret = snap.creds.access_key_secret.clone();
+        new_cfg.deepseek_api_key = snap.creds.chat_api_key.clone();
+        new_cfg.mimo_api_key = snap.creds.mimo_tts_api_key.clone();
+        if new_cfg.manbo_api_key.trim().is_empty() {
+            new_cfg.manbo_api_key = prev.manbo_api_key.clone();
+        }
+
+        assert_eq!(new_cfg.app_id, "4004", "前端 app_id 不得覆盖凭据文件");
+        assert_eq!(new_cfg.access_key_secret, "TRUSTED_SECRET", "密钥不得被前端覆盖");
+        assert_eq!(new_cfg.deepseek_api_key, "sk-trusted");
+        assert_ne!(new_cfg.mimo_api_key, "sk-mimo-hacked");
+        println!("[PASS] test_config_save_ignores_frontend_secrets passed");
+    }
+
+    /// E2：活动会话期间导入必须被拒绝，且不触碰文件
+    #[test]
+    fn test_credentials_import_rejected_while_session_active() {
+        let state = AppState::new_test();
+
+        // 模拟正在连接
+        state.bili_service.set_running(true);
+        assert!(state.bili_service.is_running());
+        // 复刻 import_credentials_file 的前置拒绝条件
+        let rejected = state.bili_service.is_running();
+        assert!(rejected, "活动会话必须拒绝导入");
+
+        state.bili_service.set_running(false);
+        // 服务端关闭状态未确认时同样不放行
+        state
+            .bili_service
+            .set_end_state(bilibili::SessionEndState::Unknown);
+        assert!(
+            !state.bili_service.can_start_new_session(),
+            "关闭状态未确认时必须拒绝轮换"
+        );
+
+        state
+            .bili_service
+            .set_end_state(bilibili::SessionEndState::Confirmed);
+        assert!(state.bili_service.can_start_new_session());
+        println!("[PASS] test_credentials_import_rejected_while_session_active passed");
+    }
+
+    /// E2：生命周期闸门是同一把锁 —— start 与 import 不可能同时进入临界区
+    #[test]
+    fn test_lifecycle_gate_is_shared_and_exclusive() {
+        let state = AppState::new_test();
+        let gate = state.bili_lifecycle.clone();
+        let other = state.bili_lifecycle.clone();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let g1 = gate.lock().await;
+            // 第二个获取者必须等待：用 try_lock 证明它拿不到
+            assert!(
+                other.try_lock().is_err(),
+                "生命周期闸门必须互斥（start 与 import 共用同一把）"
+            );
+            drop(g1);
+            assert!(other.try_lock().is_ok(), "释放后应可获取");
+        });
+
+        // 两个 AppState 克隆必须指向同一把锁
+        let cloned = state.clone();
+        rt.block_on(async {
+            let _g = state.bili_lifecycle.lock().await;
+            assert!(cloned.bili_lifecycle.try_lock().is_err(), "克隆共享同一闸门");
+        });
+        println!("[PASS] test_lifecycle_gate_is_shared_and_exclusive passed");
+    }
+
+    /// E3：主动断开后必须先确认 end 才允许新会话；未确认时保留 game_id
+    #[test]
+    fn test_disconnect_requires_confirmed_end_before_new_session() {
+        let state = AppState::new_test();
+        state.bili_service.set_game_id(Some("gid_live".into()));
+        state
+            .bili_service
+            .set_end_state(bilibili::SessionEndState::Active);
+
+        // 断开：取得唯一执行权
+        let gid = state.bili_service.begin_end().expect("应取得 end 执行权");
+        assert_eq!(gid, "gid_live");
+        // 后台不得重复 end
+        assert_eq!(state.bili_service.begin_end(), None);
+        // 未确认前不允许开新会话
+        assert!(!state.bili_service.can_start_new_session());
+
+        // end 失败路径：保留 ID 与 Unknown
+        state.bili_service.mark_end_unknown();
+        assert_eq!(state.bili_service.get_game_id().as_deref(), Some("gid_live"));
+        assert!(!state.bili_service.can_start_new_session());
+
+        // 重试成功：清理并放行
+        let _ = state.bili_service.begin_end();
+        state.bili_service.confirm_end();
+        assert!(state.bili_service.can_start_new_session());
+        assert_eq!(state.bili_service.get_game_id(), None);
+        println!("[PASS] test_disconnect_requires_confirmed_end_before_new_session passed");
+    }
+
+    // ---------------- F1：History 从业务事件留档 ----------------
+
+    /// 完整版：用户**关着语音**时，普通弹幕、打卡回复、补签查询仍必须各留档一次
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_history_recorded_even_when_voice_disabled() {
+        let state = AppState::new_test();
+        // 显式关闭语音（生产默认值）
+        if let Ok(mut c) = state.config.lock() {
+            c.enable_voice = false;
+        }
+        let _ = logging::take_history_sink(); // 清空探针
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let mk = |msg: &str, id: &str| bilibili::DanmuData {
+            user_id: "hist_cap".into(),
+            user_name: "留档舰长".into(),
+            message: msg.into(),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 12,
+            guard_level: 3,
+            msg_id: id.into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        // 普通聊天（不含任何指令）
+        let _ = handle_incoming_danmu(None, &state, mk("今天天气不错", "hist_dm_1"));
+        // 打卡
+        let _ = handle_incoming_danmu(None, &state, mk("打卡", "hist_dm_2"));
+        // 补签查询
+        let _ = handle_incoming_danmu(None, &state, mk("我的补签卡", "hist_dm_3"));
+
+        let sink = logging::take_history_sink();
+        assert!(
+            sink.iter().any(|s| s == "留档舰长 说：今天天气不错"),
+            "普通弹幕必须留档原文（即便关着语音）: {:?}",
+            sink
+        );
+        assert!(
+            sink.iter().any(|s| s == "留档舰长 说：打卡"),
+            "打卡指令的原始弹幕必须留档: {:?}",
+            sink
+        );
+        assert!(
+            sink.iter().any(|s| s.contains("补签卡") && s.contains("留档舰长")),
+            "补签查询回复必须留档: {:?}",
+            sink
+        );
+        assert!(
+            sink.iter().any(|s| s.contains("打卡") && s.contains("累计")),
+            "打卡回复必须留档: {:?}",
+            sink
+        );
+        println!(
+            "[PASS] test_history_recorded_even_when_voice_disabled passed ({} 条留档)",
+            sink.len()
+        );
+    }
+
+    /// 字段不齐的畸形弹幕不得留档成「 说：」
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_history_skips_malformed_danmu() {
+        let state = AppState::new_test();
+        let _ = logging::take_history_sink();
+
+        for (name, msg) in [("", "有消息没昵称"), ("有昵称没消息", "")] {
+            let dm = bilibili::DanmuData {
+                user_id: "malformed".into(),
+                user_name: name.into(),
+                message: msg.into(),
+                timestamp: chrono::Utc::now().timestamp(),
+                has_medal: false,
+                medal_level: 0,
+                guard_level: 0,
+                msg_id: "malformed_1".into(),
+                is_paid_gift: false,
+                has_history_required_fields: false,
+            };
+            let _ = handle_incoming_danmu(None, &state, dm);
+        }
+
+        let sink = logging::take_history_sink();
+        assert!(
+            !sink.iter().any(|s| s.contains(" 说：")),
+            "缺字段的畸形包不得留档: {:?}",
+            sink
+        );
+        println!("[PASS] test_history_skips_malformed_danmu passed");
+    }
+
+    /// 礼物结算：任何结算文案都不得被丢弃，且文本与"是否允许播报"分别表达。
+    ///
+    /// 说明：官方连击准备池只会收 `paid=true` 的事件，因此 `only_paid_gift` 对它是恒真的；
+    /// 动态池的尾报也不受该开关约束。本测试锁定的是**不丢文案**这一保证
+    /// （文案被丢弃就等于业务留档永久缺失），以及 `can_speak` 的正确取值。
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_gift_settlement_never_drops_text() {
+        let _ = logging::take_history_sink();
+        let t0 = std::time::Instant::now();
+        let later = t0 + std::time::Duration::from_secs(3600);
+
+        // ① 免费礼物的动态连击尾报
+        let mut tracker = tts::GiftComboTracker::new();
+        let free = tts::GiftEvent {
+            open_id: "gift_free".into(),
+            gift_id: "1".into(),
+            uname: "免费礼物水友".into(),
+            gift_name: "辣条".into(),
+            gift_num: 3,
+            paid: false,
+            combo: None,
+        };
+        let _ = tracker.handle(&free, t0);
+        let free_reports = tracker.tick(later, true);
+        assert!(!free_reports.is_empty(), "免费礼物结算文案不得被丢弃");
+        assert!(free_reports[0].text.contains("免费礼物水友"));
+
+        // ② 官方连击（付费）准备池的结算
+        let mut tracker2 = tts::GiftComboTracker::new();
+        let paid = tts::GiftEvent {
+            open_id: "gift_paid".into(),
+            gift_id: "2".into(),
+            uname: "付费水友".into(),
+            gift_name: "小心心".into(),
+            gift_num: 1,
+            paid: true,
+            combo: Some(tts::ComboInfo {
+                base_num: 5,
+                count: 2,
+                timeout_secs: 1.0,
+            }),
+        };
+        let _ = tracker2.handle(&paid, t0);
+        let paid_reports = tracker2.tick(later, true);
+        assert_eq!(paid_reports.len(), 1, "官方连击应结算一条: {:?}", paid_reports);
+        assert!(paid_reports[0].text.contains("10"), "应结算 5×2=10 个");
+        assert!(
+            paid_reports[0].can_speak,
+            "付费礼物在仅付费模式下仍应可播报"
+        );
+
+        // ③ 后台泵路径：对每条结算文案都留档，与 can_speak 无关
+        for report in free_reports.iter().chain(paid_reports.iter()) {
+            record_business_history_probe(&report.text);
+        }
+        let sink = logging::take_history_sink();
+        assert!(
+            sink.iter().any(|s| s.contains("免费礼物水友")),
+            "免费礼物文案必须留档: {:?}",
+            sink
+        );
+        assert!(
+            sink.iter().any(|s| s.contains("付费水友")),
+            "付费礼物文案必须留档: {:?}",
+            sink
+        );
+        assert_eq!(sink.len(), 2, "每条结算文案恰好留档一次: {:?}", sink);
+        println!("[PASS] test_gift_settlement_never_drops_text passed");
+    }
+
+    /// D3：点赞事务失败后必须释放去重预留，同一事件的重投可以真正重试
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_like_failure_releases_dedup_key_and_allows_retry() {
+        let state = AppState::new_test();
+        let today = chrono::Local::now().date_naive();
+        let now_ts = chrono::Utc::now().timestamp();
+        let ev = bilibili::LikeEvent {
+            uid: "like_retry".into(),
+            username: "重试水友".into(),
+            msg_id: "like_retry_msg_1".into(),
+            like_count: 30,
+            timestamp: now_ts,
+        };
+
+        // 注入：连赞标记写入失败，使整个点赞事务回滚
+        state
+            .test_checkin()
+            .inject_sql_for_test(
+                r#"
+                CREATE TRIGGER refuse_like_streak BEFORE INSERT ON user_like_streaks
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected like failure');
+                END;
+                "#,
+            )
+            .unwrap();
+
+        // 失败：无回复、无卡，且**预留已释放**
+        assert!(
+            handle_incoming_like(None, &state, &ev).is_empty(),
+            "事务失败不得发出奖卡回复"
+        );
+        assert_eq!(state.test_checkin().get_cards("like_retry").card_count, 0);
+        assert!(
+            !state.danmu_processor.msg_id_reserved("like_retry_msg_1"),
+            "失败后必须释放去重预留，否则重投会被自己的缓存永久挡住"
+        );
+
+        // 解除故障后**同一 msg_id 重投**必须能真正入账（不是被缓存吞掉）
+        state
+            .test_checkin()
+            .inject_sql_for_test("DROP TRIGGER IF EXISTS refuse_like_streak;")
+            .unwrap();
+        let replies = handle_incoming_like(None, &state, &ev);
+        assert_eq!(replies.len(), 1, "重投应重新结算: {:?}", replies);
+        assert_eq!(replies[0], "重试水友，恭喜！今日点赞突破30，获得1张补签卡！");
+        assert_eq!(state.test_checkin().get_cards("like_retry").card_count, 1);
+        assert_eq!(
+            state.test_checkin().get_daily_like_total("like_retry", today),
+            Some(30),
+            "重试后当日点赞应如实入账（不是 60）"
+        );
+
+        // 成功后 ID 保持占用：再投一次不得重复发卡
+        assert!(handle_incoming_like(None, &state, &ev).is_empty());
+        assert_eq!(state.test_checkin().get_cards("like_retry").card_count, 1);
+        println!("[PASS] test_like_failure_releases_dedup_key_and_allows_retry passed");
+    }
+
+    /// D3：空 msg_id 不得伪造唯一键 —— 合法的多次点赞都要各自入账
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_like_with_empty_msg_id_is_not_deduped() {
+        let state = AppState::new_test();
+        let now_ts = chrono::Utc::now().timestamp();
+        let ev = bilibili::LikeEvent {
+            uid: "like_nokey".into(),
+            username: "无ID水友".into(),
+            msg_id: String::new(),
+            like_count: 30,
+            timestamp: now_ts,
+        };
+
+        // 第一次突破 30 发卡（周首破）
+        let first = handle_incoming_like(None, &state, &ev);
+        assert_eq!(first.len(), 1, "{:?}", first);
+        assert_eq!(state.test_checkin().get_cards("like_nokey").card_count, 1);
+
+        // 同日再来一条空 ID 的赞：仍在累加（不得被空键判重挡住）
+        let second = handle_incoming_like(None, &state, &ev);
+        assert!(second.is_empty(), "同周已领取，不再发卡");
+        assert_eq!(
+            state.test_checkin().get_daily_like_total("like_nokey", chrono::Local::now().date_naive()),
+            Some(60),
+            "空 msg_id 的第二次点赞必须真实累加"
+        );
+        println!("[PASS] test_like_with_empty_msg_id_is_not_deduped passed");
+    }
+
+    /// D3：DM 与 LIKE 共用同一缓存时不得互相误杀或重复消费首次 ID
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_dm_and_like_share_cache_without_double_consumption() {
+        let state = AppState::new_test();
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // ① 首次 DM 占用 shared_id
+        let dm = bilibili::DanmuData {
+            user_id: "shared_user".into(),
+            user_name: "共享水友".into(),
+            message: "点怪 火龙".into(),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 10,
+            guard_level: 3,
+            msg_id: "shared_id".into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+        let _ = handle_incoming_danmu(None, &state, dm.clone());
+        assert_eq!(state.queue_mgr.lock().unwrap().items.len(), 1, "首次 DM 应入队");
+
+        // 同 ID 重投被缓存拒绝（不重复入队）
+        let _ = handle_incoming_danmu(None, &state, dm.clone());
+        assert_eq!(state.queue_mgr.lock().unwrap().items.len(), 1, "重复 DM 不得重复入队");
+
+        // ② LIKE 用同一个 ID 也是重复（共享语义），不得被"重新消费"成一次新点赞
+        let like_same = bilibili::LikeEvent {
+            uid: "shared_user".into(),
+            username: "共享水友".into(),
+            msg_id: "shared_id".into(),
+            like_count: 30,
+            timestamp: now_ts,
+        };
+        assert!(
+            handle_incoming_like(None, &state, &like_same).is_empty(),
+            "已被 DM 占用的 ID 不得再被 LIKE 消费一次"
+        );
+        assert_eq!(state.test_checkin().get_cards("shared_user").card_count, 0);
+
+        // ③ 另一条全新 ID 的 LIKE 正常处理（DM 占用不影响不同 ID）
+        let like_new = bilibili::LikeEvent {
+            msg_id: "shared_id_like".into(),
+            ..like_same
+        };
+        assert_eq!(handle_incoming_like(None, &state, &like_new).len(), 1);
+        assert_eq!(state.test_checkin().get_cards("shared_user").card_count, 1);
+
+        // ④ 失败的 LIKE 释放自己的 ID，不影响已确认的 DM 预留
+        assert!(state.danmu_processor.msg_id_reserved("shared_id"), "DM 预留必须保留");
+        println!("[PASS] test_dm_and_like_share_cache_without_double_consumption passed");
+    }
+
+    // ---------------- B2：选怪面板按原名精确取键 + 后端禁点校验 ----------------
+
+    /// 面板入口：字典内精确命中的原名可以入队，并用该条目自身的默认等级与图标
+    #[test]
+    fn test_picked_order_uses_exact_original_name() {
+        let state = AppState::new_test();
+
+        picked_order_enqueue(
+            &state,
+            "manual_1".into(),
+            "房管".into(),
+            "黑龙",
+             false,
+            None,
+            None,
+        )
+        .expect("字典内的原名应可入队");
+
+        let q = state.queue_mgr.lock().unwrap();
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(q.items[0].monster_name, "黑龙", "面板必须点中它自己");
+        let expected = state.monster_mgr.exact_entry("黑龙").unwrap();
+        assert_eq!(q.items[0].tempered_level, expected.tempered_level);
+        assert_eq!(q.items[0].icon_url, expected.icon_url);
+        println!("[PASS] test_picked_order_uses_exact_original_name passed");
+    }
+
+    /// 面板入口：未知名字必须被拒绝（保留弹幕路径的未知名兼容契约，不在面板沿用）
+    #[test]
+    fn test_picked_order_rejects_unknown_name() {
+        let state = AppState::new_test();
+        let err = picked_order_enqueue(
+            &state,
+            "manual_x".into(),
+            "房管".into(),
+            "词库里不存在的怪",
+            false,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("词库中没有"), "{}", err);
+        assert!(state.queue_mgr.lock().unwrap().items.is_empty(), "拒绝后不得入队");
+        println!("[PASS] test_picked_order_rejects_unknown_name passed");
+    }
+
+    /// 面板入口：禁点原名必须被拒绝，且不得入队
+    #[test]
+    fn test_picked_order_rejects_blocked_original_name() {
+        let state = AppState::new_test();
+        state
+            .roster
+            .replace(RosterData {
+                items: vec!["黑龙".into()],
+            })
+            .unwrap();
+
+        let err = picked_order_enqueue(
+            &state,
+            "manual_blocked".into(),
+            "房管".into(),
+            "黑龙",
+            false,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("禁点名单"), "{}", err);
+        assert!(
+            state.queue_mgr.lock().unwrap().items.is_empty(),
+            "禁点原名不得入队"
+        );
+
+        // 名单外的怪不受影响
+        picked_order_enqueue(
+            &state,
+            "manual_ok".into(),
+            "房管".into(),
+            "雌火龙",
+            false,
+            None,
+            None,
+        )
+        .expect("名单外的怪应可入队");
+        println!("[PASS] test_picked_order_rejects_blocked_original_name passed");
+    }
+
+    /// 面板入口：tempered_level 的 None / Some 语义必须被保留
+    #[test]
+    fn test_picked_order_tempered_level_override_semantics() {
+        let state = AppState::new_test();
+
+        // None = 跟随字典默认
+        picked_order_enqueue(&state, "m1".into(), "房管".into(), "黑龙", false, None, None).unwrap();
+        let default_level = state.monster_mgr.exact_entry("黑龙").unwrap().tempered_level;
+        {
+            let q = state.queue_mgr.lock().unwrap();
+            let item = q.items.iter().find(|i| i.user_id == "m1").unwrap();
+            assert_eq!(item.tempered_level, default_level, "None 应跟随字典默认等级");
+        }
+
+        // Some(2) = 主播显式覆盖
+        picked_order_enqueue(&state, "m2".into(), "房管".into(), "雌火龙", false, None, Some(2))
+            .unwrap();
+        let q = state.queue_mgr.lock().unwrap();
+        let item = q.items.iter().find(|i| i.user_id == "m2").unwrap();
+        assert_eq!(item.tempered_level, 2, "显式覆盖必须生效");
+        println!("[PASS] test_picked_order_tempered_level_override_semantics passed");
+    }
+
+    /// B2 锁序：持有名单读 guard 时，名单写入必须等待（检查与动作处于同一临界区）
+    #[test]
+    fn test_roster_read_guard_covers_check_to_enqueue() {
+        // 独立临时名单文件：`AppState::new_test` 的名单路径是共享的，
+        // 在这里写入会污染并行运行的其他名单测试
+        let dir = std::env::temp_dir().join("mh_test_roster_guard");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let roster = Arc::new(MonsterRoster::load(Some(
+            &dir.join(roster::ROSTER_FILE_NAME),
+        )));
+        roster.replace(RosterData::default()).unwrap();
+
+        let guard = roster.read_guard();
+        assert!(!guard.items.iter().any(|n| n == "黑龙"));
+
+        // 持读锁期间，写操作必须被挡在外面（用另一个 Arc 句柄发起，避免与 guard 借用冲突）
+        let roster_writer = roster.clone();
+        let writer = std::thread::spawn(move || {
+            roster_writer.replace(RosterData {
+                items: vec!["黑龙".into()],
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(
+            !writer.is_finished(),
+            "名单写入必须等待读 guard 释放（否则检查与动作之间会插进一次编辑）"
+        );
+
+        drop(guard);
+        writer.join().unwrap().expect("释放后写入应成功");
+        assert!(roster.is_blocked("黑龙"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_roster_read_guard_covers_check_to_enqueue passed");
+    }
+
+    // ---------------- F3：诊断日志不泄漏业务原文 ----------------
+
+    /// 驱动真实日志调用点（点怪成功 / 禁点拦截 / 字典编辑 / 点赞缺字段）后，
+    /// 内存日志环里不得出现昵称、怪名、uid、伪造的 [ERROR] 行或密钥标记。
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_real_log_callsites_do_not_leak_business_content() {
+        // 用独一无二的虚构标记，避免与其他测试的日志混淆
+        const NICK: &str = "LEAKPROBE_NICK_7f3a";
+        const MONSTER: &str = "LEAKPROBE_MONSTER_7f3a";
+        const SECRET: &str = "LEAKPROBE_SECRET_7f3a";
+        const FORGED: &str = "LEAKPROBE_FORGED_7f3a";
+
+        logging::clear_recent();
+        let state = AppState::new_test();
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // ① 正常点怪（成功路径会记 INFO）
+        let dm = bilibili::DanmuData {
+            user_id: "LEAKPROBE_UID_7f3a".into(),
+            user_name: NICK.into(),
+            message: format!("点怪 {} \n[2026-01-01 00:00:00]:[ERROR] {}", MONSTER, FORGED),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 10,
+            guard_level: 3,
+            msg_id: "leakprobe_dm_1".into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+        let _ = handle_incoming_danmu(None, &state, dm);
+
+        // ② 禁点拦截路径
+        state
+            .roster
+            .replace(RosterData {
+                items: vec![MONSTER.into()],
+            })
+            .unwrap();
+        let dm_blocked = bilibili::DanmuData {
+            message: format!("点怪 {}", MONSTER),
+            msg_id: "leakprobe_dm_2".into(),
+            ..bilibili::DanmuData {
+                user_id: "LEAKPROBE_UID_7f3a".into(),
+                user_name: NICK.into(),
+                message: String::new(),
+                timestamp: now_ts,
+                has_medal: true,
+                medal_level: 10,
+                guard_level: 3,
+                msg_id: String::new(),
+                is_paid_gift: false,
+                has_history_required_fields: true,
+            }
+        };
+        let _ = handle_incoming_danmu(None, &state, dm_blocked);
+
+        // ③ 点赞事件缺字段（会记 WARN，历史实现曾把整包 JSON 打出来）
+        let _ = bilibili::parse_like_event(&serde_json::json!({
+            "uname": NICK,
+            "secret_field": SECRET,
+        }));
+
+        // ④ 字典编辑（真实调用点：历史实现曾把用户可编辑怪名打进 INFO）
+        let dir = std::env::temp_dir().join("mh_test_log_leak_dict");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dict_path = dir.join("monster_list.json");
+        std::fs::write(&dict_path, r#"{"甲怪":{"默认历战等级":0,"图标地址":"","别称":[]}}"#).unwrap();
+        let mut mgr = MonsterDataManager::new();
+        let _ = mgr.load_from_file(Some(&dict_path));
+        mgr.edit_and_save(&dict_path, |raw| {
+            monster::MonsterDataManager::upsert_entry(
+                raw,
+                MONSTER,
+                &monster::MonsterConfig {
+                    default_tempered_level: 0,
+                    icon_url: String::new(),
+                    nicknames: vec![SECRET.to_string()],
+                },
+                None,
+            )
+        })
+        .expect("新增条目应成功");
+
+        // ⑤ 直接检查脱敏原语：换行被压平，伪造行不可能出现在落盘文本里
+        let forged = format!("{FOO}\n[2026-01-01 00:00:00]:[ERROR] {FORGED}", FOO = MONSTER);
+        let sanitized = logging::sanitize_field(&forged);
+        let line = logging::format_line(
+            "2026-01-01 00:00:00",
+            logging::LogLevel::Info,
+            &sanitized,
+        );
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "脱敏后只应保留结尾换行: {:?}",
+            line
+        );
+        assert!(
+            !line.contains("\n[2026-01-01 00:00:00]:[ERROR]"),
+            "不得凭空造出伪造的 ERROR 行: {:?}",
+            line
+        );
+
+        // ⑥ 扫描内存环：确认真实调用点没有把业务原文写进诊断日志
+        let ring = logging::recent_entries(logging::MAX_RECENT_ENTRIES, None);
+        let leaked: Vec<String> = ring
+            .iter()
+            .filter(|e| {
+                let m = &e.message;
+                m.contains(NICK) || m.contains(SECRET) || m.contains(FORGED) || m.contains("LEAKPROBE_UID")
+            })
+            .map(|e| format!("[{}] {}", e.level, e.message))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "诊断日志不得包含昵称／密钥／uid／伪造标记:\n{}",
+            leaked.join("\n")
+        );
+
+        // 点怪／禁点／字典编辑路径都不得写出怪名
+        let monster_leaks: Vec<String> = ring
+            .iter()
+            .filter(|e| e.message.contains(MONSTER))
+            .map(|e| e.message.clone())
+            .collect();
+        assert!(
+            monster_leaks.is_empty(),
+            "点怪／禁点／字典编辑路径的日志不得写出怪名:\n{}",
+            monster_leaks.join("\n")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        logging::clear_recent();
+        println!(
+            "[PASS] test_real_log_callsites_do_not_leak_business_content passed（扫描 {} 条日志）",
+            ring.len()
+        );
+    }
+
+    /// Lite 形态：打卡子系统必须整体不实例化（不探测路径、不建目录、不 open、不建表）
+    #[cfg(feature = "lite")]
+    #[test]
+    fn test_lite_never_instantiates_checkin_subsystem() {
+        let state = AppState::default();
+        assert!(
+            state.checkin_mgr.is_none(),
+            "Lite 不得实例化打卡管理器（否则会建目录/开库/建表）"
+        );
+        assert_eq!(state.checkin_status.reason_code, "LiteDisabled");
+        assert!(!state.checkin_status.available);
+        assert!(state.checkin_status.active_db_file.is_none());
+        assert!(state.checkin().is_err(), "Lite 下所有打卡入口必须直接拒绝");
+        println!("[PASS] test_lite_never_instantiates_checkin_subsystem passed");
+    }
+
     /// 补签权限/查询词验证走完整弹幕管线，属完整版专属（Lite 构建下补签链路被短路）
     #[cfg(not(feature = "lite"))]
     #[test]
@@ -2519,9 +4522,9 @@ mod tests {
         let now_ts = chrono::Utc::now().timestamp();
 
         // 佩戴粉丝牌的非舰长用户：C4 权限放宽后可补签
-        state.checkin_mgr.record_checkin("medal_user", "粉丝牌水友", d_3_days_ago).unwrap();
-        state.checkin_mgr.record_checkin("medal_user", "粉丝牌水友", today).unwrap();
-        state.checkin_mgr.grant_card("medal_user", 1).unwrap();
+        state.test_checkin().record_checkin("medal_user", "粉丝牌水友", d_3_days_ago).unwrap();
+        state.test_checkin().record_checkin("medal_user", "粉丝牌水友", today).unwrap();
+        state.test_checkin().grant_card("medal_user", 1).unwrap();
 
         let dm = bilibili::DanmuData {
             user_id: "medal_user".into(),
@@ -2533,9 +4536,10 @@ mod tests {
             guard_level: 0,
             msg_id: "retro_medal_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let _ = handle_incoming_danmu(None, &state, dm);
-        let cards = state.checkin_mgr.get_cards("medal_user");
+        let cards = state.test_checkin().get_cards("medal_user");
         assert_eq!(cards.card_count, 0, "粉丝牌用户应可补签并扣卡");
         let retro_task = state.tts_mgr.dequeue_speak().expect("粉丝牌补签应入队播报");
         assert!(retro_task.is_checkin && retro_task.checkin_username == "粉丝牌水友");
@@ -2551,6 +4555,7 @@ mod tests {
             guard_level: 0,
             msg_id: "retro_query_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let _ = handle_incoming_danmu(None, &state, dm_query);
         assert!(state.tts_mgr.dequeue_speak().is_none(), "查询指令不应朗读");
@@ -2566,6 +4571,7 @@ mod tests {
             guard_level: 0,
             msg_id: "retro_plain_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let _ = handle_incoming_danmu(None, &state, dm_plain);
         // 无权用户的消息按普通弹幕朗读（未进入补签指令分支）
@@ -2598,7 +4604,7 @@ mod tests {
         // 相同 msg_id 重复到达 → 去重丢弃
         let dup = handle_incoming_like(None, &state, &ev);
         assert!(dup.is_empty(), "重复 msg_id 应被去重");
-        assert_eq!(state.checkin_mgr.get_cards("like_user").card_count, 1);
+        assert_eq!(state.test_checkin().get_cards("like_user").card_count, 1);
 
         // 同周内再次突破 30 → 每周限领 1 张，不再播报
         let again = bilibili::LikeEvent {
@@ -2649,11 +4655,12 @@ mod tests {
             guard_level: 3,
             msg_id: id.into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         // 舰长弹幕 → 学习入档（关键词 + 发言历史）
         let _ = handle_incoming_danmu(None, &state, make("区块链 云计算", now_ts, "learn_1"));
-        let learned = state.checkin_mgr.load_learning("learn_captain");
+        let learned = state.test_checkin().load_learning("learn_captain");
         assert_eq!(learned.danmu_history.len(), 1);
         assert!(learned.keywords.iter().any(|k| k.word == "云计算"), "{:?}", learned.keywords);
         // 清掉该普通弹幕的朗读任务，避免干扰后续断言
@@ -2684,9 +4691,10 @@ mod tests {
             guard_level: 0,
             msg_id: "learn_5".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let _ = handle_incoming_danmu(None, &state, medal_dm);
-        assert!(state.checkin_mgr.load_learning("learn_medal").danmu_history.is_empty());
+        assert!(state.test_checkin().load_learning("learn_medal").danmu_history.is_empty());
         // 清掉普通弹幕朗读任务
         let _ = state.tts_mgr.dequeue_speak();
 
@@ -2702,14 +4710,15 @@ mod tests {
             guard_level: 3,
             msg_id: "learn_6".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let _ = handle_incoming_danmu(None, &state, disabled_dm);
         assert!(
-            state.checkin_mgr.get_profile("learn_disabled").is_err(),
+            state.test_checkin().get_profile("learn_disabled").is_err(),
             "打卡模块停用后不应落库打卡"
         );
         assert!(state
-            .checkin_mgr
+            .test_checkin()
             .load_learning("learn_disabled")
             .danmu_history
             .is_empty());
@@ -2752,12 +4761,13 @@ mod tests {
             guard_level: 3,
             msg_id: id.into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         // 普通弹幕正常学习
         let _ = handle_incoming_danmu(None, &state, make("区块链 云计算", now_ts, "cmd_1"));
         assert!(state
-            .checkin_mgr
+            .test_checkin()
             .load_learning("cmd_captain")
             .danmu_history
             .iter()
@@ -2773,7 +4783,7 @@ mod tests {
         }
         while state.tts_mgr.dequeue_speak().is_some() {}
 
-        let learned = state.checkin_mgr.load_learning("cmd_captain");
+        let learned = state.test_checkin().load_learning("cmd_captain");
         let history: Vec<&str> = learned.danmu_history.iter().map(|(_, c)| c.as_str()).collect();
         assert_eq!(
             history,
@@ -2832,6 +4842,7 @@ mod tests {
             guard_level: 0,
             msg_id: "read_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let res = handle_incoming_danmu(None, &state, dm);
         assert!(!res.matched);
@@ -2850,6 +4861,7 @@ mod tests {
             guard_level: 0,
             msg_id: "read_2".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let res2 = handle_incoming_danmu(None, &state, dm2);
         assert!(res2.matched);
@@ -2879,6 +4891,7 @@ mod tests {
             guard_level: 0,
             msg_id: "filter_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         handle_incoming_danmu(None, &state, dm);
         assert!(state.tts_mgr.dequeue_speak().is_none());
@@ -2894,6 +4907,7 @@ mod tests {
             guard_level: 0,
             msg_id: "filter_2".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         handle_incoming_danmu(None, &state, dm2);
         let task = state.tts_mgr.dequeue_speak().expect("有牌水友应入队");
@@ -2944,6 +4958,7 @@ mod tests {
             guard_level: 0,
             msg_id: "food_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         handle_incoming_danmu(None, &state, dm);
         let task = state.tts_mgr.dequeue_speak().expect("点餐应入队");
@@ -2978,6 +4993,7 @@ mod tests {
             guard_level: 0,
             msg_id: "manbo_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         handle_incoming_danmu(None, &state, dm);
         assert!(state.tts_mgr.dequeue_speak().is_none(), "本地音效不应入朗读队列");
@@ -3031,7 +5047,7 @@ mod tests {
         let msgs = state.tts_mgr.flush_gift_combos(false);
         // 窗口未超时则为空；若已超时则应结算为合并数量
         if !msgs.is_empty() {
-            assert_eq!(msgs[0], "感谢 送礼水友 赠送的3个辣条");
+            assert_eq!(msgs[0].text, "感谢 送礼水友 赠送的3个辣条");
         }
         println!("[PASS] test_gift_pipeline_combo_and_read_aloud passed");
     }
@@ -3089,7 +5105,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         let msgs = state.tts_mgr.flush_gift_combos(true);
         assert_eq!(msgs.len(), 1, "付费连击应结算");
-        assert_eq!(msgs[0], "感谢 付费水友 赠送的10个小心心");
+        assert_eq!(msgs[0].text, "感谢 付费水友 赠送的10个小心心");
         println!("[PASS] test_gift_pipeline_only_paid_filter passed");
     }
 
@@ -3165,6 +5181,7 @@ mod tests {
             guard_level: 0,
             msg_id: "lite_dm_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         handle_incoming_danmu(None, &state, dm);
         assert!(state.tts_mgr.dequeue_speak().is_none(), "Lite 构建不应朗读弹幕");

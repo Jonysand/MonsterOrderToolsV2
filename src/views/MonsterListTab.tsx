@@ -173,6 +173,15 @@ export const MonsterListTab: React.FC<Props> = ({
       toast("怪物原名不能为空");
       return;
     }
+    // 改原名属不可逆操作（弹幕旧写法会失效）：复用原生二次确认
+    if (draft.original && draft.original !== name) {
+      const ok = await askConfirm(
+        `确认把「${draft.original}」改名为「${name}」？\n\n` +
+          "改名后弹幕里的旧写法不再命中该怪，禁点名单中的引用会同步更新。",
+        "确认修改怪物原名"
+      );
+      if (!ok) return;
+    }
     const config: MonsterConfig = {
       默认历战等级: draft.level,
       图标地址: draft.icon,
@@ -189,6 +198,7 @@ export const MonsterListTab: React.FC<Props> = ({
       setDraft(null);
       toast(`条目「${name}」已保存并生效`);
     } catch (err) {
+      // 后端是最后一道校验：同名/撞名会在这里被拒绝
       toast(`保存失败: ${err}`);
     } finally {
       setSaving(false);
@@ -227,20 +237,36 @@ export const MonsterListTab: React.FC<Props> = ({
     setAliasInput("");
   };
 
-  /** 草稿别称冲突：与运行时一致地给出「字典序最小者命中」的确定性结论 */
+  /**
+   * 草稿冲突：与运行时一致地给出「字典序最小者命中」的确定性结论。
+   *
+   * 判定**只看草稿自己**，不再以"保存前就已冲突"（`conflicts.has(w)`）为门槛 ——
+   * 否则给「黑龙」新增一个仅属于「雌火龙」的别称时不会提示，保存后才暴露冲突。
+   * 胜出者按"**新草稿原名** + 其他拥有者"重算，改名时不能继续拿旧名当赢家。
+   */
   const draftConflicts = useMemo(() => {
     if (!draft) return [] as { word: string; others: string[]; winner: string }[];
-    const self = draft.original || draft.name.trim();
-    const words = new Set([...draft.aliases, draft.name.trim()].filter(Boolean));
+    const self = draft.name.trim();
+    const words = new Set([...draft.aliases, self].filter(Boolean));
     const hits: { word: string; others: string[]; winner: string }[] = [];
     words.forEach((w) => {
-      if (!conflicts.has(w)) return;
-      const others = (owners.get(w) || []).filter((n) => n !== self);
+      // 剔除旧原名（改名后它已不再属于本条目），并排除本条目自身
+      const others = (owners.get(w) || []).filter((n) => n !== self && n !== draft.original);
       if (!others.length) return;
-      hits.push({ word: w, others, winner: conflictWinner(owners, w) || self });
+      // 胜出者：草稿原名与其他拥有者一起按名称排序取最小
+      const candidates = [...others, self].sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+      hits.push({ word: w, others, winner: candidates[0] });
     });
     return hits;
-  }, [draft, conflicts, owners]);
+  }, [draft, owners]);
+
+  /** 草稿原名与现有条目撞名：由后端拒绝保存，前端只作即时提示 */
+  const draftNameCollision = useMemo(() => {
+    if (!draft) return null;
+    const name = draft.name.trim();
+    if (!name || draft.original === name) return null;
+    return entries.some((e) => e.name === name) ? name : null;
+  }, [draft, entries]);
 
   // ESC 关闭抽屉 / 图标选择器 / 冲突清单
   useEffect(() => {
@@ -665,13 +691,24 @@ export const MonsterListTab: React.FC<Props> = ({
                 </div>
               </div>
 
+              {draftNameCollision && (
+                <div className="alert warn">
+                  <AlertTriangle />
+                  <span>
+                    已存在名为「<b>{draftNameCollision}</b>」的怪物：
+                    <b>原名撞名会被后端直接拒绝</b>（保存它会覆盖对方的别称与图标）。
+                    请换一个原名，或先改掉/删除对方。
+                  </span>
+                </div>
+              )}
+
               {draftConflicts.length > 0 && (
                 <div className="alert warn">
                   <AlertTriangle />
                   <span>
                     别称「<b>{draftConflicts[0].word}</b>」与条目「
                     <b>{draftConflicts[0].others.join("、")}</b>」重复：运行时按名称排序取靠前者，
-                    {draftConflicts[0].winner === (draft.original || draft.name.trim()) ? (
+                    {draftConflicts[0].winner === draft.name.trim() ? (
                       <>
                         本条目（<b>{draft.name.trim()}</b>）生效，对方不会命中该别称
                       </>

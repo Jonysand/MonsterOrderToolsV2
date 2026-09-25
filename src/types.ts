@@ -10,6 +10,24 @@
   icon_url: string;
 }
 
+/**
+ * 队列落盘状态：`Saved` 表示当前 revision 已确认落盘；
+ * `PendingRetry` 包含「写入中」与「写入失败」两种情况，UI 只需提示磁盘待重试。
+ */
+export type QueuePersistence = "Saved" | "PendingRetry";
+
+/**
+ * 队列权威快照：`get_queue`、队列变更命令与 `queue-updated` 事件统一使用。
+ *
+ * 前端只应用 **不小于** 已知 revision 的快照，因此迟到的旧响应无法把 UI 拉回旧队列。
+ * 同一 revision 允许 `PendingRetry → Saved` 的持久化状态推进，反向会被拒绝。
+ */
+export interface QueueSnapshot {
+  items: QueueItem[];
+  revision: number;
+  persistence: QueuePersistence;
+}
+
 export interface UserProfile {
   uid: string;
   username: string;
@@ -138,6 +156,15 @@ export interface RosterData {
   items: string[];
 }
 
+/**
+ * 名单权威快照：`get_monster_roster` / `set_monster_roster` 统一使用。
+ * `revision` 只在内存与 IPC 中存在，**不写入**用户导入/导出的名单文件。
+ */
+export interface RosterSnapshot {
+  data: RosterData;
+  revision: number;
+}
+
 // ---------- D3 跑马灯 ----------
 export interface OrderPlacedPayload {
   user_id: string;
@@ -186,6 +213,36 @@ export interface GiftReceivedPayload {
   gift_name: string;
   gift_num: number;
   paid: boolean;
+}
+
+/**
+ * 打卡子系统可用性（冷启动经 `get_checkin_status` 读取，不依赖可能丢失的单次事件）。
+ * `reason_code`：`None`（可用）/ `LiteDisabled`（Lite 形态停用）/ `DatabaseUnavailable`（数据库故障）
+ */
+export interface CheckinStatus {
+  available: boolean;
+  reason_code: string;
+  message: string;
+  /** 实际使用的库文件名（仅文件名，不含路径） */
+  active_db_file: string | null;
+  /** 是否存在另一份未展示、未删除的打卡库 */
+  has_shadow_db: boolean;
+}
+
+/** 打卡不可用事件载荷（只含非敏感原因码与提示文本） */
+export interface CheckinUnavailablePayload {
+  reason_code: string;
+  message: string;
+}
+
+/**
+ * 点赞结算失败事件载荷。
+ * 整事件已回滚（该次点赞未入账），`retryable` 表示去重预留已释放、服务端重投可自动重试。
+ */
+export interface LikeRewardFailedPayload {
+  like_count: number;
+  retryable: boolean;
+  message: string;
 }
 
 /**

@@ -4,6 +4,10 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+/// 临时文件序号：与进程 ID 一起构成同目录唯一临时文件名，
+/// 避免两个线程（或同进程内多次重试）共用同一个 `.tmp`
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 点怪排队条目
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueueItem {
@@ -50,12 +54,38 @@ impl QueueItem {
     }
 }
 
+/// 队列落盘状态：表示「最近一次有序内存版本是否已确认落盘」。
+///
+/// 这不是永不失败的承诺，只是一个可核对的事实：
+/// `Saved` 等价于 `revision == saved_revision`；写入中与写入失败都是 `PendingRetry`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum QueuePersistence {
+    Saved,
+    PendingRetry,
+}
+
+/// 队列权威快照：IPC 命令与 `queue-updated` 事件统一使用。
+///
+/// 前端只应用 **不小于** 已知 revision 的快照，因此迟到的旧响应无法把 UI 拉回旧队列；
+/// 同一 revision 允许 `PendingRetry → Saved` 的持久化状态推进，反向则拒绝。
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueSnapshot {
+    pub items: Vec<QueueItem>,
+    pub revision: u64,
+    pub persistence: QueuePersistence,
+}
+
 /// 排队队列管理器
 #[derive(Debug, Default, Clone)]
 pub struct QueueManager {
     pub items: Vec<QueueItem>,
-    /// 脏标记：变更后置位，由后台任务按 500ms 节流落盘（对齐原工程 PriorityQueueManager::Tick）
-    pub dirty: bool,
+    /// 版本号：任何**确实**改变条目集合、顺序或条目字段的变更都会递增。
+    ///
+    /// 盘上 `order_list.json` 仍是纯 JSON 数组，本字段只在内存中存在。
+    /// 未命中删除、重复提权、顺序未变的拖拽都不递增。
+    pub revision: u64,
+    /// 已确认落盘的版本号。小于 `revision` 即表示存在未落盘变更（脏）。
+    pub saved_revision: u64,
     /// user_id 索引：O(1) 判重/定位（对齐原工程 queue-performance spec 的 HashSet 要求）
     user_index: std::collections::HashSet<String>,
 }
@@ -64,8 +94,43 @@ impl QueueManager {
     pub fn new() -> Self {
         Self {
             items: Vec::new(),
-            dirty: false,
+            revision: 0,
+            saved_revision: 0,
             user_index: std::collections::HashSet::new(),
+        }
+    }
+
+    /// 标记一次真实变更：版本递增即代表「当前内存版本尚未确认落盘」
+    fn touch(&mut self) {
+        self.revision += 1;
+    }
+
+    /// 是否存在未落盘变更（原 `dirty` 标记的等价语义：变更置位、确认落盘后清除）
+    pub fn is_dirty(&self) -> bool {
+        self.revision != self.saved_revision
+    }
+
+    /// 确认某个版本已落盘。写入期间又发生的新变更会保留脏位（`revision` 仍更大）
+    pub fn mark_saved(&mut self, revision: u64) {
+        if revision > self.saved_revision {
+            self.saved_revision = revision;
+        }
+    }
+
+    pub fn persistence(&self) -> QueuePersistence {
+        if self.is_dirty() {
+            QueuePersistence::PendingRetry
+        } else {
+            QueuePersistence::Saved
+        }
+    }
+
+    /// 构造权威快照（必须在持有队列锁时调用，items/revision/persistence 同时捕获）
+    pub fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            items: self.items.clone(),
+            revision: self.revision,
+            persistence: self.persistence(),
         }
     }
 
@@ -105,8 +170,10 @@ impl QueueManager {
             }
 
             if changed {
-                self.dirty = true;
                 self.sort_queue();
+                // 返回 false 但条目字段确实变了，同样必须递增版本：
+                // 否则迟到的旧快照会把改过的怪名/等级/图标覆盖回去
+                self.touch();
             }
             return false;
         }
@@ -115,7 +182,7 @@ impl QueueManager {
         self.user_index.insert(new_item.user_id.clone());
         self.items.push(new_item);
         self.sort_queue();
-        self.dirty = true;
+        self.touch();
         true
     }
 
@@ -130,58 +197,107 @@ impl QueueManager {
             let item = &mut self.items[pos];
             if !item.is_priority {
                 item.is_priority = true;
-                self.dirty = true;
                 self.sort_queue();
+                self.touch();
                 return true;
             }
         }
         false
     }
 
-    /// 根据 user_id 保序删除指定条目
+    /// 根据 user_id 保序删除指定条目（未命中不递增版本）
     pub fn dequeue_by_user_id(&mut self, user_id: &str) -> Option<QueueItem> {
         if let Some(pos) = self.items.iter().position(|i| i.user_id == user_id) {
             let removed = self.items.remove(pos);
             self.user_index.remove(&removed.user_id);
-            self.dirty = true;
+            self.touch();
             Some(removed)
         } else {
             None
         }
     }
 
-    /// 根据索引保序删除
+    /// 根据索引保序删除（越界不变更，不递增版本）
     pub fn dequeue_by_index(&mut self, index: usize) -> Option<QueueItem> {
         if index < self.items.len() {
             let removed = self.items.remove(index);
             self.user_index.remove(&removed.user_id);
-            self.dirty = true;
+            self.touch();
             Some(removed)
         } else {
             None
         }
     }
 
-    /// 清空队列
+    /// 清空队列（空队列重复清空不递增版本，避免无变更的强制写盘）
     pub fn clear(&mut self) {
         if !self.items.is_empty() {
             self.items.clear();
             self.user_index.clear();
-            self.dirty = true;
+            self.touch();
         }
     }
 
-    /// 手动重新排序（主播拖拽调整顺序，保留手动排序次序）
-    pub fn reorder(&mut self, new_items: Vec<QueueItem>) {
-        self.items = new_items;
+    /// 手动重新排序（主播拖拽调整顺序）。
+    ///
+    /// 只信任「版本 + 用户 ID 顺序」：客户端发来的条目内容一律不采纳，
+    /// 后端按 ID 从**当前**条目重组，因此删单、复活完成单、撤回提权都不可能由一次拖拽造成。
+    /// 版本不符、ID 重复、ID 缺失或条目数不符都在改动任何状态**之前**拒绝。
+    /// 顺序与原顺序相同时不递增版本（连续拖拽落回原位不产生写盘）。
+    pub fn reorder_by_ids(
+        &mut self,
+        ordered_user_ids: &[String],
+        expected_revision: u64,
+    ) -> Result<(), String> {
+        if expected_revision != self.revision {
+            return Err(format!(
+                "队列已变化，请刷新后重排（后端版本 {}，请求基于 {}）",
+                self.revision, expected_revision
+            ));
+        }
+        if ordered_user_ids.len() != self.items.len() {
+            return Err(format!(
+                "队列已变化，请刷新后重排（后端 {} 条，请求 {} 条）",
+                self.items.len(),
+                ordered_user_ids.len()
+            ));
+        }
+        let mut positions: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(self.items.len());
+        for (i, it) in self.items.iter().enumerate() {
+            positions.insert(it.user_id.as_str(), i);
+        }
+        let mut next: Vec<QueueItem> = Vec::with_capacity(self.items.len());
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(self.items.len());
+        for uid in ordered_user_ids {
+            if !seen.insert(uid.as_str()) {
+                return Err("重排请求包含重复用户，已拒绝".to_string());
+            }
+            let Some(pos) = positions.get(uid.as_str()) else {
+                return Err("重排请求包含不在队列中的条目，已拒绝".to_string());
+            };
+            next.push(self.items[*pos].clone());
+        }
+
+        if next
+            .iter()
+            .zip(self.items.iter())
+            .all(|(a, b)| a.user_id == b.user_id)
+        {
+            return Ok(());
+        }
+
+        self.items = next;
         self.rebuild_index();
-        self.dirty = true;
+        self.touch();
+        Ok(())
     }
 
     /// 撤销完成：把条目**原样**插回指定下标。
     /// 保留原 id 与 timestamp —— 若改用 add_order 重建，新时间戳会让该条目在后续
     /// 优先条目插入时排到错误位置（优先级相同时按 timestamp 先来后到）。
-    /// 与 reorder 一致不做重排，保留主播的手动次序。返回 false 表示该用户已在队中。
+    /// 与 reorder_by_ids 一致不做重排，保留主播的手动次序。返回 false 表示该用户已在队中。
     pub fn restore(&mut self, item: QueueItem, index: usize) -> bool {
         if self.user_index.contains(&item.user_id) {
             return false;
@@ -189,7 +305,7 @@ impl QueueManager {
         let at = index.min(self.items.len());
         self.user_index.insert(item.user_id.clone());
         self.items.insert(at, item);
-        self.dirty = true;
+        self.touch();
         true
     }
 
@@ -203,7 +319,10 @@ impl QueueManager {
         serde_json::to_string_pretty(&self.items).map_err(|e| e.to_string())
     }
 
-    /// 原子写入 JSON 文本（临时文件 + 重命名），不涉及内存队列状态
+    /// 原子写入 JSON 文本（同目录唯一临时文件 + 重命名），不涉及内存队列状态。
+    ///
+    /// 临时文件名带进程 ID 与递增序号：多个直接调用公有 API 的线程不会互相踩同一个 `.tmp`。
+    /// 失败时清除本次临时文件，但**不先删除目标文件** —— 目标要么保持旧内容，要么被完整新内容替换。
     pub fn write_json(path: &Path, json: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -211,20 +330,45 @@ impl QueueManager {
             }
         }
 
-        let temp_path = path.with_extension("tmp");
-        {
-            let mut file = File::create(&temp_path).map_err(|e| e.to_string())?;
-            file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
-            file.flush().map_err(|e| e.to_string())?;
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "order_list.json".to_string());
+        let temp_path = path.with_file_name(format!(
+            "{}.{}.{}.tmp",
+            file_name,
+            std::process::id(),
+            seq
+        ));
+
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("写入临时队列文件失败: {}", e));
         }
-        fs::rename(&temp_path, path).map_err(|e| e.to_string())
+
+        if let Err(e) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("替换队列文件失败: {}（原文件保持不变）", e));
+        }
+        Ok(())
     }
 
-    /// 持久化保存至 JSON 文件（原子写临时文件再重命名）
+    /// 持久化保存至 JSON 文件（原子写临时文件再重命名）；仅在写盘成功后确认版本已落盘
     pub fn save_to_file(&mut self, path: &Path) -> Result<(), String> {
         let json_data = self.to_json()?;
+        let revision = self.revision;
         Self::write_json(path, &json_data)?;
-        self.dirty = false;
+        self.mark_saved(revision);
         Ok(())
     }
 
@@ -257,7 +401,9 @@ impl QueueManager {
             // 旧格式迁移：按优先级归一化一次（后续以文件顺序为准，保留主播手动拖拽次序）
             self.sort_queue();
         }
-        self.dirty = false;
+        // 冷启动：内存与磁盘一致，版本从 0 起算
+        self.revision = 0;
+        self.saved_revision = 0;
         Ok(count)
     }
 
@@ -599,14 +745,18 @@ mod tests {
             timestamp: 200,
             icon_url: "".into(),
         };
-        qm.items = vec![item1.clone(), item2.clone()];
+        qm.add_or_update(item1.clone());
+        qm.add_or_update(item2.clone());
 
-        // 手动将 item2 拖动排在 item1 前面
-        qm.reorder(vec![item2.clone(), item1.clone()]);
+        // 手动将 u2 拖动排在 u1 前面：只提交「版本 + 用户 ID 顺序」
+        let revision_before = qm.revision;
+        qm.reorder_by_ids(&["u2".to_string(), "u1".to_string()], revision_before)
+            .expect("版本一致的重排应被接受");
         assert_eq!(qm.items.len(), 2);
         assert_eq!(qm.items[0].user_id, "u2");
         assert_eq!(qm.items[1].user_id, "u1");
-        assert!(qm.dirty);
+        assert!(qm.is_dirty(), "重排后应处于未落盘状态");
+        assert_eq!(qm.revision, revision_before + 1, "真实变更必须递增版本");
         println!("[PASS] test_manual_reorder_queue passed");
     }
 
@@ -674,12 +824,17 @@ mod tests {
         q.clear();
         assert!(!q.contains("u2"));
 
-        // reorder 后索引重建
-        q.reorder(vec![mk("u3", false, 3), mk("u4", false, 4)]);
+        // reorder_by_ids 后索引重建
+        for (i, uid) in ["u3", "u4"].iter().enumerate() {
+            q.add_or_update(mk(uid, false, (i as i64 + 1) * 10));
+        }
+        let rev = q.revision;
+        q.reorder_by_ids(&["u4".to_string(), "u3".to_string()], rev)
+            .expect("版本一致的重排应被接受");
         assert!(q.contains("u3") && q.contains("u4"));
 
-        // dequeue_by_index 后索引同步
-        q.dequeue_by_index(0);
+        // dequeue_by_index 后索引同步（重排后下标 1 为 u3）
+        q.dequeue_by_index(1);
         assert!(!q.contains("u3") && q.contains("u4"));
 
         // 索引与 items 完全一致（无残留/无误标）
@@ -712,7 +867,7 @@ mod tests {
         println!("[PASS] test_queue_paths_separate_read_and_write passed");
     }
 
-    /// P1-12：脏标记语义 —— 变更置位、落盘后清除
+    /// P1-12：脏标记语义 —— 变更置位、落盘后清除（现由 revision/saved_revision 派生）
     #[test]
     fn test_dirty_flag_lifecycle() {
         let temp_dir = std::env::temp_dir().join("mh_test_queue_dirty");
@@ -721,7 +876,7 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         let mut q = QueueManager::new();
-        assert!(!q.dirty, "初始应为干净状态");
+        assert!(!q.is_dirty(), "初始应为干净状态");
         q.add_or_update(QueueItem {
             id: "item-1".into(),
             user_id: "u1".into(),
@@ -733,10 +888,12 @@ mod tests {
             timestamp: 1,
             icon_url: String::new(),
         });
-        assert!(q.dirty, "变更后应置脏");
+        assert!(q.is_dirty(), "变更后应置脏");
+        assert_eq!(q.persistence(), QueuePersistence::PendingRetry);
 
         q.save_to_file(&path).unwrap();
-        assert!(!q.dirty, "落盘后应清除脏标记");
+        assert!(!q.is_dirty(), "落盘后应清除脏标记");
+        assert_eq!(q.persistence(), QueuePersistence::Saved);
 
         // to_json / write_json 拆分：序列化不改变脏标记，写盘由调用方在锁外完成
         q.add_or_update(QueueItem {
@@ -751,8 +908,12 @@ mod tests {
             icon_url: String::new(),
         });
         let json = q.to_json().unwrap();
-        assert!(q.dirty, "仅序列化不应清除脏标记");
+        assert!(q.is_dirty(), "仅序列化不应清除脏标记");
         QueueManager::write_json(&path, &json).unwrap();
+        assert!(
+            q.is_dirty(),
+            "write_json 只管磁盘：确认落盘必须由调用者显式 mark_saved"
+        );
         let reloaded = fs::read_to_string(&path).unwrap();
         assert!(reloaded.contains("u2"));
 
@@ -799,7 +960,7 @@ mod tests {
         assert_eq!(q.items[2].id, removed.id);
         assert_eq!(q.items[2].timestamp, removed.timestamp);
         assert!(q.contains("c"), "索引应同步恢复");
-        assert!(q.dirty);
+        assert!(q.is_dirty());
         println!("[PASS] test_restore_preserves_index_and_identity passed");
     }
 
@@ -829,5 +990,350 @@ mod tests {
         assert!(q2.restore(mk_item("y", false, 2), 99));
         assert_eq!(q2.items[1].user_id, "y");
         println!("[PASS] test_restore_timestamp_semantics_for_later_priority passed");
+    }
+
+    // ---------------- A1：队列 revision 与「只接受版本＋ID 顺序」反测 ----------------
+
+    /// Q01 核心反测：拖拽旧快照不能删除直播新单。
+    /// 后端 [A,B] → 前端准备 [B,A] → 弹幕插入 C → 旧重排到达必须被拒绝，且 C 仍在队列与索引中。
+    #[test]
+    fn test_stale_reorder_cannot_drop_new_order() {
+        let mut q = QueueManager::new();
+        for (i, uid) in ["a", "b"].iter().enumerate() {
+            q.add_or_update(mk_item(uid, false, (i as i64 + 1) * 10));
+        }
+        let stale_revision = q.revision;
+
+        // 弹幕让后端变成 [A,B,C]
+        q.add_or_update(mk_item("c", false, 30));
+        let items_before = q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>();
+        let revision_before = q.revision;
+
+        // 旧重排 [B,A] 到达
+        let err = q
+            .reorder_by_ids(&["b".to_string(), "a".to_string()], stale_revision)
+            .unwrap_err();
+        assert!(err.contains("队列已变化"), "应给出刷新提示，实际: {}", err);
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            items_before,
+            "被拒绝的重排不得触碰内存队列"
+        );
+        assert!(q.contains("c"), "新单 C 必须留在 user_index 中");
+        assert_eq!(q.revision, revision_before, "被拒绝的请求不递增版本");
+        println!("[PASS] test_stale_reorder_cannot_drop_new_order passed");
+    }
+
+    /// 同一批成员但某条刚被提权：旧重排也必须被版本挡住，否则会把提权撤回
+    #[test]
+    fn test_reorder_rejected_after_priority_promotion() {
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", false, 10));
+        q.add_or_update(mk_item("b", true, 20));
+        let stale_revision = q.revision;
+
+        // A 提权为优先（二段式提权）
+        q.add_or_update(mk_item("a", true, 10));
+        let snapshot = q.snapshot();
+
+        let err = q
+            .reorder_by_ids(&["b".to_string(), "a".to_string()], stale_revision)
+            .unwrap_err();
+        assert!(err.contains("队列已变化"));
+        assert_eq!(
+            q.snapshot().items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            snapshot.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            "提权结果不得被旧重排撤回"
+        );
+        println!("[PASS] test_reorder_rejected_after_priority_promotion passed");
+    }
+
+    /// 已有用户在 add_or_update 中改了怪名：返回 false 但版本必须递增，
+    /// 否则迟到的同版本旧事件会把它覆盖回去
+    #[test]
+    fn test_existing_user_monster_change_bumps_revision() {
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", false, 10));
+        let rev_before = q.revision;
+
+        let added = q.add_or_update(QueueItem {
+            id: "item-a".into(),
+            user_id: "a".into(),
+            user_name: "水友a".into(),
+            monster_name: "煌黑龙".into(),
+            is_priority: false,
+            guard_level: 0,
+            tempered_level: 2,
+            timestamp: 10,
+            icon_url: "MHRise/x.png".into(),
+        });
+        assert!(!added, "已存在用户不应被当作新增");
+        assert_eq!(q.revision, rev_before + 1, "字段变化必须递增版本");
+        assert_eq!(q.items[0].monster_name, "煌黑龙");
+        assert_eq!(q.items[0].tempered_level, 2);
+        assert_eq!(q.items[0].icon_url, "MHRise/x.png");
+        println!("[PASS] test_existing_user_monster_change_bumps_revision passed");
+    }
+
+    /// 重排内容非法（重复 / 缺失 / 条目数不符 / 空表覆盖非空队列）一律在改动前拒绝
+    #[test]
+    fn test_reorder_rejects_invalid_id_lists() {
+        let mut q = QueueManager::new();
+        for (i, uid) in ["a", "b", "c"].iter().enumerate() {
+            q.add_or_update(mk_item(uid, false, (i as i64 + 1) * 10));
+        }
+        let rev = q.revision;
+        let baseline = q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>();
+
+        let dup = q.reorder_by_ids(
+            &["a".to_string(), "a".to_string(), "b".to_string()],
+            rev,
+        );
+        assert!(dup.unwrap_err().contains("重复"));
+
+        // 缺一个成员（长度也不符）
+        let missing = q.reorder_by_ids(&["a".to_string(), "b".to_string()], rev);
+        assert!(missing.is_err());
+
+        // 混入不在队列中的条目：长度对得上但成员对不上
+        let foreign = q.reorder_by_ids(
+            &["a".to_string(), "b".to_string(), "zzz".to_string()],
+            rev,
+        );
+        assert!(foreign.unwrap_err().contains("不在队列中"));
+
+        // 空表覆盖非空队列
+        let empty = q.reorder_by_ids(&[], rev);
+        assert!(empty.is_err());
+
+        assert_eq!(q.revision, rev, "任何非法重排都不得递增版本");
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            baseline,
+            "任何非法重排都不得触碰内存队列"
+        );
+        println!("[PASS] test_reorder_rejects_invalid_id_lists passed");
+    }
+
+    /// 重排只搬移顺序：条目的 id / is_priority / timestamp / icon_url 必须原样保留
+    #[test]
+    fn test_reorder_preserves_item_fields() {
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", true, 10));
+        q.add_or_update(QueueItem {
+            icon_url: "MHRise/icon.png".into(),
+            tempered_level: 1,
+            ..mk_item("b", false, 20)
+        });
+        let rev = q.revision;
+        let a = q.items.iter().find(|i| i.user_id == "a").unwrap().clone();
+
+        q.reorder_by_ids(&["b".to_string(), "a".to_string()], rev)
+            .unwrap();
+
+        let moved = q.items.iter().find(|i| i.user_id == "a").unwrap();
+        assert_eq!(moved.id, a.id, "重排不得改写 id");
+        assert_eq!(moved.timestamp, a.timestamp, "重排不得改写 timestamp");
+        assert!(moved.is_priority, "重排不得撤回提权");
+        let b = q.items.iter().find(|i| i.user_id == "b").unwrap();
+        assert_eq!(b.icon_url, "MHRise/icon.png", "重排不得丢图标");
+        assert_eq!(b.tempered_level, 1);
+        println!("[PASS] test_reorder_preserves_item_fields passed");
+    }
+
+    /// 顺序未变化的拖拽不递增版本、不产生无谓写盘
+    #[test]
+    fn test_reorder_same_order_is_noop() {
+        let mut q = QueueManager::new();
+        for (i, uid) in ["a", "b"].iter().enumerate() {
+            q.add_or_update(mk_item(uid, false, (i as i64 + 1) * 10));
+        }
+        let rev = q.revision;
+        q.reorder_by_ids(&["a".to_string(), "b".to_string()], rev)
+            .expect("顺序未变应视为成功");
+        assert_eq!(q.revision, rev, "顺序未变化不得递增版本");
+        println!("[PASS] test_reorder_same_order_is_noop passed");
+    }
+
+    /// 未命中的删除、重复提权、空队列清空都不递增版本（避免无变更的强制写盘）
+    #[test]
+    fn test_no_change_operations_do_not_bump_revision() {
+        let mut q = QueueManager::new();
+        assert_eq!(q.revision, 0);
+        q.clear();
+        assert_eq!(q.revision, 0, "空队列清空不应递增版本");
+
+        q.add_or_update(mk_item("a", true, 10));
+        let rev = q.revision;
+        assert!(q.dequeue_by_user_id("nobody").is_none());
+        assert!(q.dequeue_by_index(99).is_none());
+        assert!(!q.update_priority("a", 3), "已优先条目重复提权应返回 false");
+        assert!(!q.update_priority("nobody", 3));
+        assert!(!q.restore(mk_item("a", true, 10), 0), "已在队中不得重复恢复");
+        assert_eq!(q.revision, rev, "无实际变更的操作不得递增版本");
+        println!("[PASS] test_no_change_operations_do_not_bump_revision passed");
+    }
+
+    /// A2：写入期间发生的新变更必须保留脏位 —— 旧快照落盘后不得清掉新版本的脏标记
+    #[test]
+    fn test_mark_saved_does_not_clear_newer_revision() {
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", false, 10));
+        // 模拟后台任务取得的快照版本
+        let json = q.to_json().unwrap();
+        let flushed_revision = q.revision;
+
+        // 写盘期间来了新弹幕
+        q.add_or_update(mk_item("b", false, 20));
+        assert_ne!(q.revision, flushed_revision);
+
+        // 后台任务完成落盘，只确认自己那份版本
+        q.mark_saved(flushed_revision);
+        assert!(q.is_dirty(), "新版本必须保持脏位，等待下一 tick");
+        assert_eq!(q.persistence(), QueuePersistence::PendingRetry);
+
+        // 落盘内容仍是旧快照（这是允许的：下一 tick 会补上）
+        assert!(json.contains("\"a\""));
+        println!("[PASS] test_mark_saved_does_not_clear_newer_revision passed");
+    }
+
+    /// A2：写入失败不得清理脏位，重试成功后恢复 Saved
+    #[test]
+    fn test_write_failure_keeps_dirty_until_retry_succeeds() {
+        let dir = std::env::temp_dir().join("mh_test_queue_retry");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", false, 10));
+        let json = q.to_json().unwrap();
+        let revision = q.revision;
+
+        // 让目标路径无法写入：临时目录不存在且父路径是个文件
+        let blocked_parent = dir.join("not_a_dir");
+        fs::write(&blocked_parent, b"x").unwrap();
+        let blocked_target = blocked_parent.join("order_list.json");
+        assert!(QueueManager::write_json(&blocked_target, &json).is_err());
+        assert!(q.is_dirty(), "写盘失败后必须保留脏位以便重试");
+
+        // 重试到可写路径后清脏
+        let good_path = dir.join("order_list.json");
+        QueueManager::write_json(&good_path, &json).unwrap();
+        q.mark_saved(revision);
+        assert!(!q.is_dirty(), "成功落盘后应确认已保存");
+        assert_eq!(q.persistence(), QueuePersistence::Saved);
+
+        let _ = fs::remove_dir_all(&dir);
+        println!("[PASS] test_write_failure_keeps_dirty_until_retry_succeeds passed");
+    }
+
+    /// A2：目标文件已存在时可被替换（Windows 同样允许 rename 覆盖普通文件）
+    #[test]
+    fn test_write_json_replaces_existing_target() {
+        let dir = std::env::temp_dir().join("mh_test_queue_replace");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("order_list.json");
+
+        fs::write(&path, b"OLD").unwrap();
+        QueueManager::write_json(&path, "NEW").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "NEW");
+
+        // 目录内不得残留任何临时文件
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件: {:?}", leftovers);
+
+        let _ = fs::remove_dir_all(&dir);
+        println!("[PASS] test_write_json_replaces_existing_target passed");
+    }
+
+    /// A2：两次并发写入互不踩临时文件（唯一临时名 + 原子替换，最终内容是其中一份完整快照）
+    #[test]
+    fn test_concurrent_writes_never_share_temp_file() {
+        let dir = std::env::temp_dir().join("mh_test_queue_concurrent");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("order_list.json");
+
+        let payloads: Vec<String> = (0..8)
+            .map(|i| serde_json::to_string(&vec![mk_item(&format!("u{}", i), false, i as i64)]).unwrap())
+            .collect();
+        let mut handles = Vec::new();
+        for payload in payloads.clone() {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || QueueManager::write_json(&p, &payload)));
+        }
+        for h in handles {
+            h.join().unwrap().expect("并发写入不应失败");
+        }
+
+        let final_text = fs::read_to_string(&path).unwrap();
+        let parsed: Vec<QueueItem> = serde_json::from_str(&final_text).expect("最终文件必须是完整 JSON");
+        assert_eq!(parsed.len(), 1, "最终文件必须是某一份完整快照，不能是交错内容");
+
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件: {:?}", leftovers);
+
+        let _ = fs::remove_dir_all(&dir);
+        println!("[PASS] test_concurrent_writes_never_share_temp_file passed");
+    }
+
+    /// 快照的持久化状态与版本必须自洽：有未落盘变更即 PendingRetry
+    #[test]
+    fn test_snapshot_reports_persistence() {
+        let mut q = QueueManager::new();
+        let fresh = q.snapshot();
+        assert_eq!(fresh.revision, 0);
+        assert_eq!(fresh.persistence, QueuePersistence::Saved);
+
+        q.add_or_update(mk_item("a", false, 1));
+        let dirty = q.snapshot();
+        assert_eq!(dirty.revision, 1);
+        assert_eq!(dirty.persistence, QueuePersistence::PendingRetry);
+
+        q.mark_saved(1);
+        let saved = q.snapshot();
+        assert_eq!(saved.revision, 1);
+        assert_eq!(saved.persistence, QueuePersistence::Saved);
+        assert_eq!(saved.items.len(), 1);
+        println!("[PASS] test_snapshot_reports_persistence passed");
+    }
+
+    /// A3：撤销必须核对旧条目的身份。
+    /// 完成 A → A 又点新单 → 撤销旧 A 必须被拒绝，且新单不被旧订单覆盖。
+    #[test]
+    fn test_undo_after_requeue_keeps_new_order() {
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", false, 10));
+        q.add_or_update(mk_item("b", false, 20));
+
+        // 完成 A：拿到被删除的旧条目
+        let completed = q.dequeue_by_user_id("a").expect("A 应在队中");
+
+        // A 又点了一单全新的（新 id、新时间戳）
+        let mut requeued = mk_item("a", false, 99);
+        requeued.id = "item-a-new".into();
+        assert!(q.add_or_update(requeued.clone()));
+
+        // 撤销旧 A：必须失败，且不得覆盖同 UID 的新单
+        assert!(
+            !q.restore(completed, 0),
+            "同一用户已重新入队时，撤销旧完成必须被拒绝"
+        );
+        let current = q.items.iter().find(|i| i.user_id == "a").unwrap();
+        assert_eq!(current.id, "item-a-new", "新单不得被旧订单覆盖");
+        assert_eq!(current.timestamp, 99, "新单时间戳不得被改写");
+        assert_eq!(q.items.len(), 2, "队列不应产生重复条目");
+        println!("[PASS] test_undo_after_requeue_keeps_new_order passed");
     }
 }

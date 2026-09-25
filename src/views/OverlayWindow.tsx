@@ -4,10 +4,13 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   QueueItem,
+  QueueSnapshot,
   AppConfig,
   OrderPlacedPayload,
   OrderBlockedPayload,
   CheckinReplyPayload,
+  CheckinUnavailablePayload,
+  LikeRewardFailedPayload,
   RetroactivePayload,
   LikeRewardPayload,
   GiftReceivedPayload,
@@ -109,8 +112,8 @@ export const OverlayWindow: React.FC = () => {
   const [bubbles, setBubbles] = useState<OverlayBubble[]>([]);
   const [drag, setDrag] = useState<DragState | null>(null);
   const marqueeSeqRef = useRef(0);
-  /** 权威队列（后端快照），拖拽/撤销的下标计算基准 */
-  const authoritativeRef = useRef<QueueItem[]>([]);
+  /** 权威队列快照（后端版本 + 落盘状态），拖拽/撤销的基准 */
+  const authoritativeRef = useRef<QueueSnapshot>({ items: [], revision: 0, persistence: "Saved" });
   /** 行级锁：正在播完成动画的 user_id，期间拒绝再次点击 */
   const completingRef = useRef<Set<string>>(new Set());
   /** 已知条目 id，用于识别新入队行以播入场动画 */
@@ -156,9 +159,20 @@ export const OverlayWindow: React.FC = () => {
     return opChainRef.current;
   };
 
-  /** 队列写入唯一入口：fetchQueue 与 queue-updated 都走这里 */
-  const applyQueue = (items: QueueItem[]) => {
-    authoritativeRef.current = items;
+  /**
+   * 队列写入唯一入口：fetchQueue、queue-updated 与命令成功回调都走这里。
+   *
+   * 版本检查必须在**所有**路径生效：旧 revision 的快照直接丢弃，
+   * 同 revision 只允许 `PendingRetry → Saved` 推进。
+   */
+  const applyQueue = (snap: QueueSnapshot) => {
+    const prev = authoritativeRef.current;
+    if (snap.revision < prev.revision) return;
+    if (snap.revision === prev.revision && prev.persistence === "Saved" && snap.persistence === "PendingRetry") {
+      return;
+    }
+    authoritativeRef.current = snap;
+    const items = snap.items;
 
     const ids = new Set(items.map((i) => i.id));
     // 后端仍在队中说明该单并未删除成功 → 撤回对应幽灵行，避免行残留
@@ -179,8 +193,7 @@ export const OverlayWindow: React.FC = () => {
 
   const fetchQueue = async () => {
     try {
-      const items = await invoke<QueueItem[]>("get_queue");
-      applyQueue(items);
+      applyQueue(await invoke<QueueSnapshot>("get_queue"));
     } catch (e) {
       console.error(e);
     }
@@ -277,8 +290,8 @@ export const OverlayWindow: React.FC = () => {
 
     const interval = setInterval(fetchQueue, 1500);
 
-    // 队列实时更新
-    const unlistenQueue = listen<QueueItem[]>("queue-updated", (event) => {
+    // 队列实时更新（权威快照，带版本与落盘状态）
+    const unlistenQueue = listen<QueueSnapshot>("queue-updated", (event) => {
       applyQueue(event.payload);
     });
 
@@ -309,6 +322,31 @@ export const OverlayWindow: React.FC = () => {
 
     // D4 停用模块气泡（打卡 / 补签 / 点赞）：Lite 构建下无此功能，监听整体剔除（noop 占位保持清理逻辑统一）
     const liteNoop = Promise.resolve(() => {});
+
+    // 打卡数据不可持久化（Lite 形态停用，或完整版数据库故障）：
+    // 必须让主播看到，而不是让指令静默消失
+    const unlistenCheckinDown = __IS_LITE__
+      ? liteNoop
+      : listen<CheckinUnavailablePayload>("checkin-unavailable", (event) => {
+          pushBubble({
+            title: "打卡不可用",
+            username: "系统",
+            content: event.payload.message,
+            tone: "system",
+          });
+        });
+
+    // D3 点赞结算失败：整事件已回滚，必须让主播看见，且说明它是可重试的
+    const unlistenLikeFailed = __IS_LITE__
+      ? liteNoop
+      : listen<LikeRewardFailedPayload>("like-reward-failed", (event) => {
+          pushBubble({
+            title: "点赞结算未完成",
+            username: "系统",
+            content: event.payload.message,
+            tone: "system",
+          });
+        });
 
     // D4 舰长打卡回复气泡（原工程 CheckinTTSPlay 回调）
     const unlistenCheckin = __IS_LITE__
@@ -420,6 +458,8 @@ export const OverlayWindow: React.FC = () => {
     return () => {
       clearInterval(interval);
       unlistenQueue.then((f) => f());
+      unlistenCheckinDown.then((f) => f());
+      unlistenLikeFailed.then((f) => f());
       unlistenOrder.then((f) => f());
       unlistenBlocked.then((f) => f());
       unlistenCheckin.then((f) => f());
@@ -509,13 +549,24 @@ export const OverlayWindow: React.FC = () => {
     const current = authoritativeRef.current;
     const rank = new Map(order.map((uid, i) => [uid, i]));
     // 拖拽期间队列可能被弹幕改动：长度或成员对不上就放弃，交由 queue-updated 校正
-    if (order.length !== current.length || current.some((it) => rank.get(it.user_id) === undefined)) return;
+    if (order.length !== current.items.length || current.items.some((it) => rank.get(it.user_id) === undefined)) return;
 
-    const list = [...current].sort((a, b) => rank.get(a.user_id)! - rank.get(b.user_id)!);
-    if (list.every((it, i) => it.user_id === current[i].user_id)) return;
+    const list = [...current.items].sort((a, b) => rank.get(a.user_id)! - rank.get(b.user_id)!);
+    if (list.every((it, i) => it.user_id === current.items[i].user_id)) return;
 
-    applyQueue(list);
-    serial(() => invoke("reorder_queue", { items: list }));
+    // 不做乐观整表提交：预览由 drag state 渲染，权威顺序只由后端快照决定
+    serial(async () => {
+      try {
+        const snap = await invoke<QueueSnapshot>("reorder_queue", {
+          orderedUserIds: order,
+          expectedRevision: current.revision,
+        });
+        applyQueue(snap);
+      } catch (err) {
+        pushMarquee(`排序未生效：${err}`);
+        await fetchQueue();
+      }
+    });
   };
 
   /**
@@ -529,7 +580,7 @@ export const OverlayWindow: React.FC = () => {
     e.preventDefault(); // 阻止拖动时选中文本、触发原生拖放
     e.stopPropagation(); // 不冒泡到行（点击完成）与窗口拖动
     const rowEl = e.currentTarget.closest<HTMLElement>(".queue-row");
-    const origin = authoritativeRef.current.map((i) => i.user_id);
+    const origin = authoritativeRef.current.items.map((i) => i.user_id);
     if (!rowEl || !origin.includes(userId)) return;
 
     const rect = rowEl.getBoundingClientRect();
@@ -680,14 +731,19 @@ export const OverlayWindow: React.FC = () => {
     if (completingRef.current.has(item.user_id)) return; // 行级锁：连点同一行只删一次
 
     completingRef.current.add(item.user_id);
-    // 乐观移除 + 幽灵行插回原位：同一 key 就地复用 DOM，动画不会被打断
+    // 乐观移除 + 幽灵行插回原位：同一 key 就地复用 DOM，动画不会被打断。
+    // 此处只改本地渲染 state，authoritativeRef 保持后端权威快照，等命令回执再更新
     setGhosts((prev) => [...prev, { item, index }]);
-    const rest = authoritativeRef.current.filter((i) => i.user_id !== item.user_id);
-    authoritativeRef.current = rest;
     setQueue((prev) => prev.filter((i) => i.user_id !== item.user_id));
 
-    // 不消费返回值：连点时多个请求同时在飞，queue-updated 才是唯一真相源
-    serial(() => invoke("dequeue_by_user_id", { userId: item.user_id }));
+    // 串行链保证回执按序到达；版本检查会丢弃任何迟到的旧快照
+    serial(async () => {
+      try {
+        applyQueue(await invoke<QueueSnapshot>("dequeue_by_user_id", { userId: item.user_id }));
+      } catch (e) {
+        console.error(e);
+      }
+    });
 
     const timer = setTimeout(() => {
       completeTimersRef.current.delete(item.user_id);
@@ -703,15 +759,21 @@ export const OverlayWindow: React.FC = () => {
     if (locked) return;
     const record = undoStack[undoStack.length - 1];
     if (!record) return;
-    setUndoStack((prev) => prev.slice(0, -1));
 
-    const at = Math.min(record.index, authoritativeRef.current.length);
+    const at = Math.min(record.index, authoritativeRef.current.items.length);
+    // 后端确认成功后才消耗撤销入口；同一用户已重新入队时必须保留条目并提示失败
     serial(async () => {
-      const items = await invoke<QueueItem[]>("restore_order", {
-        item: record.item,
-        index: at,
-      });
-      applyQueue(items);
+      try {
+        const snap = await invoke<QueueSnapshot>("restore_order", {
+          item: record.item,
+          index: at,
+        });
+        applyQueue(snap);
+        setUndoStack((prev) => prev.filter((r) => r !== record));
+      } catch (err) {
+        pushMarquee(`撤销失败：${err}`);
+        await fetchQueue();
+      }
     });
   };
 

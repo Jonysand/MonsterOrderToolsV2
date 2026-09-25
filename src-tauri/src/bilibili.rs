@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -170,6 +170,21 @@ impl BiliCredentials {
         Ok((game_id, wss_links, auth_body))
     }
 
+    /// 解析心跳/接口响应中的业务 code。
+    ///
+    /// 缺 `code`、`code` 非整数、或超出 `i32` 范围都视为**无效响应**而不是成功：
+    /// 早期实现用 `unwrap_or(0)`，于是 HTTP 200 的 `{}`、`{"code":"bad"}` 或越界值
+    /// 都会被当成"心跳正常"，把已经失效的会话一直藏起来。
+    pub fn parse_business_code(val: &serde_json::Value) -> Result<i32, String> {
+        let raw = val
+            .get("code")
+            .ok_or_else(|| "响应缺少 code 字段".to_string())?;
+        let n = raw
+            .as_i64()
+            .ok_or_else(|| "响应 code 不是整数".to_string())?;
+        i32::try_from(n).map_err(|_| format!("响应 code 超出 i32 范围: {}", n))
+    }
+
     /// 发送应用心跳 POST /v2/app/heartbeat
     /// 返回响应体的业务 code（对齐原工程 BliveManager::OnReceiveHeartbeatResponse 的判定：
     /// 0 / 4004 视为正常，其它 code 说明会话已失效需重连）
@@ -200,10 +215,14 @@ impl BiliCredentials {
             .json()
             .await
             .map_err(|e| format!("心跳响应解析失败: {}", e))?;
-        Ok(val.get("code").and_then(|c| c.as_i64()).unwrap_or(0) as i32)
+        Self::parse_business_code(&val)
     }
 
     /// 停止并关闭互动应用 POST /v2/app/end
+    ///
+    /// 只有**明确证实**关闭成功才返回 `Ok`：网络错误、非 2xx、响应体无有效成功码
+    /// 一律返回 `Err`，由调用方保留可重试的 game_id 并标记"关闭状态未知"。
+    /// 早期实现丢弃 `.send()` 结果永远返回成功，会让日志假记"已关闭上一场"。
     pub async fn end_app(&self, game_id: &str) -> Result<(), String> {
         let app_id_num: serde_json::Value = self
             .app_id
@@ -229,7 +248,25 @@ impl BiliCredentials {
             req = req.header(k, v);
         }
 
-        let _ = req.body(body).send().await;
+        let resp = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| format!("下播请求失败: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("下播 HTTP 状态异常: {}", resp.status()));
+        }
+
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("下播响应解析失败: {}", e))?;
+        // 协议成功码为 0；缺 code 或非整数都不得当作成功
+        let code = Self::parse_business_code(&val)?;
+        if code != 0 {
+            return Err(format!("下播被服务端拒绝（code {}）", code));
+        }
         Ok(())
     }
 }
@@ -352,6 +389,11 @@ pub struct DanmuData {
     pub msg_id: String,
     /// 是否付费礼物（仅礼物通道解析 paid 后置位；DM 通道恒 false）
     pub is_paid_gift: bool,
+    /// 原始包是否带齐 History 留档所需的必需字段（粉丝牌佩戴状态 / 舰长等级 / 昵称 / 消息）。
+    ///
+    /// 旧完整版只在字段齐全时才把原弹幕写入独立 History 队列，缺字段的畸形包不写。
+    /// 解析路径按同一判定置位，避免把空值弹幕留档成「 说：」。
+    pub has_history_required_fields: bool,
 }
 
 /// 直播间事件（SC / 上舰 / 进场），对齐原工程 `HandleSpeekSC/Guard/Enter`
@@ -458,8 +500,9 @@ pub fn parse_like_event(data: &serde_json::Value) -> Option<LikeEvent> {
 
     let uid = pick_user_id(data);
     if uid.is_empty() {
-        // 缺 uid（open_id/uid 皆无）时记录告警后丢弃（对齐 like-event-tracking spec 的可观测要求）
-        crate::log_warn!("[BiliLive] 点赞事件缺少 uid/open_id，已丢弃: {}", data);
+        // 缺 uid（open_id/uid 皆无）时记录告警后丢弃（对齐 like-event-tracking spec 的可观测要求）。
+        // 只记"缺哪个字段"，不回显原始 JSON —— 包里带用户标识与昵称，属业务内容
+        crate::log_warn!("[BiliLive] 点赞事件缺少 uid/open_id，已丢弃");
         return None;
     }
 
@@ -469,7 +512,8 @@ pub fn parse_like_event(data: &serde_json::Value) -> Option<LikeEvent> {
         .or_else(|| data.get("click_count").and_then(|v| v.as_i64()))
         .unwrap_or(0) as i32;
     if like_count <= 0 {
-        crate::log_warn!("[BiliLive] 点赞事件 like_count<=0，已丢弃（uid={}）", uid);
+        // uid 不写入普通日志（业务标识）；需要定位时按事件计数与时间窗口排查
+        crate::log_warn!("[BiliLive] 点赞事件 like_count<=0，已丢弃");
         return None;
     }
     if like_count > MAX_LIKE_COUNT {
@@ -617,6 +661,22 @@ pub struct DanmuProcessResult {
     pub blocked_by_roster: bool,
 }
 
+/// 消息 ID 预留结果 —— 三态去重的载体。
+///
+/// 弹幕（DM）与点赞（LIKE）共用同一份缓存，但语义不同：
+/// - DM：预留后**永久保留**（一条弹幕只处理一次）；
+/// - LIKE：处理中保留、提交成功确认保留、**失败则释放** ——
+///   否则一次数据库失败会把该事件的重投永久挡在缓存外，合法点赞就真的丢了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgIdReservation {
+    /// 空 msg_id：不参与去重，允许合法的多次处理（不得伪造唯一键）
+    NoKey,
+    /// 首次出现，已预留
+    Reserved,
+    /// 已存在：重复投递，应丢弃
+    Duplicate,
+}
+
 /// 10 万条 LRU 消息 ID 去重缓存
 pub struct MsgIdCache {
     max_size: usize,
@@ -633,14 +693,18 @@ impl MsgIdCache {
         }
     }
 
-    /// 检查并添加，若已存在则返回 true（表示重复）
-    pub fn check_and_add(&mut self, msg_id: &str) -> bool {
+    /// 尝试预留一个 msg_id。
+    ///
+    /// 空 ID 返回 [`MsgIdReservation::NoKey`]（调用方照常处理，不做去重）；
+    /// 已存在返回 [`MsgIdReservation::Duplicate`]；否则登记并返回 `Reserved`。
+    /// 整个过程在一把锁内完成，因此并发同 ID 只可能有一条拿到 `Reserved`。
+    pub fn try_reserve(&mut self, msg_id: &str) -> MsgIdReservation {
         if msg_id.is_empty() {
-            return false;
+            return MsgIdReservation::NoKey;
         }
 
         if self.set.contains(msg_id) {
-            return true;
+            return MsgIdReservation::Duplicate;
         }
 
         self.order.push_back(msg_id.to_string());
@@ -652,7 +716,27 @@ impl MsgIdCache {
             }
         }
 
-        false
+        MsgIdReservation::Reserved
+    }
+
+    /// 撤销预留（处理失败时调用），使同一事件的重投可以重试。
+    /// 返回是否确实移除了一个预留。
+    pub fn release(&mut self, msg_id: &str) -> bool {
+        if msg_id.is_empty() || !self.set.remove(msg_id) {
+            return false;
+        }
+        // order 允许保留墓碑（LRU 淘汰时 set.remove 会返回 false，无副作用）
+        true
+    }
+
+    pub fn contains(&self, msg_id: &str) -> bool {
+        !msg_id.is_empty() && self.set.contains(msg_id)
+    }
+
+    /// 检查并添加，若已存在则返回 true（表示重复）。
+    /// 供**弹幕**使用：预留即长期保留（对齐原工程"先成功占用 ID 再处理一次"）。
+    pub fn check_and_add(&mut self, msg_id: &str) -> bool {
+        self.try_reserve(msg_id) == MsgIdReservation::Duplicate
     }
 }
 
@@ -722,6 +806,21 @@ impl DanmuProcessor {
         self.msg_id_cache.lock().unwrap().check_and_add(msg_id)
     }
 
+    /// 预留一个 msg_id（LIKE 通道使用三态语义：预留 → 成功确认 / 失败释放）
+    pub fn reserve_msg_id(&self, msg_id: &str) -> MsgIdReservation {
+        self.msg_id_cache.lock().unwrap().try_reserve(msg_id)
+    }
+
+    /// 释放预留：仅在处理失败时调用，使同一事件的重投能够重试
+    pub fn release_msg_id(&self, msg_id: &str) -> bool {
+        self.msg_id_cache.lock().unwrap().release(msg_id)
+    }
+
+    /// 查询某 msg_id 是否已被占用（仅用于测试与诊断）
+    pub fn msg_id_reserved(&self, msg_id: &str) -> bool {
+        self.msg_id_cache.lock().unwrap().contains(msg_id)
+    }
+
     /// 文本预处理：过滤空格和逗号
     pub fn normalize_string(&self, input: &str) -> String {
         input.replace(' ', "").replace(',', "").replace('，', "")
@@ -778,6 +877,13 @@ impl DanmuProcessor {
         }
         let msg_id = data.get("msg_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
+        // History 留档判定：昵称与消息必须非空，且佩戴状态/舰长等级字段必须真实存在。
+        // 畸形空值包不得被留档成「 说：」。
+        let has_history_required_fields = !user_name.trim().is_empty()
+            && !message.trim().is_empty()
+            && data.get("fans_medal_wearing_status").is_some()
+            && data.get("guard_level").is_some();
+
         Some(DanmuData {
             user_id,
             user_name,
@@ -788,6 +894,7 @@ impl DanmuProcessor {
             guard_level,
             msg_id,
             is_paid_gift: false,
+            has_history_required_fields,
         })
     }
 
@@ -1088,10 +1195,79 @@ impl ExponentialBackoff {
     }
 }
 
+/// 会话结束状态：把"本地已停止"与"服务端已确认关闭"分开。
+///
+/// 只有 `Confirmed` 才允许在**同一进程内**直接开始新会话；
+/// `Ending` 表示已有调用者取得该次 end 的唯一执行权（后台不得重复 end）；
+/// `Unknown` 表示 end 失败/超时，必须保留 game_id 以便受控重试。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEndState {
+    /// 有活动会话，尚未请求结束
+    Active,
+    /// 已有调用者正在执行 end
+    Ending,
+    /// 服务端已确认关闭
+    Confirmed,
+    /// end 失败或未执行：服务端关闭状态未知，保留可重试的 game_id
+    Unknown,
+}
+
 /// B站直播长连服务状态与生命周期管理
 pub struct BiliLiveService {
     running: Arc<AtomicBool>,
     game_id: Arc<Mutex<Option<String>>>,
+    /// 当前会话的结束状态（与 game_id 同一把锁保护，避免两者读出不一致）
+    end_state: Arc<Mutex<SessionEndState>>,
+    /// 会话代号：每开一次会话递增。旧循环发现代号变了就自行退出，
+    /// 因此不可能出现"旧会话被 running=true 复活"。
+    session_generation: Arc<AtomicU64>,
+    /// 连接循环是否仍在运行：断开方据此等待"真的停了"，而不是假设已停
+    loop_alive: Arc<AtomicBool>,
+}
+
+/// 会话取消令牌：交给长连循环，用于判定自己是否已被取消，以及退出时回报。
+///
+/// 拆出独立结构是为了让"取消"与"退出确认"两件事都可单测，不必真的起网络连接。
+#[derive(Clone)]
+pub struct SessionCtl {
+    generation: Arc<AtomicU64>,
+    loop_alive: Arc<AtomicBool>,
+    my_generation: u64,
+}
+
+impl SessionCtl {
+    /// 是否已被取消：用户要求停止，或已有更新的一代会话开始
+    pub fn is_cancelled(&self, running: &AtomicBool) -> bool {
+        !running.load(Ordering::SeqCst)
+            || self.generation.load(Ordering::SeqCst) != self.my_generation
+    }
+
+    pub fn my_generation(&self) -> u64 {
+        self.my_generation
+    }
+
+    /// 可取消的等待：分片 sleep，任意时刻都能被取消打断。
+    /// 原实现一次性 `sleep(最长 60s)`，导致断开后旧循环还要空等很久才退出。
+    pub async fn cancellable_sleep(&self, running: &AtomicBool, total_ms: u64) {
+        const SLICE_MS: u64 = 100;
+        let mut left = total_ms;
+        while left > 0 {
+            if self.is_cancelled(running) {
+                return;
+            }
+            let step = left.min(SLICE_MS);
+            tokio::time::sleep(tokio::time::Duration::from_millis(step)).await;
+            left -= step;
+        }
+    }
+
+    /// 循环退出时回报。只有仍是"当前代"时才清标记，
+    /// 否则会把刚启动的新会话的 alive 标记误清掉。
+    pub fn mark_exited(&self) {
+        if self.generation.load(Ordering::SeqCst) == self.my_generation {
+            self.loop_alive.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 impl Default for BiliLiveService {
@@ -1105,6 +1281,9 @@ impl BiliLiveService {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             game_id: Arc::new(Mutex::new(None)),
+            end_state: Arc::new(Mutex::new(SessionEndState::Active)),
+            session_generation: Arc::new(AtomicU64::new(0)),
+            loop_alive: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1132,12 +1311,122 @@ impl BiliLiveService {
     pub fn get_game_id_ref(&self) -> Arc<Mutex<Option<String>>> {
         self.game_id.clone()
     }
+
+    pub fn end_state(&self) -> SessionEndState {
+        self.end_state.lock().unwrap().clone()
+    }
+
+    pub fn set_end_state(&self, state: SessionEndState) {
+        *self.end_state.lock().unwrap() = state;
+    }
+
+    /// 开始一代新会话：标记循环存活并递增代号，返回本次代号。
+    /// 旧循环会在下一次取消检查时发现代号已变而退出。
+    pub fn begin_session(&self) -> u64 {
+        self.loop_alive.store(true, Ordering::SeqCst);
+        self.session_generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// 取当前代的取消令牌（必须在 `begin_session` 之后调用）
+    pub fn session_ctl(&self) -> SessionCtl {
+        SessionCtl {
+            generation: self.session_generation.clone(),
+            loop_alive: self.loop_alive.clone(),
+            my_generation: self.session_generation.load(Ordering::SeqCst),
+        }
+    }
+
+    /// 连接循环是否仍在运行
+    pub fn is_loop_alive(&self) -> bool {
+        self.loop_alive.load(Ordering::SeqCst)
+    }
+
+    /// 声明"本次 end 由我独占执行"。
+    ///
+    /// 返回 `Some(game_id)` 时调用者取得了唯一执行权，必须自己把状态推进到
+    /// `Confirmed` 或 `Unknown`；已在 `Ending` 时返回 `None`（后台看到后不得重复 end）。
+    /// **不 `take()` 掉 game_id**：即便 end 失败，也还留着可重试的 ID。
+    pub fn begin_end(&self) -> Option<String> {
+        let gid = self.get_game_id()?;
+        let mut st = self.end_state.lock().unwrap();
+        match *st {
+            SessionEndState::Ending => None,
+            _ => {
+                *st = SessionEndState::Ending;
+                Some(gid)
+            }
+        }
+    }
+
+    /// end 成功：清理 ID 并放行新会话
+    pub fn confirm_end(&self) {
+        self.set_game_id(None);
+        self.set_end_state(SessionEndState::Confirmed);
+    }
+
+    /// end 失败/超时：保留 game_id 与"关闭状态未知"，禁止在未确认下立即开新会话
+    pub fn mark_end_unknown(&self) {
+        self.set_end_state(SessionEndState::Unknown);
+    }
+
+    /// 是否允许本进程立即开启新会话。
+    /// 三个条件都必须满足：服务端关闭状态已确认、没有 end 在进行、**旧连接循环确已退出**。
+    pub fn can_start_new_session(&self) -> bool {
+        !matches!(self.end_state(), SessionEndState::Unknown | SessionEndState::Ending)
+            && !self.is_loop_alive()
+    }
+}
+
+/// 直播包类型统计的白名单（无法识别的 cmd 统一计入 `other`）。
+/// 固定集合保证摘要长度有上限，不会被异常 cmd 撑爆日志。
+pub const CMD_TYPE_WHITELIST: [&str; 7] = [
+    "LIVE_OPEN_PLATFORM_DM",
+    "LIVE_OPEN_PLATFORM_LIKE",
+    "LIVE_OPEN_PLATFORM_SEND_GIFT",
+    "LIVE_OPEN_PLATFORM_SUPER_CHAT",
+    "LIVE_OPEN_PLATFORM_GUARD",
+    "LIVE_OPEN_PLATFORM_LIVE_ROOM_ENTER",
+    "LIVE_OPEN_PLATFORM_INTERACTION_END",
+];
+
+/// 包类型计数器：白名单内按类型计数，其余归 `other`
+pub type CmdCounts = std::collections::BTreeMap<&'static str, u64>;
+
+/// 记一次收包（不写日志，只累加）
+pub fn record_cmd_type(counts: &mut CmdCounts, cmd: &str) {
+    let key = CMD_TYPE_WHITELIST
+        .iter()
+        .find(|c| **c == cmd)
+        .copied()
+        .unwrap_or("other");
+    *counts.entry(key).or_insert(0) += 1;
+}
+
+/// 生成有上限的收包摘要（按固定白名单顺序，未出现的类型也要以 0 呈现，
+/// 这样"完全没收到 DM"与"收到 0 条 DM"是同一种可读事实）
+pub fn format_cmd_summary(counts: &mut CmdCounts) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for t in CMD_TYPE_WHITELIST
+        .iter()
+        .copied()
+        .chain(std::iter::once("other"))
+    {
+        let n = counts.get(t).copied().unwrap_or(0);
+        let short = t
+            .strip_prefix("LIVE_OPEN_PLATFORM_")
+            .unwrap_or(t)
+            .to_ascii_lowercase();
+        parts.push(format!("{}={}", short, n));
+    }
+    counts.clear();
+    parts.join(" ")
 }
 
 /// 运行 B 站直播开放平台 WebSocket 长连接后台主循环
 pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
     creds: BiliCredentials,
     running: Arc<AtomicBool>,
+    session: SessionCtl,
     current_game_id: Arc<Mutex<Option<String>>>,
     on_danmu: FDanmu,
     on_like: FLike,
@@ -1160,16 +1449,28 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
     // 进入即「连接中」（对齐原工程 Start() 的 SetConnectionState(Connecting, None)）
     on_state_change(ConnectionState::Connecting, DisconnectReason::None, 0);
 
-    while running.load(Ordering::SeqCst) {
+    // L05：收包类型统计与 60 秒摘要节流（每个类型在完整窗口内至多一条统计）
+    let mut cmd_counts: CmdCounts = CmdCounts::new();
+    let mut last_cmd_summary = std::time::Instant::now();
+    const CMD_SUMMARY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    while !session.is_cancelled(&running) {
         // 0. 重连/重开前先关闭上一场互动应用（对齐原工程 BliveManager.cpp:146-148：
         //    若仍有 currentGameId 则先 End(gameId, restart=true)，否则会命中服务端 7001 请求冷却期）
         {
             let stale = current_game_id.lock().ok().and_then(|mut g| g.take());
             if let Some(old_gid) = stale {
-                if let Err(e) = creds.end_app(&old_gid).await {
-                    crate::log_warn!("[BiliLive] 重连前关闭上一场互动应用失败（忽略并继续）: {}", e);
-                } else {
-                    crate::log_info!("[BiliLive] 重连前已关闭上一场互动应用: {}", old_gid);
+                match creds.end_app(&old_gid).await {
+                    Ok(()) => {
+                        // 只有明确证实关闭成功才记 INFO，否则会假报"已关闭上一场"
+                        crate::log_info!("[BiliLive] 重连前已确认关闭上一场互动应用");
+                    }
+                    Err(e) => {
+                        crate::log_warn!(
+                            "[BiliLive] 重连前关闭上一场互动应用未获确认（服务端关闭状态未知）: {}",
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -1200,7 +1501,8 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                     attempt,
                 );
                 let delay = backoff.next_delay();
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                // 可取消的退避等待：断开后旧循环不再空等到最长 60s
+                session.cancellable_sleep(&running, delay).await;
                 continue;
             }
         };
@@ -1242,13 +1544,29 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                     let mut app_heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(20));
                     // 首个 WS 心跳延后 2s 发出（对齐原工程收到 OP_AUTH_REPLY 后排 2s 心跳）
                     ws_heartbeat_interval.reset();
+                    // 取消轮询：保证断开后旧循环最多 500ms 就退出
+                    let mut cancel_tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
 
                     'ws_loop: loop {
-                        if !running.load(Ordering::SeqCst) {
+                        if session.is_cancelled(&running) {
                             break;
                         }
 
+                        // 收包摘要与心跳同频检查：到点就输出一次固定格式的统计并清零，
+                        // 因此 60 秒窗口内每种类型至多出现一次
+                        if last_cmd_summary.elapsed() >= CMD_SUMMARY_INTERVAL {
+                            last_cmd_summary = std::time::Instant::now();
+                            crate::log_info!("[BiliLive] 直播包统计（60s）: {}", format_cmd_summary(&mut cmd_counts));
+                        }
+
                         tokio::select! {
+                            // 取消检查（500ms）：没有这一支时，仅剩 20s 心跳分支，
+                            // 断开后旧循环最长要空等 20s 才退出，新会话就被无谓地挡住
+                            _ = cancel_tick.tick() => {
+                                if session.is_cancelled(&running) {
+                                    break 'ws_loop;
+                                }
+                            }
                             _ = ws_heartbeat_interval.tick() => {
                                 let hb_pkt = Packet::new(Packet::OP_HEARTBEAT, vec![]);
                                 if let Err(e) = write.send(Message::Binary(hb_pkt.pack())).await {
@@ -1314,6 +1632,10 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                                                 }
                                             };
                                             let cmd = val.get("cmd").and_then(|c| c.as_str()).unwrap_or_default();
+                                            // L05：按固定白名单统计直播包类型，周期性输出有上限的 INFO 摘要。
+                                            // 这样才能在 Release 日志里区分"没收到包"与"收到了但被过滤"，
+                                            // 又不必为每条包写文件（也无法识别的类型统一计为 other）
+                                            record_cmd_type(&mut cmd_counts, cmd);
                                             if cmd == "LIVE_OPEN_PLATFORM_DM" {
                                                 if let Some(danmu) = processor.parse_danmu_json(text) {
                                                     on_danmu(danmu);
@@ -1361,9 +1683,9 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                                                     .and_then(|g| g.as_str())
                                                     .unwrap_or_default();
                                                 if !ended_gid.is_empty() && ended_gid != game_id {
+                                                    // 不回显 game_id（会话标识不进普通日志）
                                                     crate::log_warn!(
-                                                        "[BiliLive] 收到其它会话的终止包（{}），忽略",
-                                                        ended_gid
+                                                        "[BiliLive] 收到其它会话的终止包，已忽略"
                                                     );
                                                     continue;
                                                 }
@@ -1398,7 +1720,8 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
                     break;
                 }
                 Err(e) => {
-                    crate::log_warn!("[BiliLive] 连接 {} 失败: {}", wss_url, e);
+                    // 不回显 WSS 地址（含鉴权信息）与原始错误全文，只记错误类别
+                    crate::log_warn!("[BiliLive] WebSocket 连接失败，将按退避重试: {}", e);
                 }
             }
         }
@@ -1416,7 +1739,329 @@ pub async fn run_bili_live_loop<FDanmu, FLike, FGift, FEvent, FState>(
         attempt = attempt.saturating_add(1);
         on_state_change(ConnectionState::Reconnecting, last_reason, attempt);
         let delay = backoff.next_delay();
-        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+        session.cancellable_sleep(&running, delay).await;
+    }
+
+    // 循环真正结束：回报退出，让断开方可以确认"旧任务已经不在了"
+    session.mark_exited();
+}
+
+#[cfg(test)]
+mod heartbeat_and_session_tests {
+    use super::*;
+
+    /// E3：心跳业务码解析 —— 缺 code / 非整数 / 越界都必须是无效响应，不能默认为成功
+    #[test]
+    fn test_parse_business_code_rejects_invalid_shapes() {
+        // 正常
+        assert_eq!(
+            BiliCredentials::parse_business_code(&serde_json::json!({"code": 0})).unwrap(),
+            0
+        );
+        assert_eq!(
+            BiliCredentials::parse_business_code(&serde_json::json!({"code": 4004})).unwrap(),
+            4004
+        );
+        assert_eq!(
+            BiliCredentials::parse_business_code(&serde_json::json!({"code": 7001})).unwrap(),
+            7001
+        );
+
+        // HTTP 200 但响应体是空对象：早期 unwrap_or(0) 会把它当成"心跳正常"
+        let err = BiliCredentials::parse_business_code(&serde_json::json!({})).unwrap_err();
+        assert!(err.contains("缺少 code"), "{}", err);
+
+        // 字符串 code
+        let err =
+            BiliCredentials::parse_business_code(&serde_json::json!({"code": "bad"})).unwrap_err();
+        assert!(err.contains("不是整数"), "{}", err);
+
+        // 超出 i32 范围：不得截断成看似正常的值
+        let err = BiliCredentials::parse_business_code(&serde_json::json!({"code": 4294967296i64}))
+            .unwrap_err();
+        assert!(err.contains("超出 i32 范围"), "{}", err);
+
+        // null / 布尔 / 数组同样无效
+        for bad in [
+            serde_json::json!({"code": null}),
+            serde_json::json!({"code": true}),
+            serde_json::json!({"code": [0]}),
+        ] {
+            assert!(
+                BiliCredentials::parse_business_code(&bad).is_err(),
+                "非整数 code 必须判为无效响应: {}",
+                bad
+            );
+        }
+        println!("[PASS] test_parse_business_code_rejects_invalid_shapes passed");
+    }
+
+    /// E3：会话结束状态机 —— 只有确认关闭才放行新会话；end 失败保留可重试 ID
+    #[test]
+    fn test_session_end_state_machine() {
+        let svc = BiliLiveService::new();
+        assert!(svc.can_start_new_session(), "初始状态允许开播");
+
+        svc.set_game_id(Some("gid_1".into()));
+        svc.set_end_state(SessionEndState::Active);
+
+        // 第一个调用者取得唯一执行权
+        assert_eq!(svc.begin_end().as_deref(), Some("gid_1"));
+        assert_eq!(svc.end_state(), SessionEndState::Ending);
+        // 后台看到 Ending 时不得重复 end
+        assert_eq!(svc.begin_end(), None, "同一会话只允许一次 end");
+        assert!(
+            !svc.can_start_new_session(),
+            "end 进行中不得开新会话"
+        );
+        // 关键：end 进行中也没有丢掉 game_id
+        assert_eq!(svc.get_game_id().as_deref(), Some("gid_1"));
+
+        // end 失败：转入 Unknown，仍保留可重试 ID
+        svc.mark_end_unknown();
+        assert_eq!(svc.end_state(), SessionEndState::Unknown);
+        assert_eq!(svc.get_game_id().as_deref(), Some("gid_1"), "失败后必须保留可重试的 ID");
+        assert!(
+            !svc.can_start_new_session(),
+            "服务端关闭状态未知时不得立即开新会话"
+        );
+
+        // 重试成功后才清 ID 并放行
+        assert_eq!(svc.begin_end().as_deref(), Some("gid_1"), "Unknown 允许受控重试");
+        svc.confirm_end();
+        assert_eq!(svc.end_state(), SessionEndState::Confirmed);
+        assert_eq!(svc.get_game_id(), None);
+        assert!(svc.can_start_new_session());
+        println!("[PASS] test_session_end_state_machine passed");
+    }
+
+    /// E3：没有会话时 begin_end 不得凭空标记 Ending
+    #[test]
+    fn test_begin_end_without_session_is_none() {
+        let svc = BiliLiveService::new();
+        assert_eq!(svc.begin_end(), None);
+        assert_eq!(svc.end_state(), SessionEndState::Active);
+        println!("[PASS] test_begin_end_without_session_is_none passed");
+    }
+
+    // ---------------- E2：会话取消与退出确认 ----------------
+
+    /// 只把 running=false 不算"已停"：循环未回报退出前不得开新会话
+    #[test]
+    fn test_loop_alive_blocks_new_session_until_exit_reported() {
+        let svc = BiliLiveService::new();
+        assert!(svc.can_start_new_session(), "初始可开播");
+        assert!(!svc.is_loop_alive());
+
+        let gen = svc.begin_session();
+        assert_eq!(gen, 1);
+        assert!(svc.is_loop_alive(), "开播后循环标记应为存活");
+
+        // 停止：running=false，但循环还没回报退出
+        svc.set_running(false);
+        svc.set_end_state(SessionEndState::Confirmed);
+        assert!(
+            !svc.can_start_new_session(),
+            "循环尚未退出时不得允许新会话（否则新旧循环会并行）"
+        );
+
+        // 循环回报退出后才放行
+        svc.session_ctl().mark_exited();
+        assert!(!svc.is_loop_alive());
+        assert!(svc.can_start_new_session(), "退出确认后应放行");
+        println!("[PASS] test_loop_alive_blocks_new_session_until_exit_reported passed");
+    }
+
+    /// 代号递增后旧会话立即被判为取消；旧循环退出不得清掉新会话的存活标记
+    #[test]
+    fn test_generation_cancels_old_session_and_mark_exited_is_guarded() {
+        let svc = BiliLiveService::new();
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+
+        let gen1 = svc.begin_session();
+        let old_ctl = svc.session_ctl();
+        assert_eq!(old_ctl.my_generation(), gen1);
+        assert!(!old_ctl.is_cancelled(&running), "当前会话未被取消");
+
+        // 开新一代：旧令牌立刻视为已取消（即便 running 还是 true）
+        let gen2 = svc.begin_session();
+        assert_ne!(gen1, gen2);
+        assert!(
+            old_ctl.is_cancelled(&running),
+            "代号变化必须让旧会话立即被判为取消"
+        );
+        let new_ctl = svc.session_ctl();
+        assert!(!new_ctl.is_cancelled(&running));
+
+        // 旧循环延迟退出：不得把新会话的存活标记清掉
+        old_ctl.mark_exited();
+        assert!(
+            svc.is_loop_alive(),
+            "旧一代退出回报不得清除新一代的存活标记"
+        );
+        new_ctl.mark_exited();
+        assert!(!svc.is_loop_alive());
+        println!("[PASS] test_generation_cancels_old_session_and_mark_exited_is_guarded passed");
+    }
+
+    /// 可取消的退避等待：取消后必须立刻返回，而不是睡满整个退避时长
+    #[test]
+    fn test_cancellable_sleep_returns_promptly_on_cancel() {
+        let svc = BiliLiveService::new();
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        svc.begin_session();
+        let ctl = svc.session_ctl();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 已取消：立即返回
+            running.store(false, Ordering::SeqCst);
+            let t0 = std::time::Instant::now();
+            ctl.cancellable_sleep(&running, 60_000).await;
+            assert!(
+                t0.elapsed() < std::time::Duration::from_millis(200),
+                "取消后不得继续等待，实际 {:?}",
+                t0.elapsed()
+            );
+
+            // 未取消：等待约等于请求时长（分片 sleep 不应显著跑偏）
+            running.store(true, Ordering::SeqCst);
+            let t1 = std::time::Instant::now();
+            ctl.cancellable_sleep(&running, 300).await;
+            let elapsed = t1.elapsed();
+            assert!(
+                elapsed >= std::time::Duration::from_millis(250),
+                "未取消时应等满，实际 {:?}",
+                elapsed
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(900),
+                "不应显著超时，实际 {:?}",
+                elapsed
+            );
+        });
+        println!("[PASS] test_cancellable_sleep_returns_promptly_on_cancel passed");
+    }
+
+    /// L05：收包类型统计按固定白名单归类，未知 cmd 计入 other，摘要长度有上限
+    #[test]
+    fn test_cmd_type_counting_and_bounded_summary() {
+        let mut counts: CmdCounts = CmdCounts::new();
+        for _ in 0..3 {
+            record_cmd_type(&mut counts, "LIVE_OPEN_PLATFORM_DM");
+        }
+        record_cmd_type(&mut counts, "LIVE_OPEN_PLATFORM_LIKE");
+        // 未知类型统一归 other，不得为每个异常 cmd 生成一个新键
+        for weird in ["SOME_NEW_CMD", "ANOTHER_CMD", ""] {
+            record_cmd_type(&mut counts, weird);
+        }
+
+        let summary = format_cmd_summary(&mut counts);
+        assert!(summary.contains("dm=3"), "{}", summary);
+        assert!(summary.contains("like=1"), "{}", summary);
+        assert!(summary.contains("other=3"), "{}", summary);
+        // 未出现的类型也以 0 呈现：这样才能区分"没收到"与"收到了但被过滤"
+        assert!(summary.contains("send_gift=0"), "{}", summary);
+        assert_eq!(
+            summary.split_whitespace().count(),
+            CMD_TYPE_WHITELIST.len() + 1,
+            "摘要条目数固定，不会被异常 cmd 撑爆: {}",
+            summary
+        );
+        // 生成摘要即清零，保证 60 秒窗口内每种类型至多一条统计
+        assert!(counts.is_empty(), "摘要生成后应清零");
+        println!("[PASS] test_cmd_type_counting_and_bounded_summary passed");
+    }
+
+    // ---------------- D3：msg_id 三态去重 ----------------
+
+    /// 三态语义：预留 → 重复被拒 → 释放后可重试
+    #[test]
+    fn test_msg_id_three_state_reserve_release_retry() {
+        let mut cache = MsgIdCache::new(100);
+
+        // 首次预留成功
+        assert_eq!(cache.try_reserve("m1"), MsgIdReservation::Reserved);
+        assert!(cache.contains("m1"));
+        // 处理中：并发/重投的同一 ID 被拒
+        assert_eq!(cache.try_reserve("m1"), MsgIdReservation::Duplicate);
+        // 失败释放后可重试
+        assert!(cache.release("m1"), "释放应成功");
+        assert!(!cache.contains("m1"));
+        assert_eq!(cache.try_reserve("m1"), MsgIdReservation::Reserved);
+
+        // 重复释放无副作用
+        assert!(!cache.release("never_reserved"));
+
+        // 空 msg_id：不参与去重，允许合法多次处理
+        assert_eq!(cache.try_reserve(""), MsgIdReservation::NoKey);
+        assert_eq!(cache.try_reserve(""), MsgIdReservation::NoKey);
+        assert!(!cache.release(""), "空 ID 不做释放");
+        assert!(!cache.contains(""));
+        println!("[PASS] test_msg_id_three_state_reserve_release_retry passed");
+    }
+
+    /// 释放后 LRU 淘汰仍安全：墓碑不会让计数错乱或误删新预留
+    #[test]
+    fn test_msg_id_release_interacts_safely_with_lru_eviction() {
+        let mut cache = MsgIdCache::new(2);
+
+        assert_eq!(cache.try_reserve("a"), MsgIdReservation::Reserved);
+        assert_eq!(cache.try_reserve("b"), MsgIdReservation::Reserved);
+        // 释放 a（order 里留下墓碑）
+        assert!(cache.release("a"));
+        // 再放 c：容量为 2，b 与 c 应保留，a 的墓碑被淘汰时不得影响 b
+        assert_eq!(cache.try_reserve("c"), MsgIdReservation::Reserved);
+        assert!(cache.contains("b"), "淘汰墓碑不得误删有效预留");
+        assert!(cache.contains("c"));
+        assert!(!cache.contains("a"));
+
+        // 已释放的 ID 可以重新预留（这就是"失败可重试"）
+        assert_eq!(cache.try_reserve("a"), MsgIdReservation::Reserved);
+        println!("[PASS] test_msg_id_release_interacts_safely_with_lru_eviction passed");
+    }
+
+    /// 并发同 ID 只能有一条拿到 Reserved（其余全部 Duplicate）
+    #[test]
+    fn test_concurrent_same_msg_id_only_one_reserved() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        let cache = Arc::new(std::sync::Mutex::new(MsgIdCache::new(1000)));
+        let reserved = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..16 {
+            let c = cache.clone();
+            let r = reserved.clone();
+            handles.push(std::thread::spawn(move || {
+                if c.lock().unwrap().try_reserve("same_id") == MsgIdReservation::Reserved {
+                    r.fetch_add(1, AtomicOrdering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            reserved.load(AtomicOrdering::SeqCst),
+            1,
+            "并发同一 msg_id 只允许一条进入处理"
+        );
+        println!("[PASS] test_concurrent_same_msg_id_only_one_reserved passed");
+    }
+
+    /// DM 路径沿用"预留即长期保留"：check_and_add 不释放，一条弹幕只处理一次
+    #[test]
+    fn test_dm_path_keeps_permanent_reservation() {
+        let mut cache = MsgIdCache::new(100);
+        assert!(!cache.check_and_add("dm_1"), "首次 DM 不应判重");
+        assert!(cache.check_and_add("dm_1"), "同 ID 重投应判重");
+        assert!(cache.check_and_add("dm_1"), "DM 预留不会被自动释放");
+        // 空 ID 不判重（否则会挡掉合法的多条弹幕）
+        assert!(!cache.check_and_add(""));
+        assert!(!cache.check_and_add(""));
+        println!("[PASS] test_dm_path_keeps_permanent_reservation passed");
     }
 }
 
@@ -1598,6 +2243,7 @@ mod tests {
             guard_level: 3, // 舰长
             msg_id: "msg_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         let res1 = processor.process_danmu(&dm1, &matcher, &roster, &mut queue_mgr);
@@ -1617,6 +2263,7 @@ mod tests {
             guard_level: 3,
             msg_id: "msg_chat".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
         let res_chat = processor.process_danmu(&dm_chat, &matcher, &roster, &mut queue_mgr);
         assert!(!res_chat.priority_updated, "句中含优先词不应触发提权");
@@ -1633,6 +2280,7 @@ mod tests {
             guard_level: 3,
             msg_id: "msg_2".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         let res2 = processor.process_danmu(&dm2, &matcher, &roster, &mut queue_mgr);
@@ -1659,6 +2307,7 @@ mod tests {
             guard_level: 0,
             msg_id: msg_id.into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         // 运行期开启"仅粉丝牌可点怪"：无粉丝牌弹幕不入队
@@ -1725,6 +2374,7 @@ mod tests {
             guard_level: 0,
             msg_id: "msg_norm_1".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         let res = processor.process_danmu(&dm, &matcher, &roster, &mut queue_mgr);
@@ -1744,6 +2394,7 @@ mod tests {
             guard_level: 0,
             msg_id: "msg_norm_2".into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         let res_prio = processor.process_danmu(&dm_prio, &matcher, &roster, &mut queue_mgr);
@@ -1779,6 +2430,7 @@ mod tests {
             guard_level: guard,
             msg_id: msg_id.into(),
             is_paid_gift: false,
+            has_history_required_fields: true,
         };
 
         // 1. 空名单：不限制任何点怪

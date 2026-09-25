@@ -559,6 +559,16 @@ struct PrepareCombo {
     deadline: Instant,
 }
 
+/// 连击播报报告：把「文本」与「是否允许播报」分开。
+///
+/// 「仅付费礼物」开关只应影响 `can_speak`，不得连带删掉业务留档 ——
+/// 若在 tracker 内部直接丢弃免费礼物文案，那段历史就永久缺了。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComboReport {
+    pub text: String,
+    pub can_speak: bool,
+}
+
 /// 礼物连击合并跟踪器
 #[derive(Debug, Default)]
 pub struct GiftComboTracker {
@@ -591,7 +601,7 @@ impl GiftComboTracker {
     }
 
     /// 处理单个礼物事件，返回需要立即播报的文案
-    pub fn handle(&mut self, ev: &GiftEvent, now: Instant) -> Vec<String> {
+    pub fn handle(&mut self, ev: &GiftEvent, now: Instant) -> Vec<ComboReport> {
         let key = Self::key(ev);
         if ev.gift_num <= 0 {
             return Vec::new();
@@ -632,14 +642,17 @@ impl GiftComboTracker {
             }
         }
 
-        let mut out = Vec::new();
+        let mut out: Vec<ComboReport> = Vec::new();
         let mut set_cooldown = false;
         match self.dynamic.get_mut(&key) {
             Some(d) => {
                 d.gift_num += ev.gift_num;
                 d.deadline = now + DYNAMIC_COMBO_WINDOW;
                 if !d.first_reported && d.gift_num >= 3 {
-                    out.push(format!("感谢 {} 开始赠送{}", d.uname, d.gift_name));
+                    out.push(ComboReport {
+                        text: format!("感谢 {} 开始赠送{}", d.uname, d.gift_name),
+                        can_speak: true,
+                    });
                     d.first_reported = true;
                     set_cooldown = true;
                 }
@@ -656,10 +669,13 @@ impl GiftComboTracker {
                     },
                 );
                 if ev.gift_num < 3 {
-                    out.push(format!(
-                        "感谢 {} 赠送的{}个{}",
-                        ev.uname, ev.gift_num, ev.gift_name
-                    ));
+                    out.push(ComboReport {
+                        text: format!(
+                            "感谢 {} 赠送的{}个{}",
+                            ev.uname, ev.gift_num, ev.gift_name
+                        ),
+                        can_speak: true,
+                    });
                     set_cooldown = true;
                     if let Some(d) = self.dynamic.get_mut(&key) {
                         d.first_reported = true;
@@ -673,18 +689,19 @@ impl GiftComboTracker {
         out
     }
 
-    /// 周期结算：超时的连击池出队播报（prepare 池受「仅付费礼物」开关约束）
-    pub fn tick(&mut self, now: Instant, only_paid_gift: bool) -> Vec<String> {
-        let mut out = Vec::new();
+    /// 周期结算：超时的连击池出队。
+    ///
+    /// 「仅付费礼物」只决定 `can_speak`，结算文案本身**总是**产出，
+    /// 因此关闭该开关期间的免费礼物同样会进入业务留档。
+    pub fn tick(&mut self, now: Instant, only_paid_gift: bool) -> Vec<ComboReport> {
+        let mut out: Vec<ComboReport> = Vec::new();
 
         self.prepare.retain(|_, p| {
             if now >= p.deadline {
-                if !only_paid_gift || p.paid {
-                    out.push(format!(
-                        "感谢 {} 赠送的{}个{}",
-                        p.uname, p.gift_num, p.gift_name
-                    ));
-                }
+                out.push(ComboReport {
+                    text: format!("感谢 {} 赠送的{}个{}", p.uname, p.gift_num, p.gift_name),
+                    can_speak: !only_paid_gift || p.paid,
+                });
                 false
             } else {
                 true
@@ -694,10 +711,10 @@ impl GiftComboTracker {
         self.dynamic.retain(|_, d| {
             if now >= d.deadline {
                 if !d.first_reported || d.gift_num > 0 {
-                    out.push(format!(
-                        "感谢 {} 赠送的{}个{}",
-                        d.uname, d.gift_num, d.gift_name
-                    ));
+                    out.push(ComboReport {
+                        text: format!("感谢 {} 赠送的{}个{}", d.uname, d.gift_num, d.gift_name),
+                        can_speak: true,
+                    });
                 }
                 false
             } else {
@@ -829,12 +846,9 @@ impl TTSManager {
             self.normal_queue.lock().unwrap()
         };
         if q.len() >= MAX_SPEAK_QUEUE {
-            // 队满丢弃不再静默：写日志便于排查刷屏导致的丢播报
-            crate::log_warn!(
-                "[TTS] 播报队列已满（{} 条），丢弃：{}",
-                MAX_SPEAK_QUEUE,
-                task.text.chars().take(20).collect::<String>()
-            );
+            // 队满丢弃不再静默：写日志便于排查刷屏导致的丢播报。
+            // 只记队列长度：被丢弃的文案属业务原文，不进普通 Logs（History 已另行留档）
+            crate::log_warn!("[TTS] 播报队列已满（上限 {} 条），本条已丢弃", MAX_SPEAK_QUEUE);
             return false;
         }
         q.push_back(task);
@@ -1051,13 +1065,13 @@ impl TTSManager {
     }
 
     /// 接收礼物连击事件，返回需立即播报的文案
-    pub fn process_gift(&self, ev: &GiftEvent) -> Vec<String> {
+    pub fn process_gift(&self, ev: &GiftEvent) -> Vec<ComboReport> {
         let mut tracker = self.gift_tracker.lock().unwrap();
         tracker.handle(ev, Instant::now())
     }
 
     /// 刷新连击池（超时结算）
-    pub fn flush_gift_combos(&self, only_paid_gift: bool) -> Vec<String> {
+    pub fn flush_gift_combos(&self, only_paid_gift: bool) -> Vec<ComboReport> {
         let mut tracker = self.gift_tracker.lock().unwrap();
         tracker.tick(Instant::now(), only_paid_gift)
     }
@@ -1635,7 +1649,7 @@ mod tests {
         // 首次 <3 个：立即播报
         let r1 = tracker.handle(&ev(1), now);
         assert_eq!(r1.len(), 1);
-        assert_eq!(r1[0], "感谢 水友A 赠送的1个小电视");
+        assert_eq!(r1[0].text, "感谢 水友A 赠送的1个小电视");
 
         // 冷却期内累加不播报（对齐原工程 5s 冷却）
         let r2 = tracker.handle(&ev(2), now + Duration::from_millis(100));
@@ -1648,7 +1662,7 @@ mod tests {
         // 超过 10s 动态窗口：尾报合并数量（1+2=3）
         let r4 = tracker.tick(now + Duration::from_secs(11), false);
         assert_eq!(r4.len(), 1);
-        assert_eq!(r4[0], "感谢 水友A 赠送的3个小电视");
+        assert_eq!(r4[0].text, "感谢 水友A 赠送的3个小电视");
         println!("[PASS] test_gift_combo_merging passed");
     }
 
@@ -1673,7 +1687,7 @@ mod tests {
         // 冷却期外的新事件累加：仍未首报且 >=3 → 首报「开始赠送」
         let r2 = tracker.handle(&ev(1, "1"), now + Duration::from_secs(6));
         assert_eq!(r2.len(), 1);
-        assert_eq!(r2[0], "感谢 水友B 开始赠送辣条");
+        assert_eq!(r2[0].text, "感谢 水友B 开始赠送辣条");
 
         // 冷却期内再次累加：无播报
         let r3 = tracker.handle(&ev(1, "1"), now + Duration::from_secs(7));
@@ -1713,7 +1727,7 @@ mod tests {
         // 超时结算为合并数量 15
         let r3 = tracker.tick(now + Duration::from_secs(4), false);
         assert_eq!(r3.len(), 1);
-        assert_eq!(r3[0], "感谢 水友C 赠送的15个小心心");
+        assert_eq!(r3[0].text, "感谢 水友C 赠送的15个小心心");
 
         // 仅付费礼物开关：非付费的官方连击被静默丢弃
         let _ = tracker.handle(&ev(false), now + Duration::from_secs(20));
