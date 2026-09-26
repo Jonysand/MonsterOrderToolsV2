@@ -465,7 +465,8 @@ mod tests {
         assert!(json_text.contains("opacity") && json_text.contains("77"), "常规字段必须保留: {}", json_text);
 
         // 2. save() 落盘文件同样不含敏感键与明文。
-        //    注：id_code / manbo_api_key 非空时 save() 会同步写注册表，为避免与 registry 测试并行竞争，
+        //    注：id_code / manbo_api_key 非空时 save() 会同步写注册表（测试下为隔离子键），
+        //    为避免与 registry roundtrip 测试在同一隔离子键上并行竞争，
         //    落盘路径改用空值（其"键不出现"由同一 skip_serializing 机制保证），值断言由非注册表字段承担
         let mut save_cfg = cfg.clone();
         save_cfg.id_code = String::new();

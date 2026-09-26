@@ -3,6 +3,24 @@ pub const REG_SUBKEY: &str = "Software\\MonsterOrderWilds";
 pub const REG_VALUE_ID_CODE: &str = "IdCode";
 pub const REG_VALUE_MANBO_API_KEY: &str = "ManboApiKey";
 
+/// 实际生效的注册表子键。
+///
+/// 测试构建（cargo test）重定向到**带进程号的隔离子键**：
+/// 单测曾把 `SECRET_MANBO` 等假值写进真实注册表并残留（测试数据污染用户环境），
+/// 故测试一律读写 `HKCU\Software\MonsterOrderWilds_test_<pid>`，真实键完全不被触碰；
+/// 残留的测试子键无行为影响，可随时手动删除。生产构建（tauri dev / 安装版）不受影响。
+#[cfg(test)]
+pub fn registry_subkey() -> &'static str {
+    static TEST_SUBKEY: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("{}_test_{}", REG_SUBKEY, std::process::id()));
+    &TEST_SUBKEY
+}
+
+#[cfg(not(test))]
+pub fn registry_subkey() -> &'static str {
+    REG_SUBKEY
+}
+
 #[cfg(windows)]
 mod platform {
     use std::ffi::OsStr;
@@ -221,7 +239,13 @@ mod platform {
     }
 
     fn store_path() -> PathBuf {
-        crate::paths::config_dir().join(STORE_FILE)
+        // 测试构建用独立存储文件（带进程号），避免污染真实数据目录的 registry.dat
+        let name = if cfg!(test) {
+            format!("registry_test_{}.dat", std::process::id())
+        } else {
+            STORE_FILE.to_string()
+        };
+        crate::paths::config_dir().join(name)
     }
 
     fn value_key(subkey: &str, value_name: &str) -> String {
@@ -333,35 +357,35 @@ mod platform {
 /// 读取开播身份码 IdCode
 /// （Windows：HKCU\Software\MonsterOrderWilds；其他平台：加密的 registry.dat）
 pub fn read_id_code() -> Result<String, String> {
-    platform::read_reg_string(REG_SUBKEY, REG_VALUE_ID_CODE)
+    platform::read_reg_string(registry_subkey(), REG_VALUE_ID_CODE)
 }
 
 /// 写入开播身份码 IdCode
 /// （Windows：HKCU\Software\MonsterOrderWilds；其他平台：加密的 registry.dat）
 pub fn write_id_code(id_code: &str) -> Result<(), String> {
-    platform::write_reg_string(REG_SUBKEY, REG_VALUE_ID_CODE, id_code)
+    platform::write_reg_string(registry_subkey(), REG_VALUE_ID_CODE, id_code)
 }
 
 /// 删除持久化的 IdCode（主要用于单元测试与环境清理）
 pub fn delete_id_code() -> Result<(), String> {
-    platform::delete_reg_value(REG_SUBKEY, REG_VALUE_ID_CODE)
+    platform::delete_reg_value(registry_subkey(), REG_VALUE_ID_CODE)
 }
 
 /// 读取 Manbo API Key。
 /// 遵循原工程规范：ManboApiKey 与 IdCode 同级独立持久化，不落入常规 JSON 配置
 pub fn read_manbo_api_key() -> Result<String, String> {
-    platform::read_reg_string(REG_SUBKEY, REG_VALUE_MANBO_API_KEY)
+    platform::read_reg_string(registry_subkey(), REG_VALUE_MANBO_API_KEY)
 }
 
 /// 写入 Manbo API Key
 /// （Windows：HKCU\Software\MonsterOrderWilds；其他平台：加密的 registry.dat）
 pub fn write_manbo_api_key(key: &str) -> Result<(), String> {
-    platform::write_reg_string(REG_SUBKEY, REG_VALUE_MANBO_API_KEY, key)
+    platform::write_reg_string(registry_subkey(), REG_VALUE_MANBO_API_KEY, key)
 }
 
 /// 删除持久化的 ManboApiKey（主要用于单元测试与环境清理）
 pub fn delete_manbo_api_key() -> Result<(), String> {
-    platform::delete_reg_value(REG_SUBKEY, REG_VALUE_MANBO_API_KEY)
+    platform::delete_reg_value(registry_subkey(), REG_VALUE_MANBO_API_KEY)
 }
 
 #[cfg(test)]
@@ -372,7 +396,8 @@ mod tests {
 
     #[test]
     fn test_registry_id_code_roundtrip() {
-        // 保存原注册表值以便测试完成后还原
+        // 测试构建下读写已被 registry_subkey() 重定向到隔离子键（Software\MonsterOrderWilds_test_<pid>），
+        // 真实注册表不被触碰；「保存原值-还原」保留作纵深防御
         let original_code = read_id_code().unwrap_or_default();
 
         let test_code = "TEST_ID_CODE_MHDANMU_987654";
@@ -468,7 +493,7 @@ mod tests {
 
     #[test]
     fn test_registry_manbo_api_key_roundtrip() {
-        // 保存原值以便测试完成后还原
+        // 同 test_registry_id_code_roundtrip：读写发生在隔离子键，真实注册表不受影响
         let original = read_manbo_api_key().unwrap_or_default();
 
         let test_key = "TEST_MANBO_API_KEY_123456";
