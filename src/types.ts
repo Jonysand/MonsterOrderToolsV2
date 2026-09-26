@@ -111,7 +111,7 @@ export interface CredentialsStatus {
   chat_provider: string;
   has_chat_key: boolean;
   has_mimo_key: boolean;
-  has_vip_tts_key: boolean;
+  has_manbo_key: boolean;
 }
 
 // ---------- D7 连接状态机（五态 + 断连原因） ----------

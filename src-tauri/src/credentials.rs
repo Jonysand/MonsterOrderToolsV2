@@ -10,7 +10,11 @@ type HmacSha256 = Hmac<Sha256>;
 pub const FILE_MAGIC: &str = "@MonsterOrderSecret@";
 pub const SALT: &str = "@M0nst3r$Alt@";
 
-/// 加密配置文件凭据
+/// 加密配置文件凭据。
+///
+/// 除开播身份码（注册表）外的全部凭据均由发行方填写 `scripts/credentials.json`
+/// 后生成 credentials.dat 并随安装包打包；终端用户不可在界面输入这些字段。
+/// 旧文件中的遗留字段（minimax_tts_api_key 等）由 serde 默认忽略，读取兼容。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Credentials {
     #[serde(rename = "APP_ID", default)]
@@ -22,9 +26,7 @@ pub struct Credentials {
     #[serde(default)]
     pub mimo_tts_api_key: String,
     #[serde(default)]
-    pub minimax_tts_api_key: String,
-    #[serde(default)]
-    pub special_user_tts_api_key: String,
+    pub manbo_api_key: String,
     #[serde(default = "default_chat_provider")]
     pub chat_provider: String,
     #[serde(default)]
@@ -45,7 +47,7 @@ pub struct CredentialsStatus {
     pub chat_provider: String,
     pub has_chat_key: bool,
     pub has_mimo_key: bool,
-    pub has_vip_tts_key: bool,
+    pub has_manbo_key: bool,
 }
 
 impl Credentials {
@@ -61,7 +63,7 @@ impl Credentials {
             chat_provider: self.chat_provider.clone(),
             has_chat_key: !self.chat_api_key.is_empty(),
             has_mimo_key: !self.mimo_tts_api_key.is_empty(),
-            has_vip_tts_key: !self.special_user_tts_api_key.is_empty(),
+            has_manbo_key: !self.manbo_api_key.is_empty(),
         }
     }
 }
@@ -95,11 +97,33 @@ pub fn get_credentials_path() -> PathBuf {
     crate::paths::config_dir().join("credentials.dat")
 }
 
+/// 凭据来源裁决：优先使用可写数据目录中的文件（导入更新通道），
+/// 数据目录不存在时回退到随安装包分发的 resources 副本（打包预置通道）。
+/// 两个候选都不存在时返回 None。
+pub fn pick_credentials_source(primary: &Path, resource: Option<&Path>) -> Option<PathBuf> {
+    if primary.is_file() {
+        return Some(primary.to_path_buf());
+    }
+    resource
+        .filter(|p| p.is_file())
+        .map(|p| p.to_path_buf())
+}
+
+/// 解析默认加载路径：数据目录 → 安装资源目录（`find_resource` 已覆盖两级候选）。
+/// Windows 安装版资源与数据目录同为 exe 同级，天然命中第一级；
+/// macOS 打包态数据目录无文件时回退 .app 包内资源，实现"凭据随安装包内置"。
+pub fn resolve_default_credentials_path() -> Option<PathBuf> {
+    let primary = get_credentials_path();
+    let resource = crate::paths::find_resource("credentials.dat");
+    pick_credentials_source(&primary, resource.as_deref())
+}
+
 /// 加载并解密 credentials.dat 文件
 pub fn load_credentials(path: Option<&Path>) -> Result<Credentials, String> {
     let p = match path {
         Some(custom) => custom.to_path_buf(),
-        None => get_credentials_path(),
+        None => resolve_default_credentials_path()
+            .ok_or_else(|| format!("凭证文件不存在: {}", get_credentials_path().display()))?,
     };
 
     if !p.exists() {
@@ -277,8 +301,7 @@ mod tests {
             access_key_id: "test_ak_id".into(),
             access_key_secret: "test_ak_sec".into(),
             mimo_tts_api_key: "test_mimo_key".into(),
-            minimax_tts_api_key: String::new(),
-            special_user_tts_api_key: "test_vip_tts".into(),
+            manbo_api_key: "test_manbo_key".into(),
             chat_provider: "deepseek".into(),
             chat_api_key: "sk-test_ai_key".into(),
         };
@@ -292,9 +315,98 @@ mod tests {
         assert!(status.loaded);
         assert_eq!(status.app_id, "test_app_888");
         assert!(status.access_key_masked.contains("***"));
+        assert!(status.has_manbo_key);
+        assert!(status.has_mimo_key);
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);
         println!("[PASS] test_credentials_roundtrip passed");
+    }
+
+    /// 凭据来源裁决：数据目录优先（导入更新通道），缺失时回退安装资源（打包预置通道）
+    #[test]
+    fn test_pick_credentials_source_prefers_data_dir_over_resource() {
+        let base = std::env::temp_dir().join("mh_cred_pick_source");
+        let _ = fs::remove_dir_all(&base);
+        let data_dir = base.join("data");
+        let res_dir = base.join("resource");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&res_dir).unwrap();
+
+        let primary = data_dir.join("credentials.dat");
+        let resource = res_dir.join("credentials.dat");
+
+        // 两侧都无文件 → None
+        assert!(pick_credentials_source(&primary, Some(&resource)).is_none());
+
+        // 仅资源侧有 → 用资源（首次安装：凭据随包内置）
+        fs::write(&resource, b"BUILTIN").unwrap();
+        assert_eq!(
+            pick_credentials_source(&primary, Some(&resource)).unwrap(),
+            resource
+        );
+
+        // 数据目录出现后优先（导入更新通道），且不被资源副本覆盖裁决
+        fs::write(&primary, b"IMPORTED").unwrap();
+        assert_eq!(
+            pick_credentials_source(&primary, Some(&resource)).unwrap(),
+            primary
+        );
+
+        // 资源候选为 None 时仅看数据目录
+        assert_eq!(
+            pick_credentials_source(&primary, None).unwrap(),
+            primary
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        println!("[PASS] test_pick_credentials_source_prefers_data_dir_over_resource passed");
+    }
+
+    /// 跨端互通锁定：scripts/generate_credentials.py 产物必须能被 Rust 侧验签加载。
+    /// 该向量为 Python 生成器对固定测试 JSON 的输出（无真实凭据），任何人重跑
+    /// `python -c` 复算都应得到同一 Base64 —— 算法漂移（魔数/盐/序列化）会被此用例捕获
+    #[test]
+    fn test_load_python_generator_output() {
+        let py_output = "QE1vbnN0ZXJPcmRlclNlY3JldEAwY2IzMTMwMWUzNmI5NzNkM2YwYjE0MDUyZTcwZGY5YzRjMDQ0OGVmYWU3ZDk1YzVkNmNhYTc3NTRlZWYxZmUyeyJBUFBfSUQiOiJQWUdFTl9URVNUIiwiQUNDRVNTX0tFWV9JRCI6ImFrX3B5IiwiQUNDRVNTX0tFWV9TRUNSRVQiOiJzZWNfcHkiLCJtaW1vX3R0c19hcGlfa2V5IjoiIiwibWFuYm9fYXBpX2tleSI6Im1hbmJvX3B5IiwiY2hhdF9wcm92aWRlciI6ImRlZXBzZWVrIiwiY2hhdF9hcGlfa2V5Ijoic2tfcHkifQ==";
+        let temp_dir = std::env::temp_dir().join("mh_cred_pygen");
+        let _ = fs::create_dir_all(&temp_dir);
+        let path = temp_dir.join("pygen.dat");
+        fs::write(&path, py_output).unwrap();
+
+        let loaded = load_credentials(Some(&path)).unwrap();
+        assert_eq!(loaded.app_id, "PYGEN_TEST");
+        assert_eq!(loaded.manbo_api_key, "manbo_py");
+        assert_eq!(loaded.chat_api_key, "sk_py");
+        assert!(loaded.mimo_tts_api_key.is_empty());
+
+        // 正向：Rust save_credentials 的产物同样符合该信封结构（往返已在其他用例覆盖）
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&temp_dir);
+        println!("[PASS] test_load_python_generator_output passed");
+    }
+
+    /// 旧版凭据文件（含遗留字段 minimax/special_user_tts_api_key）必须继续可读，
+    /// 未知字段由 serde 忽略 —— 保证升级安装不因凭据文件格式差异而失效
+    #[test]
+    fn test_load_legacy_credentials_with_removed_fields() {
+        let temp_dir = std::env::temp_dir().join("mh_cred_legacy_fields");
+        let _ = fs::create_dir_all(&temp_dir);
+        let path = temp_dir.join("legacy.dat");
+
+        let json_data = r#"{"APP_ID":"123","ACCESS_KEY_ID":"ak","ACCESS_KEY_SECRET":"sec","mimo_tts_api_key":"mimo","minimax_tts_api_key":"legacy_mm","special_user_tts_api_key":"legacy_vip","chat_provider":"deepseek","chat_api_key":"sk-x"}"#;
+        let hmac_hex = compute_hmac_hex(json_data, SALT).unwrap();
+        let combined = format!("{}{}{}", FILE_MAGIC, hmac_hex, json_data);
+        fs::write(&path, BASE64_STANDARD.encode(combined.as_bytes())).unwrap();
+
+        let loaded = load_credentials(Some(&path)).unwrap();
+        assert_eq!(loaded.app_id, "123");
+        assert_eq!(loaded.mimo_tts_api_key, "mimo");
+        assert_eq!(loaded.chat_api_key, "sk-x");
+        assert!(loaded.manbo_api_key.is_empty(), "旧文件无 manbo 字段时应为空");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&temp_dir);
+        println!("[PASS] test_load_legacy_credentials_with_removed_fields passed");
     }
 }

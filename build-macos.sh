@@ -23,15 +23,27 @@ for tool in node npm cargo; do
 done
 
 if [ ! -d node_modules ]; then
-  echo "[1/3] 未检测到 node_modules，执行 npm ci 安装前端依赖..."
+  echo "[1/4] 未检测到 node_modules，执行 npm ci 安装前端依赖..."
   npm ci
 fi
 
 # 版本号取自 src-tauri/tauri.conf.json；beforeBuildCommand 会自动先跑前端构建
-echo "[2/3] 完整版生产打包：npm run tauri build（首次编译耗时较长）"
+# --- 凭据预置检查：除开播身份码外的全部凭据由发行方打包进 credentials.dat，缺失即终止构建 ---
+if [ ! -f MonsterOrderWilds_configs/credentials.dat ]; then
+  if [ -f scripts/credentials.json ]; then
+    echo "[2/4] 未检测到 credentials.dat，正在由 scripts/credentials.json 生成..."
+    python3 scripts/generate_credentials.py
+  else
+    echo "[ERROR] 未检测到 MonsterOrderWilds_configs/credentials.dat，无法打包内置凭据。" >&2
+    echo "        请填写 scripts/credentials.json 后运行: python3 scripts/generate_credentials.py" >&2
+    exit 1
+  fi
+fi
+
+echo "[3/4] 完整版生产打包：npm run tauri build（首次编译耗时较长）"
 npm run tauri build
 
-echo "[3/3] Lite 纯排队版生产打包：npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json"
+echo "[4/4] Lite 纯排队版生产打包：npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json"
 npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json
 
 APP="src-tauri/target/release/bundle/macos/MonsterOrderWilds-Ascendance.app"

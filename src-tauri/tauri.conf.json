@@ -45,6 +45,7 @@
     "targets": "all",
     "resources": {
       "../MonsterOrderWilds_configs/monster_list.json": "MonsterOrderWilds_configs/monster_list.json",
+      "../MonsterOrderWilds_configs/credentials.dat": "MonsterOrderWilds_configs/credentials.dat",
       "../MonsterOrderWilds_configs/voices": "MonsterOrderWilds_configs/voices",
       "../MonsterOrderWilds_configs/local_voices.zip": "MonsterOrderWilds_configs/local_voices.zip",
       "../MonsterOrderWilds_configs/dict/stop_words.utf8": "MonsterOrderWilds_configs/dict/stop_words.utf8",

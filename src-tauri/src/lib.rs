@@ -201,10 +201,13 @@ impl Default for AppState {
         } else {
             app_cfg.mimo_api_key.clone()
         };
-        // Manbo API Key 的权威来源是注册表（HKCU\Software\MonsterOrderWilds\ManboApiKey）与配置值，
-        // 不由 credentials.dat 承载 —— 原工程 C++/C# 全仓无 special_user_tts_api_key 引用，
-        // 该凭据不得覆盖用户手填的 Manbo Key。
-        let manbo_key = app_cfg.manbo_api_key.clone();
+        // Manbo API Key 与 MiMo/对话 Key 同口径：凭据文件（发行方打包预置）优先，
+        // 回退注册表/配置值 —— 兼容历史安装中用户经注册表自行填写过的 Key
+        let manbo_key = if !creds.manbo_api_key.is_empty() {
+            creds.manbo_api_key.clone()
+        } else {
+            app_cfg.manbo_api_key.clone()
+        };
 
         let tts_mgr = TTSManager::new(TTSConfig {
             engine: parse_tts_engine(&app_cfg.tts_engine),
@@ -1001,11 +1004,7 @@ fn save_app_config(
     keep_cred!(access_key_secret, access_key_secret);
     keep_cred!(deepseek_api_key, chat_api_key);
     keep_cred!(mimo_api_key, mimo_tts_api_key);
-    // Manbo Key 不走 credentials.dat（原工程零引用 special_user_tts_api_key）：
-    // 权威来源是注册表/配置，凭据里的同名字段不得反写
-    if new_cfg.manbo_api_key.trim().is_empty() {
-        new_cfg.manbo_api_key = prev.manbo_api_key.clone();
-    }
+    keep_cred!(manbo_api_key, manbo_api_key);
 
     // 悬浮窗位置由拖动链路（pending_pos + 3s 防抖）独占维护，前端设置面板不提供该字段，
     // 故此处忽略前端回传的 top_pos，避免用陈旧副本覆盖真实位置（P1-6）
@@ -2305,6 +2304,7 @@ fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) ->
         cfg.access_key_id = creds.access_key_id.clone();
         cfg.access_key_secret = creds.access_key_secret.clone();
         cfg.mimo_api_key = creds.mimo_tts_api_key.clone();
+        cfg.manbo_api_key = creds.manbo_api_key.clone();
         cfg.deepseek_api_key = creds.chat_api_key.clone();
     }
 
@@ -2323,14 +2323,19 @@ fn sync_credential_consumers(state: &AppState) -> Result<(), String> {
     } else {
         cfg.mimo_api_key.clone()
     };
+    // Manbo Key 与 MiMo 同口径：凭据文件优先，回退注册表/配置镜像
+    let manbo_key = if !snap.creds.manbo_api_key.is_empty() {
+        snap.creds.manbo_api_key.clone()
+    } else {
+        cfg.manbo_api_key.clone()
+    };
     state.tts_mgr.update_config(TTSConfig {
         engine: parse_tts_engine(&cfg.tts_engine),
         enable_voice: cfg.enable_voice,
         speech_rate: cfg.speech_rate,
         speech_volume: cfg.speech_volume,
         speech_pitch: cfg.speech_pitch,
-        // Manbo Key 权威来源为注册表/配置，不由 credentials.dat 承载
-        manbo_api_key: cfg.manbo_api_key.clone(),
+        manbo_api_key: manbo_key,
         manbo_voice: cfg.manbo_voice.clone(),
         mimo_api_key: mimo_key,
         mimo_voice: cfg.mimo_voice.clone(),
@@ -2366,8 +2371,9 @@ fn pick_credentials_file(_app_handle: &AppHandle) -> Result<Option<String>, Stri
 }
 
 /// 导入 B 站开放平台凭据文件（P1-8）。
-/// 安装包不随包分发 credentials.dat（避免公开分发平台密钥），故提供显式导入入口：
-/// 选择文件 → HMAC 校验 → 原子替换 `{数据目录}/credentials.dat` → 发布内存快照与 AI/TTS。
+/// 正式分发中凭据由发行方生成 credentials.dat 并随安装包打包（启动时自动加载），
+/// 本命令保留为**凭据轮换应急通道**：选择文件 → HMAC 校验 → 原子替换
+/// `{数据目录}/credentials.dat`（数据目录优先级高于随包副本）→ 发布内存快照与 AI/TTS。
 ///
 /// **"即时生效"的准确界线**：只对**下一次连接**生效。运行中的长连以值持有旧凭据，
 /// 换内存快照不会让现有 WebSocket 自动改用新凭据，因此活动会话期间直接拒绝导入
@@ -2552,28 +2558,6 @@ fn parse_tts_engine(s: &str) -> TTSEngineType {
 #[tauri::command]
 fn get_current_tts_engine(state: State<'_, AppState>) -> String {
     state.tts_mgr.current_engine_name()
-}
-
-/// 保存 Manbo API Key（仅写注册表，永不回传明文；空值不覆盖已有 Key；受 Lite 模式控制）
-#[tauri::command]
-fn save_manbo_api_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
-    ensure_not_lite(&state, "TTS语音模块")?;
-    let trimmed = key.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("Manbo API Key 不能为空".into());
-    }
-    registry::write_manbo_api_key(&trimmed)?;
-    let mut cfg_guard = state.config.lock().map_err(|e| e.to_string())?;
-    cfg_guard.manbo_api_key = trimmed.clone();
-    {
-        let mut tts_cfg = state.tts_mgr.config_snapshot();
-        tts_cfg.manbo_api_key = trimmed;
-        state.tts_mgr.update_config(tts_cfg);
-    }
-    if let Err(e) = cfg_guard.save(None) {
-        crate::log_warn!("[Config] Manbo Key 保存配置失败（注册表已写入）: {}", e);
-    }
-    Ok(())
 }
 
 /// 运行日志快照（前端「运行日志」视图轮询读取）
@@ -3096,7 +3080,6 @@ pub fn run() {
             confirm_action,
             get_manbo_voice_list,
             get_current_tts_engine,
-            save_manbo_api_key,
             get_recent_logs,
             clear_recent_logs,
             get_overlay_locked,
@@ -3964,8 +3947,11 @@ mod tests {
     #[test]
     fn test_config_save_ignores_frontend_secrets() {
         let state = AppState::new_test();
+        let mut trusted = fake_creds("4004", "TRUSTED_SECRET", "sk-trusted");
+        trusted.manbo_api_key = "manbo-trusted".into();
+        trusted.mimo_tts_api_key = "mimo-trusted".into();
         state.publish_credentials(CredentialState {
-            creds: fake_creds("4004", "TRUSTED_SECRET", "sk-trusted"),
+            creds: trusted,
             loaded: true,
             blocked_reason: None,
         });
@@ -3976,10 +3962,9 @@ mod tests {
         hostile.access_key_secret = "HACKED".into();
         hostile.deepseek_api_key = "sk-hacked".into();
         hostile.mimo_api_key = "sk-mimo-hacked".into();
-        hostile.manbo_api_key = "".into();
+        hostile.manbo_api_key = "manbo-hacked".into();
 
-        let prev = state.config.lock().unwrap().clone();
-        // 复刻 save_app_config 的字段裁决逻辑
+        // 复刻 save_app_config 的字段裁决逻辑（keep_cred! 宏）
         let snap = state.credentials_snapshot();
         let mut new_cfg = hostile.clone();
         new_cfg.app_id = snap.creds.app_id.clone();
@@ -3987,15 +3972,50 @@ mod tests {
         new_cfg.access_key_secret = snap.creds.access_key_secret.clone();
         new_cfg.deepseek_api_key = snap.creds.chat_api_key.clone();
         new_cfg.mimo_api_key = snap.creds.mimo_tts_api_key.clone();
-        if new_cfg.manbo_api_key.trim().is_empty() {
-            new_cfg.manbo_api_key = prev.manbo_api_key.clone();
-        }
+        new_cfg.manbo_api_key = snap.creds.manbo_api_key.clone();
 
         assert_eq!(new_cfg.app_id, "4004", "前端 app_id 不得覆盖凭据文件");
         assert_eq!(new_cfg.access_key_secret, "TRUSTED_SECRET", "密钥不得被前端覆盖");
         assert_eq!(new_cfg.deepseek_api_key, "sk-trusted");
         assert_ne!(new_cfg.mimo_api_key, "sk-mimo-hacked");
+        assert_eq!(new_cfg.manbo_api_key, "manbo-trusted", "Manbo Key 不得被前端覆盖");
         println!("[PASS] test_config_save_ignores_frontend_secrets passed");
+    }
+
+    /// Manbo Key 注入优先级：凭据文件（打包预置）非空时优先于配置镜像（与 MiMo/对话 Key 同口径），
+    /// 凭据文件缺该字段时回退配置镜像（兼容历史安装中经注册表自填的 Key）
+    #[test]
+    fn test_manbo_key_prefers_credentials_file_over_config() {
+        let state = AppState::new_test();
+        state.config.lock().unwrap().manbo_api_key = "manbo-from-registry".into();
+
+        let mut builtin = fake_creds("6006", "S", "k");
+        builtin.manbo_api_key = "manbo-builtin".into();
+        state.publish_credentials(CredentialState {
+            creds: builtin,
+            loaded: true,
+            blocked_reason: None,
+        });
+        sync_credential_consumers(&state).unwrap();
+        assert_eq!(
+            state.tts_mgr.config_snapshot().manbo_api_key,
+            "manbo-builtin",
+            "凭据文件有 manbo_api_key 时必须优先"
+        );
+
+        // 凭据文件缺 manbo 字段（旧文件格式）→ 回退配置镜像值
+        state.publish_credentials(CredentialState {
+            creds: fake_creds("7007", "S", "k"),
+            loaded: true,
+            blocked_reason: None,
+        });
+        sync_credential_consumers(&state).unwrap();
+        assert_eq!(
+            state.tts_mgr.config_snapshot().manbo_api_key,
+            "manbo-from-registry",
+            "凭据文件缺 manbo_api_key 时回退注册表/配置镜像"
+        );
+        println!("[PASS] test_manbo_key_prefers_credentials_file_over_config passed");
     }
 
     /// E2：活动会话期间导入必须被拒绝，且不触碰文件

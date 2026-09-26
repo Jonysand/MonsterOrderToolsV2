@@ -10,6 +10,8 @@ lerna-debug.log*
 
 # 运行时用户数据与凭据（禁止入库：credentials.dat 为加密凭据，数据库含水友隐私数据）
 MonsterOrderWilds_configs/credentials.dat
+# 开发者填写的明文凭据模板（生成 credentials.dat 的输入，只允许存在于本机）
+scripts/credentials.json
 MonsterOrderWilds_configs/configs.json
 MonsterOrderWilds_configs/order_list.json
 MonsterOrderWilds_configs/MainConfig.cfg

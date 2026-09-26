@@ -42,7 +42,6 @@ import {
   Key,
   Save,
   FileCheck,
-  Upload,
   Volume2
 } from "lucide-react";
 
@@ -97,7 +96,6 @@ export const MainWindow: React.FC = () => {
 
   // 语音设置（D1）
   const [manboVoices, setManboVoices] = useState<string[]>([]);
-  const [manboKeyInput, setManboKeyInput] = useState("");
   const [currentEngine, setCurrentEngine] = useState<string>("");
 
   // 悬浮窗锁定（D2）
@@ -210,6 +208,8 @@ export const MainWindow: React.FC = () => {
   };
 
   const fetchCredentialsStatus = async () => {
+    // 凭据由后端启动时从随包/数据目录的 credentials.dat 自动校验加载，
+    // 前端仅轮询展示脱敏状态，不提供任何凭据输入入口（唯一用户输入为开播身份码）
     try {
       const status = await invoke<CredentialsStatus>("get_credentials_status");
       setCredStatus(status);
@@ -580,22 +580,6 @@ export const MainWindow: React.FC = () => {
     }
   };
 
-  // 保存 Manbo API Key（仅写注册表，不回传明文）
-  const handleSaveManboKey = async () => {
-    if (!manboKeyInput.trim()) {
-      showToast("请输入 Manbo API Key！");
-      return;
-    }
-    try {
-      await invoke("save_manbo_api_key", { key: manboKeyInput.trim() });
-      setManboKeyInput("");
-      showToast("Manbo API Key 已加密托管至注册表！");
-      fetchCredentialsStatus();
-    } catch (e) {
-      showToast(`保存 Manbo Key 失败: ${e}`);
-    }
-  };
-
   // 悬浮窗锁定/解锁（等同 Alt+, 热键）
   const handleToggleOverlayLock = async () => {
     try {
@@ -648,22 +632,6 @@ export const MainWindow: React.FC = () => {
       }
     } catch (err) {
       showToast(`发卡失败: ${err}`);
-    }
-  };
-
-  // 凭据文件导入（安装包不随包分发 credentials.dat，需用户显式导入原工程的加密凭据文件）
-  const handleImportCredentials = async () => {
-    try {
-      const status = await invoke<CredentialsStatus>("import_credentials_file");
-      setCredStatus(status);
-      // 「即时生效」只对**下一次连接**成立：运行中的长连以值持有旧凭据，
-      // 因此活动会话期间后端会直接拒绝导入
-      showToast("凭据导入成功：下次连接将使用新凭据（现有连接不会被切换）");
-      fetchBiliStatus();
-    } catch (err) {
-      showToast(`凭据导入失败: ${err}`);
-      // 失败后以权威状态为准（可能因发布失败进入暂禁开播状态）
-      fetchCredentialsStatus();
     }
   };
 
@@ -1385,21 +1353,13 @@ export const MainWindow: React.FC = () => {
                 </div>
 
                 <p className="text-[11px] text-neutral-400 leading-relaxed">
-                  遵循原工程安全规范，应用凭据（APP ID、访问密钥{isLite ? "" : "、语音与 AI 密钥"}）均加密保存在本地凭据文件中，<strong className="text-neutral-200">不允许手动设置或明文暴露</strong>。
-                  安装包出于安全考虑<strong className="text-neutral-200">不随包分发该文件</strong>，请点击下方按钮导入由原工程生成（或随原始发行包提供）的凭据文件。
+                  遵循原工程安全规范，应用凭据（APP ID、访问密钥{isLite ? "" : "、语音与 AI 密钥"}）均由发行方加密托管于凭据文件并随安装包内置，启动时自动校验加载，<strong className="text-neutral-200">不允许手动设置或明文暴露</strong>。
+                  如需更换凭据请获取新的安装包，或使用发行方提供的凭据文件替换数据目录下的 credentials.dat（对下一次连接生效）。
                 </p>
 
                 <div className="flex items-center gap-2 flex-wrap">
-                  <button
-                    type="button"
-                    onClick={handleImportCredentials}
-                    className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1.5 rounded-lg text-[11px] shadow-lg shadow-emerald-600/30 transition"
-                  >
-                    <Upload className="w-3.5 h-3.5" />
-                    <span>导入凭据文件</span>
-                  </button>
                   <span className="text-[10px] font-mono text-neutral-500 break-all">
-                    目标路径：{credStatus?.file_path || "—"}
+                    凭据文件：{credStatus?.file_path || "—"}
                   </span>
                 </div>
 
@@ -1433,8 +1393,8 @@ export const MainWindow: React.FC = () => {
 
                       <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
                         <span className="text-[10px] text-neutral-500 block">多引擎语音</span>
-                        <span className={`text-xs font-bold ${credStatus?.has_mimo_key || credStatus?.has_vip_tts_key ? "text-emerald-300" : "text-neutral-500"}`}>
-                          {credStatus?.has_mimo_key ? "MiMo 已绑定" : "本地语音"}
+                        <span className={`text-xs font-bold ${credStatus?.has_mimo_key || credStatus?.has_manbo_key ? "text-emerald-300" : "text-neutral-500"}`}>
+                          {credStatus?.has_mimo_key ? "MiMo 已绑定" : credStatus?.has_manbo_key ? "Manbo 已绑定" : "本地语音"}
                         </span>
                       </div>
                     </>
@@ -1556,57 +1516,34 @@ export const MainWindow: React.FC = () => {
                   </div>
                 </div>
 
-                {/* Manbo API Key：仅写注册表，永不回传明文 */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  <div className="min-w-0">
-                    <label className="block text-[11px] text-neutral-400 mb-1">
-                      Manbo API Key（仅保存到本机，不回显）
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="password"
-                        value={manboKeyInput}
-                        onChange={(e) => setManboKeyInput(e.target.value)}
-                        placeholder={credStatus?.has_vip_tts_key ? "已绑定（留空则保持不变）" : "输入 Manbo API Key"}
-                        className="flex-1 min-w-0 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 disabled:opacity-40"
-                      />
-                      <button
-                        type="button"
-                        onClick={handleSaveManboKey}
-                        className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-xs font-bold rounded-lg border border-neutral-700 transition shrink-0 disabled:opacity-40"
-                      >
-                        保存 Key
-                      </button>
-                    </div>
+                {/* MiMo 语音角色与风格（Manbo/MiMo 密钥由凭据文件随包内置，不提供用户输入） */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音角色</label>
+                    <select
+                      value={config.mimo_voice}
+                      onChange={(e) => setConfig({ ...config, mimo_voice: e.target.value })}
+                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
+                    >
+                      <option value="mimo_default">默认语音</option>
+                      <option value="default_zh">中文语音</option>
+                      <option value="default_en">英文语音</option>
+                    </select>
                   </div>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音角色</label>
-                      <select
-                        value={config.mimo_voice}
-                        onChange={(e) => setConfig({ ...config, mimo_voice: e.target.value })}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
-                      >
-                        <option value="mimo_default">默认语音</option>
-                        <option value="default_zh">中文语音</option>
-                        <option value="default_en">英文语音</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音风格</label>
-                      <select
-                        value={config.mimo_style}
-                        onChange={(e) => setConfig({ ...config, mimo_style: e.target.value })}
-                        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
-                      >
-                        <option value="">默认</option>
-                        <option value="温柔轻声">温柔轻声</option>
-                        <option value="激昂慷慨">激昂慷慨</option>
-                        <option value="新闻播报">新闻播报</option>
-                        <option value="欢乐活泼">欢乐活泼</option>
-                        <option value="沉稳严肃">沉稳严肃</option>
-                      </select>
-                    </div>
+                  <div>
+                    <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音风格</label>
+                    <select
+                      value={config.mimo_style}
+                      onChange={(e) => setConfig({ ...config, mimo_style: e.target.value })}
+                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
+                    >
+                      <option value="">默认</option>
+                      <option value="温柔轻声">温柔轻声</option>
+                      <option value="激昂慷慨">激昂慷慨</option>
+                      <option value="新闻播报">新闻播报</option>
+                      <option value="欢乐活泼">欢乐活泼</option>
+                      <option value="沉稳严肃">沉稳严肃</option>
+                    </select>
                   </div>
                 </div>
 
