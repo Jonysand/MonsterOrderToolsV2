@@ -52,7 +52,7 @@ export interface RetroactiveCardData {
   last_earned_date: number;
 }
 
-// 敏感字段（app_id / access_key_* / manbo_api_key / mimo_api_key / deepseek_api_key）
+// 敏感字段（app_id / access_key_* / manbo_api_key / deepseek_api_key）
 // 运行时恒为空串：权威来源为 credentials.dat（应用凭据状态走 get_credentials_status）；
 // 保存配置时回传空值不会清空已有凭据。id_code 权威来源为 Windows 注册表。
 export interface AppConfig {
@@ -68,10 +68,6 @@ export interface AppConfig {
   speech_pitch: number;
   manbo_api_key: string;
   manbo_voice: string;
-  mimo_api_key: string;
-  mimo_voice: string;
-  mimo_style: string;
-  mimo_audio_format: string;
   tts_cache_days_to_keep: number;
 
   only_medal_order: boolean;
@@ -110,7 +106,6 @@ export interface CredentialsStatus {
   access_key_masked: string;
   chat_provider: string;
   has_chat_key: boolean;
-  has_mimo_key: boolean;
   has_manbo_key: boolean;
 }
 

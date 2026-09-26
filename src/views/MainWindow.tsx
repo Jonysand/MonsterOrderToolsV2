@@ -56,7 +56,6 @@ const DEFAULT_CONNECTION: ConnectionStatusPayload = {
 /** 引擎名 → 展示文案（对齐原工程 UpdateCurrentTTSEngineLabel） */
 const ENGINE_LABELS: Record<string, string> = {
   manbo: "Manbo",
-  xiaomi: "小米MiMo",
   sapi: "Windows 本地语音",
 };
 
@@ -1393,8 +1392,8 @@ export const MainWindow: React.FC = () => {
 
                       <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
                         <span className="text-[10px] text-neutral-500 block">多引擎语音</span>
-                        <span className={`text-xs font-bold ${credStatus?.has_mimo_key || credStatus?.has_manbo_key ? "text-emerald-300" : "text-neutral-500"}`}>
-                          {credStatus?.has_mimo_key ? "MiMo 已绑定" : credStatus?.has_manbo_key ? "Manbo 已绑定" : "本地语音"}
+                        <span className={`text-xs font-bold ${credStatus?.has_manbo_key ? "text-emerald-300" : "text-neutral-500"}`}>
+                          {credStatus?.has_manbo_key ? "Manbo 已绑定" : "本地语音"}
                         </span>
                       </div>
                     </>
@@ -1470,7 +1469,6 @@ export const MainWindow: React.FC = () => {
                     >
                       <option value="auto">自动（按优先级依次尝试）</option>
                       <option value="manbo">Manbo</option>
-                      <option value="mimo">小米 MiMo</option>
                       <option value="sapi">Windows 本地语音</option>
                     </select>
                   </div>
@@ -1512,37 +1510,6 @@ export const MainWindow: React.FC = () => {
                       {manboVoices.length > 0 && !manboVoices.includes(config.manbo_voice) && (
                         <option value={config.manbo_voice}>{config.manbo_voice}</option>
                       )}
-                    </select>
-                  </div>
-                </div>
-
-                {/* MiMo 语音角色与风格（Manbo/MiMo 密钥由凭据文件随包内置，不提供用户输入） */}
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音角色</label>
-                    <select
-                      value={config.mimo_voice}
-                      onChange={(e) => setConfig({ ...config, mimo_voice: e.target.value })}
-                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
-                    >
-                      <option value="mimo_default">默认语音</option>
-                      <option value="default_zh">中文语音</option>
-                      <option value="default_en">英文语音</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] text-neutral-400 mb-1">MiMo 语音风格</label>
-                    <select
-                      value={config.mimo_style}
-                      onChange={(e) => setConfig({ ...config, mimo_style: e.target.value })}
-                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
-                    >
-                      <option value="">默认</option>
-                      <option value="温柔轻声">温柔轻声</option>
-                      <option value="激昂慷慨">激昂慷慨</option>
-                      <option value="新闻播报">新闻播报</option>
-                      <option value="欢乐活泼">欢乐活泼</option>
-                      <option value="沉稳严肃">沉稳严肃</option>
                     </select>
                   </div>
                 </div>

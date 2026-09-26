@@ -48,7 +48,7 @@ MonsterOrderWilds-Ascendance/
 │   └── src/
 │       ├── lib.rs                     # 核心状态、命令注册、Lite 守卫、业务总线与单元测试
 │       ├── bilibili.rs                # B 站开放平台长连、弹幕解析、五态连接状态机
-│       ├── tts.rs                     # 多引擎 TTS（Manbo/MiMo/SAPI 自动级联）、音频串行队列
+│       ├── tts.rs                     # 多引擎 TTS（Manbo/SAPI 自动级联）、音频串行队列
 │       ├── checkin.rs / checkin_ai.rs # 打卡 / 补签 / 点赞奖卡 / 关键词学习与 AI 回复
 │       ├── config.rs / credentials.rs / registry.rs / paths.rs  # 配置、凭据、注册表与资源路径
 │       ├── queue.rs / monster.rs      # 保序排队算法 / 怪物别名匹配

@@ -195,13 +195,8 @@ impl Default for AppState {
             }
         };
 
-        // 4. 初始化 TTS 管理器 (优先注入加密凭证中的 API Key)
-        let mimo_key = if !creds.mimo_tts_api_key.is_empty() {
-            creds.mimo_tts_api_key.clone()
-        } else {
-            app_cfg.mimo_api_key.clone()
-        };
-        // Manbo API Key 与 MiMo/对话 Key 同口径：凭据文件（发行方打包预置）优先，
+        // 4. 初始化 TTS 管理器
+        // Manbo API Key 与对话 Key 同口径：凭据文件（发行方打包预置）优先，
         // 回退注册表/配置值 —— 兼容历史安装中用户经注册表自行填写过的 Key
         let manbo_key = if !creds.manbo_api_key.is_empty() {
             creds.manbo_api_key.clone()
@@ -217,10 +212,6 @@ impl Default for AppState {
             speech_pitch: app_cfg.speech_pitch,
             manbo_api_key: manbo_key,
             manbo_voice: app_cfg.manbo_voice.clone(),
-            mimo_api_key: mimo_key,
-            mimo_voice: app_cfg.mimo_voice.clone(),
-            mimo_style: app_cfg.mimo_style.clone(),
-            mimo_audio_format: app_cfg.mimo_audio_format.clone(),
         });
 
         // 5. 初始化 AI 思考模块 (优先注入加密凭证中的 API Key)
@@ -1003,7 +994,6 @@ fn save_app_config(
     keep_cred!(access_key_id, access_key_id);
     keep_cred!(access_key_secret, access_key_secret);
     keep_cred!(deepseek_api_key, chat_api_key);
-    keep_cred!(mimo_api_key, mimo_tts_api_key);
     keep_cred!(manbo_api_key, manbo_api_key);
 
     // 悬浮窗位置由拖动链路（pending_pos + 3s 防抖）独占维护，前端设置面板不提供该字段，
@@ -1033,10 +1023,6 @@ fn save_app_config(
         speech_pitch: new_cfg.speech_pitch,
         manbo_api_key: new_cfg.manbo_api_key,
         manbo_voice: new_cfg.manbo_voice,
-        mimo_api_key: new_cfg.mimo_api_key,
-        mimo_voice: new_cfg.mimo_voice,
-        mimo_style: new_cfg.mimo_style,
-        mimo_audio_format: new_cfg.mimo_audio_format,
     });
 
     Ok(())
@@ -2303,7 +2289,6 @@ fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) ->
         cfg.app_id = creds.app_id.clone();
         cfg.access_key_id = creds.access_key_id.clone();
         cfg.access_key_secret = creds.access_key_secret.clone();
-        cfg.mimo_api_key = creds.mimo_tts_api_key.clone();
         cfg.manbo_api_key = creds.manbo_api_key.clone();
         cfg.deepseek_api_key = creds.chat_api_key.clone();
     }
@@ -2318,12 +2303,7 @@ fn sync_credential_consumers(state: &AppState) -> Result<(), String> {
     state.ai_provider.set_api_key(snap.creds.chat_api_key.clone());
 
     let cfg = state.config.lock().map_err(|e| e.to_string())?.clone();
-    let mimo_key = if !snap.creds.mimo_tts_api_key.is_empty() {
-        snap.creds.mimo_tts_api_key.clone()
-    } else {
-        cfg.mimo_api_key.clone()
-    };
-    // Manbo Key 与 MiMo 同口径：凭据文件优先，回退注册表/配置镜像
+    // Manbo Key 与对话 Key 同口径：凭据文件优先，回退注册表/配置镜像
     let manbo_key = if !snap.creds.manbo_api_key.is_empty() {
         snap.creds.manbo_api_key.clone()
     } else {
@@ -2337,10 +2317,6 @@ fn sync_credential_consumers(state: &AppState) -> Result<(), String> {
         speech_pitch: cfg.speech_pitch,
         manbo_api_key: manbo_key,
         manbo_voice: cfg.manbo_voice.clone(),
-        mimo_api_key: mimo_key,
-        mimo_voice: cfg.mimo_voice.clone(),
-        mimo_style: cfg.mimo_style.clone(),
-        mimo_audio_format: cfg.mimo_audio_format.clone(),
     });
     Ok(())
 }
@@ -2548,13 +2524,12 @@ fn get_manbo_voice_list() -> Vec<String> {
 fn parse_tts_engine(s: &str) -> TTSEngineType {
     match s.trim().to_ascii_lowercase().as_str() {
         "manbo" | "曼波" => TTSEngineType::Manbo,
-        "mimo" | "xiaomi" => TTSEngineType::MiMo,
         "sapi" => TTSEngineType::Sapi,
         _ => TTSEngineType::Auto,
     }
 }
 
-/// 当前实际使用的 TTS 引擎名（manbo / xiaomi / sapi），供设置面板实时显示
+/// 当前实际使用的 TTS 引擎名（manbo / sapi），供设置面板实时显示
 #[tauri::command]
 fn get_current_tts_engine(state: State<'_, AppState>) -> String {
     state.tts_mgr.current_engine_name()
@@ -3123,10 +3098,6 @@ impl AppState {
             speech_pitch: 0,
             manbo_api_key: String::new(),
             manbo_voice: String::new(),
-            mimo_api_key: String::new(),
-            mimo_voice: String::new(),
-            mimo_style: String::new(),
-            mimo_audio_format: String::new(),
         });
         let ai_provider = DeepSeekAIChatProvider::new(String::new());
         let danmu_processor = bilibili::DanmuProcessor::new();
@@ -3949,7 +3920,6 @@ mod tests {
         let state = AppState::new_test();
         let mut trusted = fake_creds("4004", "TRUSTED_SECRET", "sk-trusted");
         trusted.manbo_api_key = "manbo-trusted".into();
-        trusted.mimo_tts_api_key = "mimo-trusted".into();
         state.publish_credentials(CredentialState {
             creds: trusted,
             loaded: true,
@@ -3961,7 +3931,6 @@ mod tests {
         hostile.app_id = "9999".into();
         hostile.access_key_secret = "HACKED".into();
         hostile.deepseek_api_key = "sk-hacked".into();
-        hostile.mimo_api_key = "sk-mimo-hacked".into();
         hostile.manbo_api_key = "manbo-hacked".into();
 
         // 复刻 save_app_config 的字段裁决逻辑（keep_cred! 宏）
@@ -3971,18 +3940,16 @@ mod tests {
         new_cfg.access_key_id = snap.creds.access_key_id.clone();
         new_cfg.access_key_secret = snap.creds.access_key_secret.clone();
         new_cfg.deepseek_api_key = snap.creds.chat_api_key.clone();
-        new_cfg.mimo_api_key = snap.creds.mimo_tts_api_key.clone();
         new_cfg.manbo_api_key = snap.creds.manbo_api_key.clone();
 
         assert_eq!(new_cfg.app_id, "4004", "前端 app_id 不得覆盖凭据文件");
         assert_eq!(new_cfg.access_key_secret, "TRUSTED_SECRET", "密钥不得被前端覆盖");
         assert_eq!(new_cfg.deepseek_api_key, "sk-trusted");
-        assert_ne!(new_cfg.mimo_api_key, "sk-mimo-hacked");
         assert_eq!(new_cfg.manbo_api_key, "manbo-trusted", "Manbo Key 不得被前端覆盖");
         println!("[PASS] test_config_save_ignores_frontend_secrets passed");
     }
 
-    /// Manbo Key 注入优先级：凭据文件（打包预置）非空时优先于配置镜像（与 MiMo/对话 Key 同口径），
+    /// Manbo Key 注入优先级：凭据文件（打包预置）非空时优先于配置镜像（与对话 Key 同口径），
     /// 凭据文件缺该字段时回退配置镜像（兼容历史安装中经注册表自填的 Key）
     #[test]
     fn test_manbo_key_prefers_credentials_file_over_config() {
@@ -5637,10 +5604,9 @@ mod tests {
         assert_eq!(parse_tts_engine("auto"), TTSEngineType::Auto);
         assert_eq!(parse_tts_engine(" AUTO "), TTSEngineType::Auto);
         assert_eq!(parse_tts_engine("manbo"), TTSEngineType::Manbo);
-        assert_eq!(parse_tts_engine("mimo"), TTSEngineType::MiMo);
         assert_eq!(parse_tts_engine("sapi"), TTSEngineType::Sapi);
         // 未知值/空值按「自动」处理（对齐原工程 TTSProviderFactory::Create 的 default 分支走 AUTO，
-        // 保留 Manbo→MiMo→SAPI 降级链，而不是退化为手动 Manbo）
+        // 保留 Manbo→SAPI 降级链，而不是退化为手动 Manbo）
         assert_eq!(parse_tts_engine("unknown"), TTSEngineType::Auto);
         assert_eq!(parse_tts_engine(""), TTSEngineType::Auto);
         println!("[PASS] test_parse_tts_engine_mapping passed");

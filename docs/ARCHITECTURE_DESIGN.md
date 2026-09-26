@@ -69,7 +69,7 @@
 * `get_id_code()` / `save_id_code(id_code)`: 开播身份码读取（注册表优先，供前端输入框以密码形态回显）与保存（仅注册表，不落 JSON）。
 * `set_overlay_locked(locked)` / `get_overlay_locked()`: 悬浮窗鼠标穿透 + 置顶（D2，运行时状态不持久化）。
 * `save_overlay_position(x, y)`: 悬浮窗拖动位置防抖落盘（→ `top_pos_x/y`，D2）。
-* `get_current_tts_engine()`: 当前实际引擎名 `manbo / xiaomi / sapi`（D1）。
+* `get_current_tts_engine()`: 当前实际引擎名 `manbo / sapi`（D1）。
 * `save_manbo_api_key(key)`: Manbo Key 仅写注册表，不落 JSON、不回传（D1）。
 * `get_manbo_voice_list()`: 185 项音色列表（D1）。
 * `get_recent_logs(limit, minLevel)` / `clear_recent_logs()`: 运行日志内存环读取/清空（D5）。
@@ -164,7 +164,6 @@
           speak_text(text, uid)  ├─► 本地语音包命中（zip 优先）→ 直接播放
                                  ├─► 特殊用户专属引擎 /apis/mbAIsc（3 次失败/30s 熔断）
                                  ├─► Manbo（曼波音色走 /apis/mbAIscvip，speed=rate×5）
-                                 ├─► MiMo（小米开放平台，<style> 标签拼接）
                                  └─► Windows SAPI（中文音色 + SSML rate/volume/pitch）
                                    ▼
               AudioQueue（单播放线程 + mpsc，全部音频串行，防叠音）

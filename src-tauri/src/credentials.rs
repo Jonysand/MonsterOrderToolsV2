@@ -24,8 +24,6 @@ pub struct Credentials {
     #[serde(rename = "ACCESS_KEY_SECRET", default)]
     pub access_key_secret: String,
     #[serde(default)]
-    pub mimo_tts_api_key: String,
-    #[serde(default)]
     pub manbo_api_key: String,
     #[serde(default = "default_chat_provider")]
     pub chat_provider: String,
@@ -46,7 +44,6 @@ pub struct CredentialsStatus {
     pub access_key_masked: String,
     pub chat_provider: String,
     pub has_chat_key: bool,
-    pub has_mimo_key: bool,
     pub has_manbo_key: bool,
 }
 
@@ -62,7 +59,6 @@ impl Credentials {
             access_key_masked,
             chat_provider: self.chat_provider.clone(),
             has_chat_key: !self.chat_api_key.is_empty(),
-            has_mimo_key: !self.mimo_tts_api_key.is_empty(),
             has_manbo_key: !self.manbo_api_key.is_empty(),
         }
     }
@@ -215,7 +211,6 @@ mod tests {
             app_id: "1751077177719".into(),
             access_key_id: "AKIDEXAMPLE1234".into(),
             access_key_secret: "SECRETEXAMPLE".into(),
-            mimo_tts_api_key: "sk-mimo".into(),
             chat_provider: "deepseek".into(),
             chat_api_key: "sk-chat".into(),
             ..Default::default()
@@ -300,7 +295,6 @@ mod tests {
             app_id: "test_app_888".into(),
             access_key_id: "test_ak_id".into(),
             access_key_secret: "test_ak_sec".into(),
-            mimo_tts_api_key: "test_mimo_key".into(),
             manbo_api_key: "test_manbo_key".into(),
             chat_provider: "deepseek".into(),
             chat_api_key: "sk-test_ai_key".into(),
@@ -316,7 +310,6 @@ mod tests {
         assert_eq!(status.app_id, "test_app_888");
         assert!(status.access_key_masked.contains("***"));
         assert!(status.has_manbo_key);
-        assert!(status.has_mimo_key);
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);
@@ -378,7 +371,6 @@ mod tests {
         assert_eq!(loaded.app_id, "PYGEN_TEST");
         assert_eq!(loaded.manbo_api_key, "manbo_py");
         assert_eq!(loaded.chat_api_key, "sk_py");
-        assert!(loaded.mimo_tts_api_key.is_empty());
 
         // 正向：Rust save_credentials 的产物同样符合该信封结构（往返已在其他用例覆盖）
         let _ = fs::remove_file(&path);
@@ -401,7 +393,6 @@ mod tests {
 
         let loaded = load_credentials(Some(&path)).unwrap();
         assert_eq!(loaded.app_id, "123");
-        assert_eq!(loaded.mimo_tts_api_key, "mimo");
         assert_eq!(loaded.chat_api_key, "sk-x");
         assert!(loaded.manbo_api_key.is_empty(), "旧文件无 manbo 字段时应为空");
 

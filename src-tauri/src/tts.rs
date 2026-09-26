@@ -4,7 +4,6 @@
 
 #[cfg(not(test))]
 use rodio::{Decoder, OutputStream, Sink};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -16,22 +15,20 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 语音引擎类型
-/// `Auto` 对齐原工程 `TTSProviderFactory` 的 AUTO 模式：按 Manbo → MiMo → SAPI 顺序取首个可用引擎
+/// `Auto` 对齐原工程 `TTSProviderFactory` 的 AUTO 模式：按 Manbo → SAPI 顺序取首个可用引擎
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TTSEngineType {
     Auto,
     Manbo,
-    MiMo,
     Sapi,
 }
 
 impl TTSEngineType {
-    /// 引擎名（对齐原工程 `TTSManager_GetCurrentProviderName` 的返回值：manbo / xiaomi / sapi）
+    /// 引擎名（对齐原工程 `TTSManager_GetCurrentProviderName` 的返回值：manbo / sapi）
     pub fn provider_name(self) -> &'static str {
         match self {
             TTSEngineType::Auto => "auto",
             TTSEngineType::Manbo => "manbo",
-            TTSEngineType::MiMo => "xiaomi",
             TTSEngineType::Sapi => "sapi",
         }
     }
@@ -60,10 +57,6 @@ pub struct TTSConfig {
     pub speech_pitch: i32,
     pub manbo_api_key: String,
     pub manbo_voice: String,
-    pub mimo_api_key: String,
-    pub mimo_voice: String,
-    pub mimo_style: String,
-    pub mimo_audio_format: String,
 }
 
 impl Default for TTSConfig {
@@ -77,10 +70,6 @@ impl Default for TTSConfig {
             manbo_api_key: String::new(),
             // 原工程默认音色为「曼波」，走 /apis/mbAIscvip 专用端点
             manbo_voice: "曼波".into(),
-            mimo_api_key: String::new(),
-            mimo_voice: "mimo_default".into(),
-            mimo_style: String::new(),
-            mimo_audio_format: "mp3".into(),
         }
     }
 }
@@ -198,7 +187,7 @@ where
 {
     if let Ok((_stream, handle)) = OutputStream::try_default() {
         if let Ok(sink) = Sink::try_new(&handle) {
-            // 对齐原工程：起播前按配置设置音量（Manbo/MiMo/本地音效同样生效）
+            // 对齐原工程：起播前按配置设置音量（Manbo/本地音效同样生效）
             sink.set_volume(volume_gain(speech_volume));
             sink.append(decoder);
             let deadline = Instant::now() + PLAYBACK_TIMEOUT;
@@ -765,7 +754,6 @@ pub const MAX_CONCURRENT_TTS: usize = 2;
 pub struct TTSManager {
     config: Mutex<TTSConfig>,
     manbo_health: Mutex<EngineHealth>,
-    mimo_health: Mutex<EngineHealth>,
     special_health: Mutex<SpecialEngineHealth>,
     gift_tracker: Mutex<GiftComboTracker>,
     /// 普通弹幕朗读队列（原工程 NormalMsgQueue）
@@ -792,7 +780,6 @@ impl TTSManager {
         Self {
             config: Mutex::new(config),
             manbo_health: Mutex::new(EngineHealth::Healthy),
-            mimo_health: Mutex::new(EngineHealth::Healthy),
             special_health: Mutex::new(SpecialEngineHealth {
                 failures: 0,
                 cooldown_until: None,
@@ -945,33 +932,6 @@ impl TTSManager {
                     }
                 }
             }
-            TTSEngineType::MiMo => {
-                // 未配置 API Key 时视为不可用（对齐原工程 TTSProvider.h IsAvailable：
-                // `!apiKey_.empty() && available_`），避免发送空 Bearer 的无效请求
-                if self
-                    .config
-                    .lock()
-                    .map(|c| c.mimo_api_key.trim().is_empty())
-                    .unwrap_or(true)
-                {
-                    return false;
-                }
-                let mut h = self.mimo_health.lock().unwrap();
-                match *h {
-                    EngineHealth::Healthy => true,
-                    EngineHealth::Degraded {
-                        failed_at,
-                        cooldown_secs,
-                    } => {
-                        if failed_at.elapsed() >= Duration::from_secs(cooldown_secs) {
-                            *h = EngineHealth::Healthy;
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                }
-            }
             // 本地兜底恒常可用：Windows 走 System.Speech（SAPI），macOS 走内置 `say`
             TTSEngineType::Sapi => true,
         }
@@ -990,18 +950,11 @@ impl TTSManager {
                     cooldown_secs: Self::COOLDOWN_SECS,
                 };
             }
-            TTSEngineType::MiMo => {
-                let mut h = self.mimo_health.lock().unwrap();
-                *h = EngineHealth::Degraded {
-                    failed_at: now,
-                    cooldown_secs: Self::COOLDOWN_SECS,
-                };
-            }
             TTSEngineType::Sapi => {}
         }
     }
 
-    /// 选择当前最优可用引擎（首选引擎健康则用之；否则按 Manbo -> MiMo -> Sapi 降级）。
+    /// 选择当前最优可用引擎（首选引擎健康则用之；否则按 Manbo -> Sapi 降级）。
     /// 配置为 `Auto`（对齐原工程 TTSProviderFactory 的 AUTO 模式）时直接走该降级链路。
     pub fn select_active_engine(&self) -> TTSEngineType {
         let preferred = self.config.lock().unwrap().engine;
@@ -1012,8 +965,6 @@ impl TTSManager {
         // 故障降级链路
         if self.is_engine_available(TTSEngineType::Manbo) {
             TTSEngineType::Manbo
-        } else if self.is_engine_available(TTSEngineType::MiMo) {
-            TTSEngineType::MiMo
         } else {
             TTSEngineType::Sapi
         }
@@ -1026,7 +977,7 @@ impl TTSManager {
         }
     }
 
-    /// 当前实际使用的引擎名（对齐原工程 `TTSManager_GetCurrentProviderName`：manbo / xiaomi / sapi）。
+    /// 当前实际使用的引擎名（对齐原工程 `TTSManager_GetCurrentProviderName`：manbo / sapi）。
     /// 尚未播报过时返回按配置解析出的引擎名
     pub fn current_engine_name(&self) -> String {
         let tracked = self.active_engine.lock().ok().and_then(|c| *c);
@@ -1241,10 +1192,8 @@ impl TTSManager {
             }
         }
 
-        // 3. 选择当前最优健康引擎并尝试
-        let mut active = self.select_active_engine();
-
-        if active == TTSEngineType::Manbo {
+        // 3. 选择当前最优健康引擎并尝试（Manbo 失败即降级，落到本地 SAPI 兜底）
+        if self.select_active_engine() == TTSEngineType::Manbo {
             let url = Self::build_manbo_url(&cfg, trimmed);
             match Self::request_audio_bytes(&client, &url, Some(&cfg.manbo_api_key)).await {
                 Ok(bytes) => {
@@ -1253,49 +1202,6 @@ impl TTSManager {
                 }
                 Err(_) => {
                     self.mark_engine_degraded(TTSEngineType::Manbo);
-                    active = self.select_active_engine();
-                }
-            }
-        }
-
-        if active == TTSEngineType::MiMo {
-            let full_text = build_mimo_text(&cfg.mimo_style, trimmed);
-            let body = serde_json::json!({
-                "model": "mimo-v2.5-tts",
-                "messages": [
-                    {"role": "user", "content": "Bright, bouncy, speak fast"},
-                    {"role": "assistant", "content": full_text}
-                ],
-                "audio": {
-                    "voice": if cfg.mimo_voice.is_empty() { "mimo_default" } else { &cfg.mimo_voice },
-                    "format": if cfg.mimo_audio_format.is_empty() { "mp3" } else { &cfg.mimo_audio_format }
-                }
-            });
-
-            match client
-                .post("https://api.xiaomimimo.com/v1/chat/completions")
-                .header("Authorization", format!("Bearer {}", cfg.mimo_api_key))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    if let Ok(json_val) = resp.json::<serde_json::Value>().await {
-                        if let Some(b64) = json_val
-                            .pointer("/choices/0/message/audio/data")
-                            .and_then(|v| v.as_str())
-                        {
-                            if let Ok(bytes) = base64_decode(b64) {
-                                self.mark_active_engine(TTSEngineType::MiMo);
-                                return self.play_audio_bytes(&bytes, checkin_username);
-                            }
-                        }
-                    }
-                    self.mark_engine_degraded(TTSEngineType::MiMo);
-                }
-                _ => {
-                    self.mark_engine_degraded(TTSEngineType::MiMo);
                 }
             }
         }
@@ -1308,42 +1214,6 @@ impl TTSManager {
             pitch: cfg.speech_pitch,
         };
         AudioQueue::global().speak_sapi(trimmed.to_string(), params)
-    }
-}
-
-/// 拼接 MiMo TTS 文本：全局风格标签前缀 + 行内 #标签# 转换。
-/// 与原工程 XiaomiTTSProvider::HashtagToStyle / styleTag 语义一致。
-pub fn build_mimo_text(style: &str, text: &str) -> String {
-    let style_tag = if style.trim().is_empty() {
-        String::new()
-    } else {
-        format!("<style>{}</style>", style)
-    };
-    format!("{}{}", style_tag, hashtag_to_style(text))
-}
-
-/// 将 `#标签#` 中的首个标签提升到串首（避免 API 忽略前缀），其余替换为 `<style>标签</style>`
-fn hashtag_to_style(text: &str) -> String {
-    let re = Regex::new(r"#([^#]+)#").unwrap();
-    let first = re.captures(text).map(|c| c[1].to_string());
-
-    let without_first = match &first {
-        Some(f) => {
-            let pat = format!("#{}#", f);
-            text.replacen(&pat, "", 1)
-        }
-        None => text.to_string(),
-    };
-
-    let replaced = re
-        .replace_all(&without_first, |caps: &regex::Captures| {
-            format!("<style>{}</style>", &caps[1])
-        })
-        .to_string();
-
-    match first {
-        Some(f) => format!("<style>{}</style>{}", f, replaced),
-        None => replaced,
     }
 }
 
@@ -1367,40 +1237,6 @@ pub fn url_encode(val: &str) -> String {
     out
 }
 
-/// Base64 解码工具函数
-pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut map = [255u8; 256];
-    for (i, &b) in TABLE.iter().enumerate() {
-        map[b as usize] = i as u8;
-    }
-
-    let clean: Vec<u8> = input
-        .bytes()
-        .filter(|&b| b != b'\r' && b != b'\n' && b != b' ')
-        .collect();
-    let mut out = Vec::with_capacity((clean.len() * 3) / 4);
-    let mut buf = 0u32;
-    let mut bits = 0;
-
-    for &b in &clean {
-        if b == b'=' {
-            break;
-        }
-        let val = map[b as usize];
-        if val == 255 {
-            continue;
-        }
-        buf = (buf << 6) | (val as u32);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,34 +1245,18 @@ mod tests {
 
     #[test]
     fn test_auto_engine_cascade_and_current_engine_name() {
-        // D1：引擎「自动」对齐原工程 TTSProviderFactory 的 AUTO 模式（manbo -> mimo -> sapi）
+        // D1：引擎「自动」对齐原工程 TTSProviderFactory 的 AUTO 模式（manbo -> sapi）
         let mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Auto,
-            mimo_api_key: "test-mimo-key".into(),
             ..Default::default()
         });
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Manbo);
         assert_eq!(mgr.current_engine_name(), "manbo");
 
-        // Manbo 熔断后自动降级 MiMo，再熔断降级 SAPI
+        // Manbo 熔断后自动降级 SAPI
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
-        assert_eq!(mgr.select_active_engine(), TTSEngineType::MiMo);
-        assert_eq!(mgr.current_engine_name(), "xiaomi");
-        mgr.mark_engine_degraded(TTSEngineType::MiMo);
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
         assert_eq!(mgr.current_engine_name(), "sapi");
-
-        // 未配置 MiMo API Key 时跳过 MiMo 直接落到 SAPI（对齐原工程 IsAvailable 的 Key 非空判定）
-        let no_key = TTSManager::new(TTSConfig {
-            engine: TTSEngineType::Auto,
-            ..Default::default()
-        });
-        no_key.mark_engine_degraded(TTSEngineType::Manbo);
-        assert!(
-            !no_key.is_engine_available(TTSEngineType::MiMo),
-            "无 MiMo Key 时该引擎不可用"
-        );
-        assert_eq!(no_key.select_active_engine(), TTSEngineType::Sapi);
 
         // 显式指定引擎时以其为准（故障时才降级），「自动」自身不参与降级判定
         let explicit = TTSManager::new(TTSConfig {
@@ -1451,7 +1271,6 @@ mod tests {
 
         // 引擎名映射（对齐原工程 TTSManager_GetCurrentProviderName 返回值）
         assert_eq!(TTSEngineType::Manbo.provider_name(), "manbo");
-        assert_eq!(TTSEngineType::MiMo.provider_name(), "xiaomi");
         assert_eq!(TTSEngineType::Sapi.provider_name(), "sapi");
         println!("[PASS] test_auto_engine_cascade_and_current_engine_name passed");
     }
@@ -1460,7 +1279,6 @@ mod tests {
     fn test_tts_circuit_breaker_and_cooldown_recovery() {
         let mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Manbo,
-            mimo_api_key: "test-mimo-key".into(),
             ..Default::default()
         });
 
@@ -1470,13 +1288,6 @@ mod tests {
         // 模拟 Manbo 请求超时触发故障降级
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
         assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
-
-        // 降级为 MiMo
-        assert_eq!(mgr.select_active_engine(), TTSEngineType::MiMo);
-
-        // 模拟 MiMo 亦故障降级
-        mgr.mark_engine_degraded(TTSEngineType::MiMo);
-        assert!(!mgr.is_engine_available(TTSEngineType::MiMo));
 
         // 最终降级至 SAPI 离线兜底
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
@@ -1959,31 +1770,10 @@ mod tests {
     }
 
     #[test]
-    fn test_url_encode_and_base64_decode() {
+    fn test_url_encode() {
         let raw = "测试文本 123 !";
         let encoded = url_encode(raw);
         assert!(encoded.contains("%E6%B5%8B%E8%AF%95"));
-
-        let sample = b"Hello, Monster Hunter Wilds!";
-        // 手动 Base64 编码对应 SGVsbG8sIE1vbnN0ZXIgSHVudGVyIFdpbGRzIQ==
-        let decoded = base64_decode("SGVsbG8sIE1vbnN0ZXIgSHVudGVyIFdpbGRzIQ==").unwrap();
-        assert_eq!(decoded, sample);
-        println!("[PASS] test_url_encode_and_base64_decode passed");
-    }
-
-    #[test]
-    fn test_mimo_style_and_hashtag() {
-        // 无风格、无标签：原样输出
-        assert_eq!(build_mimo_text("", "你好猎人"), "你好猎人");
-        // 全局风格：前置 <style>
-        assert_eq!(build_mimo_text("温柔", "你好猎人"), "<style>温柔</style>你好猎人");
-        // 行内 #标签#：提升到串首
-        assert_eq!(build_mimo_text("", "你好#开心#"), "<style>开心</style>你好");
-        // 全局 + 行内组合
-        assert_eq!(
-            build_mimo_text("激昂", "快看#出击#"),
-            "<style>激昂</style><style>出击</style>快看"
-        );
-        println!("[PASS] test_mimo_style_and_hashtag passed");
+        println!("[PASS] test_url_encode passed");
     }
 }

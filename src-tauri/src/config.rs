@@ -27,11 +27,6 @@ pub struct AppConfig {
     #[serde(skip_serializing)]
     pub manbo_api_key: String,
     pub manbo_voice: String,
-    #[serde(skip_serializing)]
-    pub mimo_api_key: String,
-    pub mimo_voice: String,
-    pub mimo_style: String,
-    pub mimo_audio_format: String,
     pub tts_cache_days_to_keep: i32,
 
     // 3. 弹幕与播报过滤配置
@@ -74,11 +69,6 @@ impl Default for AppConfig {
             manbo_api_key: String::new(),
             // 原工程默认音色为「曼波」（专用端点 /apis/mbAIscvip，speed = speech_rate × 5）
             manbo_voice: "曼波".into(),
-            mimo_api_key: String::new(),
-            mimo_voice: "mimo_default".into(),
-            // 原工程 mimoStyle 默认为空串
-            mimo_style: String::new(),
-            mimo_audio_format: "mp3".into(),
             tts_cache_days_to_keep: 7,
 
             only_medal_order: true,
@@ -224,10 +214,6 @@ impl AppConfig {
 
         set_str!("DEFAULT_MARQUEE_TEXT", default_marquee_text);
         set_str!("TTS_ENGINE", tts_engine);
-        set_str!("MIMO_API_KEY", mimo_api_key);
-        set_str!("MIMO_VOICE", mimo_voice);
-        set_str!("MIMO_STYLE", mimo_style);
-        set_str!("MIMO_AUDIO_FORMAT", mimo_audio_format);
         set_str!("MANBO_VOICE", manbo_voice);
         set_int!("TTS_CACHE_DAYS_TO_KEEP", tts_cache_days_to_keep);
         set_bool!("ENABLE_CAPTAIN_CHECKIN_AI", enable_captain_checkin_ai);
@@ -290,7 +276,6 @@ impl AppConfig {
         c.access_key_id.clear();
         c.access_key_secret.clear();
         c.manbo_api_key.clear();
-        c.mimo_api_key.clear();
         c.deepseek_api_key.clear();
         c
     }
@@ -441,17 +426,16 @@ mod tests {
         cfg.access_key_id = "SECRET_AK_ID".into();
         cfg.access_key_secret = "SECRET_AK_SECRET".into();
         cfg.manbo_api_key = "SECRET_MANBO".into();
-        cfg.mimo_api_key = "SECRET_MIMO".into();
         cfg.deepseek_api_key = "SECRET_DEEPSEEK".into();
         cfg.opacity = 77;
 
         let secret_keys = [
             "id_code", "app_id", "access_key_id", "access_key_secret",
-            "manbo_api_key", "mimo_api_key", "deepseek_api_key",
+            "manbo_api_key", "deepseek_api_key",
         ];
         let secret_values = [
             "SECRET_ID_CODE", "SECRET_APP_ID", "SECRET_AK_ID", "SECRET_AK_SECRET",
-            "SECRET_MANBO", "SECRET_MIMO", "SECRET_DEEPSEEK",
+            "SECRET_MANBO", "SECRET_DEEPSEEK",
         ];
 
         // 1. 序列化结果（返回前端 / 落盘的同一来源）不含敏感键与明文
@@ -476,22 +460,21 @@ mod tests {
         for key in secret_keys {
             assert!(!file_text.contains(key), "configs.json 不应包含敏感键 {}: {}", key, file_text);
         }
-        for secret in ["SECRET_APP_ID", "SECRET_AK_ID", "SECRET_AK_SECRET", "SECRET_MIMO", "SECRET_DEEPSEEK"] {
+        for secret in ["SECRET_APP_ID", "SECRET_AK_ID", "SECRET_AK_SECRET", "SECRET_DEEPSEEK"] {
             assert!(!file_text.contains(secret), "落盘文件不应包含明文凭据 {}: {}", secret, file_text);
         }
 
-        // 3. 反序列化兼容：历史配置中的敏感键仍可读取（只读不回写）
+        // 3. 反序列化兼容：历史配置中的敏感键/已移除键（如 mimo_api_key）仍可读取，未知键被忽略不报错
         let legacy = r#"{"id_code":"LEGACY_ID","mimo_api_key":"LEGACY_MIMO","opacity":60}"#;
         let parsed = AppConfig::parse_content(legacy, None);
         assert_eq!(parsed.id_code, "LEGACY_ID");
-        assert_eq!(parsed.mimo_api_key, "LEGACY_MIMO");
         assert_eq!(parsed.opacity, 60);
 
         // 4. sanitized()：清空全部凭据字段、保留 id_code 与常规字段
         let s = cfg.sanitized();
         assert_eq!(s.id_code, "SECRET_ID_CODE");
         assert!(s.app_id.is_empty() && s.access_key_id.is_empty() && s.access_key_secret.is_empty());
-        assert!(s.manbo_api_key.is_empty() && s.mimo_api_key.is_empty() && s.deepseek_api_key.is_empty());
+        assert!(s.manbo_api_key.is_empty() && s.deepseek_api_key.is_empty());
         assert_eq!(s.opacity, 77);
 
         let _ = fs::remove_file(&path);
@@ -596,7 +579,6 @@ mod tests {
             "PENETRATING_MODE_OPACITY": 50,
             "TTS_ENGINE": "sapi",
             "MANBO_VOICE": "曼波",
-            "MIMO_VOICE": "mimo_default",
             "CHECKIN_TRIGGER_WORDS": "打卡,签到",
             "DEFAULT_MARQUEE_TEXT": "发送'点怪 xxx'进行点怪",
             "TTS_CACHE_DAYS_TO_KEEP": 7,
@@ -612,7 +594,6 @@ mod tests {
         assert_eq!(cfg.penetrating_mode_opacity, 50);
         assert_eq!(cfg.tts_engine, "sapi");
         assert_eq!(cfg.manbo_voice, "曼波");
-        assert_eq!(cfg.mimo_voice, "mimo_default");
         assert_eq!(cfg.checkin_trigger_words, "打卡,签到");
         assert_eq!(cfg.default_marquee_text, "发送'点怪 xxx'进行点怪");
         assert_eq!(cfg.top_pos_x, 913.0);
