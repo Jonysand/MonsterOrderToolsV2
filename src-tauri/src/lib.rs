@@ -1586,8 +1586,9 @@ pub fn handle_incoming_danmu(
 
 /// 点赞奖励结算失败时的可见反馈（D3 的"可见失败事件"）。
 ///
-/// 配合整事件回滚策略：那次点赞没有落库，因此**必须**让主播知道，
-/// 并明确它是可重试的（去重预留已释放，服务端重投即可重新入账）。
+/// 配合意图账本：那次点赞没有入账，但**意图已持久化**（pending_like_rewards），
+/// 数据库恢复后由补偿扫描器自动补记，服务端重投同一消息也会直接入账——
+/// 不再只是"可重试"的承诺，而是"必达"的补偿。
 /// 载荷只含数量与固定文案，不含 uid、昵称或 SQL 错误原文。
 fn emit_like_reward_failed(app: Option<&AppHandle>, like_count: i32) {
     if let Some(handle) = app {
@@ -1596,8 +1597,152 @@ fn emit_like_reward_failed(app: Option<&AppHandle>, like_count: i32) {
             &serde_json::json!({
                 "like_count": like_count,
                 "retryable": true,
-                "message": "本次点赞结算未完成，已回滚且未计入。系统会在服务端重投时自动重试；若长时间未恢复请检查本机数据库。",
+                "message": "本次点赞结算未完成，已回滚且未计入。已存入本机补偿账本，数据库恢复后会自动补记；服务端重投同一消息时也会直接入账。",
             }),
+        );
+    }
+}
+
+/// 点赞补偿重试超限的一次性提示：复用 like-reward-failed 通道（前端零改动），
+/// retryable=false 表明自动重试已停止；意图行保留在账本中不删除，待人工排查。
+fn emit_like_reward_abandoned(app: Option<&AppHandle>, abandoned: usize) {
+    if let Some(handle) = app {
+        let _ = handle.emit(
+            "like-reward-failed",
+            &serde_json::json!({
+                "like_count": 0,
+                "retryable": false,
+                "message": format!(
+                    "有 {} 条补偿中的点赞超过自动重试上限，已保留记录不再自动重试，请检查本机日志或数据库。",
+                    abandoned
+                ),
+            }),
+        );
+    }
+}
+
+/// D3 点赞补偿扫描间隔（秒）
+const LIKE_COMPENSATION_SCAN_INTERVAL_SECS: u64 = 60;
+/// 单轮补偿扫描的最大结算条数（防止数据库刚恢复时一次性重放压垮打卡链路）
+const LIKE_COMPENSATION_BATCH_LIMIT: i64 = 200;
+
+/// D3 持久化补偿：扫描 pending_like_rewards 的待补点赞并逐条重放入账。
+/// 与实时链路共用 `settle_like_intent`（T2），由意图行状态互斥，天然防双计：
+/// 实时链路结算后删行，扫描器读到无行即跳过；扫描器补账后行转 done 凭证，
+/// 服务端重投的 stage 命中凭证行、settle 读到 done 即静默跳过。
+fn replay_pending_likes(state: &AppState, app: Option<&AppHandle>) {
+    if IS_LITE {
+        return;
+    }
+    let Ok(mgr) = state.checkin() else {
+        return; // 打卡库不可用：本轮空转，CheckinManager 恢复（重启）后自动恢复扫描
+    };
+
+    // 1. 放弃超限行（保留记录、一次性提示）
+    let abandoned = mgr
+        .abandon_stale_like_intents(checkin::LIKE_MAX_RETRIES)
+        .unwrap_or_default();
+    for row in &abandoned {
+        crate::log_error!(
+            "[Checkin] 点赞补偿重试 {} 次仍失败，已放弃自动重试（记录保留）: like_count={} like_date={} msg_id={:?}",
+            row.retry_count,
+            row.like_count,
+            row.like_date,
+            row.msg_id
+        );
+    }
+    if !abandoned.is_empty() {
+        emit_like_reward_abandoned(app, abandoned.len());
+    }
+
+    // 2. 逐条重放待补意图（先丢的先补）
+    let rows = match mgr.list_pending_like_intents(LIKE_COMPENSATION_BATCH_LIMIT) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log_warn!("[Checkin] 点赞补偿扫描读取失败: {}", e);
+            return;
+        }
+    };
+    let mut settled = 0usize;
+    let mut failed = 0usize;
+    for row in &rows {
+        match mgr.settle_like_intent(row.id, true) {
+            Ok(checkin::SettleOutcome::Settled(rewards)) => {
+                settled += 1;
+                // 补账按事件发生日结算，播报与实时一致，文案加「已补记」后缀；
+                // 普通补账（无发卡）静默入账，不打扰直播间
+                let username = row.username.as_deref().unwrap_or_default();
+                let mut replies: Vec<String> = Vec::new();
+                if rewards.weekly_reward {
+                    replies.push(format!(
+                        "{}，恭喜！今日点赞突破30，获得1张补签卡！（已补记）",
+                        username
+                    ));
+                }
+                if rewards.streak_reward {
+                    replies.push(format!(
+                        "{}，恭喜！连续7天点赞，获得1张补签卡！（已补记）",
+                        username
+                    ));
+                }
+                if replies.is_empty() {
+                    continue;
+                }
+                for text in &replies {
+                    record_business_history(text);
+                    record_business_history_probe(text);
+                }
+                if let Some(handle) = app {
+                    let _ = handle.emit(
+                        "like-reward-granted",
+                        &serde_json::json!({
+                            "uid": row.uid,
+                            "user_name": username,
+                            "likes": row.like_count,
+                            "daily_total": rewards.daily_total,
+                            "replies": replies,
+                        }),
+                    );
+                }
+                let enable_voice = state
+                    .config
+                    .lock()
+                    .map(|c| c.enable_voice)
+                    .unwrap_or(false);
+                if enable_voice {
+                    for text in &replies {
+                        state.tts_mgr.enqueue_speak(text, &row.uid, true);
+                    }
+                }
+            }
+            Ok(checkin::SettleOutcome::AlreadySettled) => {
+                // 并发窗口内已被实时链路结算（行已删）：无需处理
+            }
+            Err(e) => {
+                failed += 1;
+                mgr.bump_like_intent_failure(row.id, &e);
+                crate::log_error!("[Checkin] 点赞补偿重放失败（id={}）: {}", row.id, e);
+            }
+        }
+    }
+
+    // 3. 清理过期已办凭证 + 输出本轮统计（轻量观测：待补/成功/失败/放弃）
+    match mgr.cleanup_done_like_intents(checkin::LIKE_DONE_RECEIPT_RETENTION_SECS) {
+        Ok(n) if n > 0 => {
+            crate::log_info!("[Checkin] 点赞补偿凭证清理: 已删除 {} 条过期 done 记录", n);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            crate::log_warn!("[Checkin] 点赞补偿凭证清理失败: {}", e);
+        }
+    }
+    if !rows.is_empty() || !abandoned.is_empty() {
+        crate::log_info!(
+            "[Checkin] 点赞补偿扫描: 待补={} 补账成功={} 补账失败={} 放弃={}",
+            rows.len(),
+            settled,
+            failed,
+            abandoned.len()
         );
     }
 }
@@ -1640,11 +1785,34 @@ pub fn handle_incoming_like(
         return Vec::new();
     };
 
-    let rewards = match mgr.add_likes(&ev.uid, ev.like_count, date) {
-        Ok(r) => r,
+    // T1：意图先行落库 —— 把「这次点赞打算入账」持久化为独立事务。
+    // T1 自身失败意味着数据库整体不可写，任何持久化都不可能，维持现状路径
+    // （可见提示 + 日志）—— 这是本机制唯一无法覆盖的边界
+    let intent_id =
+        match mgr.stage_like_intent(&ev.uid, &ev.username, &ev.msg_id, ev.like_count, date) {
+            Ok(id) => id,
+            Err(e) => {
+                crate::log_error!("[Checkin] 点赞意图落库失败（库不可写，事件丢弃）: {}", e);
+                state.danmu_processor.release_msg_id(&ev.msg_id);
+                emit_like_reward_failed(app_handle, ev.like_count);
+                return Vec::new();
+            }
+        };
+
+    // T2：入账 + 销账在同一 IMMEDIATE 事务内提交。失败整体回滚后意图行仍在，
+    // 由补偿扫描器定时重放必达；服务端重投则命中同一意图行（pending 去重 /
+    // done 已办凭证），不会双计入账。
+    let rewards = match mgr.settle_like_intent(intent_id, false) {
+        Ok(checkin::SettleOutcome::Settled(r)) => r,
+        Ok(checkin::SettleOutcome::AlreadySettled) => {
+            // 已由补偿扫描器补账（本次为重投撞上已办凭证）：静默丢弃，不得重复入账
+            return Vec::new();
+        }
         Err(e) => {
-            // D3：整事件已回滚 → 必须留痕**并释放预留**，让同一事件的重投可以重试
-            crate::log_error!("[Checkin] 点赞事务失败，已回滚并释放去重预留（可重试）: {}", e);
+            // D3：整事件已回滚，但意图已持久化 → 记重试计数、释放预留，
+            // 让重投与补偿扫描器都能把这笔点赞补回来
+            mgr.bump_like_intent_failure(intent_id, &e);
+            crate::log_error!("[Checkin] 点赞事务失败，已回滚（意图已留账本待自动补记）: {}", e);
             state.danmu_processor.release_msg_id(&ev.msg_id);
             emit_like_reward_failed(app_handle, ev.like_count);
             return Vec::new();
@@ -2826,6 +2994,23 @@ pub fn run() {
                     loop {
                         interval.tick().await;
                         flush_queue(&state, false, Some(&handle));
+                    }
+                });
+            }
+
+            // D3 点赞补偿扫描：tokio interval 的首个 tick 立即触发，即「启动即扫一次」，
+            // 覆盖上次运行期失败残留的点赞意图；此后每 60s 一轮，
+            // 数据库恢复后自动补账（Lite 下扫描器内部直接早退）
+            {
+                let state = app.state::<AppState>().inner().clone();
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                        LIKE_COMPENSATION_SCAN_INTERVAL_SECS,
+                    ));
+                    loop {
+                        interval.tick().await;
+                        replay_pending_likes(&state, Some(&handle));
                     }
                 });
             }
@@ -4121,7 +4306,166 @@ mod tests {
         // 成功后 ID 保持占用：再投一次不得重复发卡
         assert!(handle_incoming_like(None, &state, &ev).is_empty());
         assert_eq!(state.test_checkin().get_cards("like_retry").card_count, 1);
+        // 账本无残留：失败留下的意图行已被重投结算销账
+        assert!(
+            state
+                .test_checkin()
+                .list_pending_like_intents(10)
+                .unwrap()
+                .is_empty(),
+            "重投结算后不得残留待补意图"
+        );
         println!("[PASS] test_like_failure_releases_dedup_key_and_allows_retry passed");
+    }
+
+    /// D3：点赞事务失败后意图持久化在账本中，补偿扫描器重放后自动补记入账，
+    /// 且补账后的同事件重投撞上已办凭证被静默拦截，不得双计
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_like_failure_persists_intent_and_backfills() {
+        let state = AppState::new_test();
+        let today = chrono::Local::now().date_naive();
+        let now_ts = chrono::Utc::now().timestamp();
+        let ev = bilibili::LikeEvent {
+            uid: "like_backfill".into(),
+            username: "补账水友".into(),
+            msg_id: "like_backfill_msg_1".into(),
+            like_count: 30,
+            timestamp: now_ts,
+        };
+
+        // 注入：连赞标记写入失败，使整个点赞结算回滚
+        state
+            .test_checkin()
+            .inject_sql_for_test(
+                r#"
+                CREATE TRIGGER refuse_like_streak BEFORE INSERT ON user_like_streaks
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected like failure');
+                END;
+                "#,
+            )
+            .unwrap();
+        assert!(handle_incoming_like(None, &state, &ev).is_empty());
+
+        // 失败不等于丢失：意图已在账本中持久化（含重试计数）
+        let pending = state.test_checkin().list_pending_like_intents(10).unwrap();
+        assert_eq!(pending.len(), 1, "失败后必须恰有一条待补意图: {:?}", pending);
+        assert_eq!(pending[0].uid, "like_backfill");
+        assert_eq!(pending[0].like_count, 30);
+        assert_eq!(pending[0].msg_id.as_deref(), Some("like_backfill_msg_1"));
+        assert_eq!(pending[0].retry_count, 1, "结算失败必须记一次重试计数");
+        assert_eq!(
+            state
+                .test_checkin()
+                .get_daily_like_total("like_backfill", today),
+            None,
+            "失败事件不得入账"
+        );
+
+        // 故障解除：补偿扫描器重放 → 自动补记入账（keep_receipt=true → done 凭证）
+        state
+            .test_checkin()
+            .inject_sql_for_test("DROP TRIGGER IF EXISTS refuse_like_streak;")
+            .unwrap();
+        replay_pending_likes(&state, None);
+        assert_eq!(
+            state
+                .test_checkin()
+                .get_daily_like_total("like_backfill", today),
+            Some(30),
+            "补偿重放后当日点赞应如实入账"
+        );
+        assert_eq!(state.test_checkin().get_cards("like_backfill").card_count, 1);
+        assert!(
+            state
+                .test_checkin()
+                .list_pending_like_intents(10)
+                .unwrap()
+                .is_empty(),
+            "补账后不得残留 pending 行"
+        );
+
+        // 补账后同一事件重投：stage 命中 done 凭证行，settle 静默跳过，不得双计
+        assert!(handle_incoming_like(None, &state, &ev).is_empty());
+        assert_eq!(
+            state
+                .test_checkin()
+                .get_daily_like_total("like_backfill", today),
+            Some(30),
+            "补账后的重投不得二次累加"
+        );
+        println!("[PASS] test_like_failure_persists_intent_and_backfills passed");
+    }
+
+    /// D3：失败 → 服务端重投（扫描器未跑）→ 命中同一意图行单计入账，账本无残留
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_like_failure_then_redelivery_settles_pending() {
+        let state = AppState::new_test();
+        let today = chrono::Local::now().date_naive();
+        let now_ts = chrono::Utc::now().timestamp();
+        let ev = bilibili::LikeEvent {
+            uid: "like_restay".into(),
+            username: "重投水友".into(),
+            msg_id: "like_restay_msg_1".into(),
+            like_count: 5,
+            timestamp: now_ts,
+        };
+
+        state
+            .test_checkin()
+            .inject_sql_for_test(
+                r#"
+                CREATE TRIGGER refuse_like_streak BEFORE INSERT ON user_like_streaks
+                BEGIN
+                    SELECT RAISE(ABORT, 'injected like failure');
+                END;
+                "#,
+            )
+            .unwrap();
+        assert!(handle_incoming_like(None, &state, &ev).is_empty());
+        assert_eq!(
+            state
+                .test_checkin()
+                .list_pending_like_intents(10)
+                .unwrap()
+                .len(),
+            1,
+            "失败后意图必须留在账本中"
+        );
+
+        // 解除故障后重投（不跑扫描器）：stage 复用 pending 行，settle 入账并销账
+        state
+            .test_checkin()
+            .inject_sql_for_test("DROP TRIGGER IF EXISTS refuse_like_streak;")
+            .unwrap();
+        let _ = handle_incoming_like(None, &state, &ev);
+        assert_eq!(
+            state
+                .test_checkin()
+                .get_daily_like_total("like_restay", today),
+            Some(5),
+            "重投应命中同一意图行并单计入账"
+        );
+        assert!(
+            state
+                .test_checkin()
+                .list_pending_like_intents(10)
+                .unwrap()
+                .is_empty(),
+            "重投结算后账本不得残留"
+        );
+
+        // 再次重投：预留已确认占用，Duplicate 拦截，不得重复累计
+        let _ = handle_incoming_like(None, &state, &ev);
+        assert_eq!(
+            state
+                .test_checkin()
+                .get_daily_like_total("like_restay", today),
+            Some(5)
+        );
+        println!("[PASS] test_like_failure_then_redelivery_settles_pending passed");
     }
 
     /// D3：空 msg_id 不得伪造唯一键 —— 合法的多次点赞都要各自入账

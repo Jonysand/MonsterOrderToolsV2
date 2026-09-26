@@ -97,6 +97,38 @@ pub struct LikeRewards {
     pub daily_total: i32,
 }
 
+/// 点赞意图（pending_like_rewards 行）结算结果。
+/// 行不存在或已是 done 凭证都返回 `AlreadySettled`：该事件已入过账，调用方必须静默跳过，
+/// 这是「扫描器补账 × 服务端重投」防双计的互斥裁判。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettleOutcome {
+    /// 本次完成了入账
+    Settled(LikeRewards),
+    /// 已结算过（无行可处理或命中已办凭证），不得重复入账
+    AlreadySettled,
+}
+
+/// 待补点赞意图行（补偿扫描用，不含 SQL 错误原文之外的敏感信息）
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingLikeIntent {
+    pub id: i64,
+    pub uid: String,
+    pub username: Option<String>,
+    pub msg_id: Option<String>,
+    /// YYYYMMDD 整数（事件发生日，补账按此日期结算）
+    pub like_date: i32,
+    pub like_count: i32,
+    pub retry_count: i32,
+    pub last_error: Option<String>,
+}
+
+/// 补偿重试上限：达到后该意图标记为 abandoned 并保留记录（不删除、不重放）
+pub const LIKE_MAX_RETRIES: i32 = 20;
+/// 已办凭证（done 行）保留期：只为拦截补账后的服务端重投，过期清理防账本无限增长
+pub const LIKE_DONE_RECEIPT_RETENTION_SECS: i64 = 7 * 24 * 3600;
+/// 已办凭证的 last_error 标记值
+pub const LIKE_INTENT_ABANDONED: &str = "abandoned";
+
 /// 常规打卡的完整结果：档案 + "本次是否属于重复打卡"的内部判定。
 ///
 /// 判定与 upsert 在同一事务内的同一条连接上完成，调用方不再需要在事务外先猜重复再决定文案。
@@ -468,7 +500,8 @@ impl CheckinManager {
     }
 
     /// 建表语句与原工程 captain_profiles.db 完全一致（表名/列名/可空性/默认值逐一对齐），
-    /// 老库直接可用；除 V2 专用的补签幂等表外不创建原工程没有的表
+    /// 老库直接可用；V2 专用表共两张：补签指令幂等表 processed_retro_commands、
+    /// 点赞补偿意图账本 pending_like_rewards，其余不创建原工程没有的表
     fn init_schema(&self) -> Result<(), String> {
         let mut conn = self.conn.lock().unwrap();
         // 建表与缺列迁移放在同一事务：中途失败整体回滚，不留下"建了一半"的库
@@ -532,6 +565,30 @@ impl CheckinManager {
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (uid, msg_id)
             );
+
+            -- V2 专用点赞补偿意图账本（D3，原工程五张业务表之外新增的第二张表）。
+            -- 用途：点赞入账前先把「打算入账」的意图持久化（T1 单独提交），
+            -- 入账与销账在同一事务（T2）提交：失败整体回滚则行保留，由补偿扫描器重放；
+            -- status='done' 为已办凭证：扫描器补账成功后行不删，拦截同一事件此后的
+            -- 服务端重投（其 stage 命中该行、settle 读到 done 即跳过），防止双计入账。
+            -- msg_id 允许为空：空 msg_id 事件本就不参与去重（NoKey），每次新建行；
+            -- 非空 msg_id 用条件唯一索引 (uid, msg_id) 去重，done 凭证行同样占键。
+            CREATE TABLE IF NOT EXISTS pending_like_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL,
+                username TEXT,
+                msg_id TEXT,
+                like_date INTEGER NOT NULL,
+                like_count INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_like_msg_id
+                ON pending_like_rewards(uid, msg_id)
+                WHERE msg_id IS NOT NULL AND msg_id <> '';
             "#,
         )
         .map_err(|e| e.to_string())?;
@@ -836,10 +893,10 @@ impl CheckinManager {
     /// 规则 2：自然周内首次「当日点赞累计」达 30 次，奖励 1 张补签卡（每周限领 1 次）
     /// 返回两条规则的触发情况（供 C3 分别播报）
     ///
-    /// 整个事件在同一 `IMMEDIATE` 事务内完成：本日点赞累加 → 连续天数与第 7 天奖卡及标记 →
-    /// 自然周 30 赞判定、周标记与卡数。任一 SQL 或提交失败则整体回滚，
-    /// 因此不会出现"卡已发、领取标记没保存"从而重复发卡的情况。
-    /// 卡数与其对应的领取标记**总是**共同成败。
+    /// 不含意图账本（不做 stage/settle）：仅供无 msg_id 上下文的直接入账与测试使用；
+    /// WS 实时点赞链路与补偿重放一律走 `stage_like_intent` → `settle_like_intent`，
+    /// 由账本行状态防双计。整个事件在同一 `IMMEDIATE` 事务内完成，任一 SQL 或提交
+    /// 失败则整体回滚，卡数与其对应的领取标记**总是**共同成败。
     pub fn add_likes(
         &self,
         uid: &str,
@@ -851,35 +908,122 @@ impl CheckinManager {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("开启点赞事务失败: {}", e))?;
+        let rewards = Self::add_likes_in_tx(&tx, uid, likes, date)?;
+        // 提交成功后才把奖励结果交回调用方：调用方据此 emit / 入 TTS 队列
+        tx.commit().map_err(|e| format!("提交点赞事务失败: {}", e))?;
+        Ok(rewards)
+    }
+
+    /// 点赞入账核心（不含事务管理）：当日累计 → 连击倒推与连击卡 → 周首破 30 卡。
+    /// 由 `add_likes`（直接入账）与 `settle_like_intent`（账本结算/重放）共用，避免两份实现漂移。
+    ///
+    /// **D3/A-1 连击算法偏离声明**：原工程与 V2 早期实现按事件流**增量**维护连续天数
+    /// （次日 +1、断档归 1），写库失败一天就会把已攒的连击清零，且补账历史日期会造成
+    /// 二次错位（游标倒退、连击再次归 1）。现改为与打卡侧 `internal_calc_continuous`
+    /// 同思路的**倒推**算法：从 user_daily_likes 日期集合的最新日往回数连续段。
+    /// 正常有序场景结果与增量算法完全一致；补账后连击自动修复，与重放顺序无关。
+    /// 连击卡判定随之从「current_streak % 7 == 0」改为「距上次发卡日连续点赞满 7 天
+    /// 发一张」——`streak_reward_issued` 的既有存储值就是上次发卡日，老库零迁移兼容；
+    /// 有序场景两者等价，补账场景（倒推值已越过里程碑）下仍能正确补发。
+    fn add_likes_in_tx(
+        conn: &Connection,
+        uid: &str,
+        likes: i32,
+        date: NaiveDate,
+    ) -> Result<LikeRewards, String> {
         let date_int = Self::date_to_int(date);
         let mut rewards = LikeRewards::default();
 
-        // 1. 规则 1：连续 7 天点赞奖励
-        let streak_row: Option<(i32, i32, i32)> = query_optional(
-            &tx,
-            "SELECT current_streak, last_like_date, streak_reward_issued FROM user_like_streaks WHERE uid = ?1",
-            params![uid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .map_err(|e| format!("读取连续点赞记录失败: {}", e))?;
+        // 1. 当日累计（先写入：倒推集合与 30 赞阈值都需要包含本次）
+        conn.execute(
+            r#"
+            INSERT INTO user_daily_likes (uid, like_date, total_likes)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(uid, like_date) DO UPDATE SET
+                total_likes = total_likes + ?3
+            "#,
+            params![uid, date_int, likes],
+        ).map_err(|e| format!("累加当日点赞失败: {}", e))?;
 
-        let (mut current_streak, last_like_date, mut streak_reward_issued) = streak_row.unwrap_or((0, 0, 0));
-        let last_date_opt = Self::int_to_date(last_like_date);
+        let total_likes: i32 = conn
+            .query_row(
+                "SELECT total_likes FROM user_daily_likes WHERE uid = ?1 AND like_date = ?2",
+                params![uid, date_int],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("读取当日点赞累计失败: {}", e))?;
 
-        if let Some(ld) = last_date_opt {
-            if date == ld + Duration::days(1) {
-                current_streak += 1;
-            } else if date != ld {
-                current_streak = 1;
+        // 2. 倒推连击（A-1）：日期集合最新日往回数连续段；last_like_date 取集合最新日
+        //    （补账历史日期时不得让游标倒退到历史值）
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT like_date FROM user_daily_likes WHERE uid = ?1 ORDER BY like_date DESC",
+            )
+            .map_err(|e| format!("读取点赞日期集合失败: {}", e))?;
+        let rows = stmt
+            .query_map(params![uid], |row| row.get::<_, i32>(0))
+            .map_err(|e| format!("读取点赞日期集合失败: {}", e))?;
+        let mut dates: Vec<NaiveDate> = Vec::new();
+        let mut date_set: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        for r in rows {
+            if let Ok(d_int) = r {
+                date_set.insert(d_int);
+                if let Some(d) = Self::int_to_date(d_int) {
+                    dates.push(d);
+                }
             }
-        } else {
-            current_streak = 1;
+        }
+        let mut current_streak = 0i32;
+        let mut prev: Option<NaiveDate> = None;
+        for d in &dates {
+            match prev {
+                None => current_streak = 1,
+                Some(p) => {
+                    if *d + Duration::days(1) == p {
+                        current_streak += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            prev = Some(*d);
+        }
+        // upsert 已写入本次日期，集合必非空；防御空集合时按首日连击 1 处理
+        let current_streak = current_streak.max(1);
+        let last_like_date = dates
+            .first()
+            .map(|d| Self::date_to_int(*d))
+            .unwrap_or(date_int);
+
+        // 3. 连击卡：从本次点赞日往回数连续点赞天数，数到上次发卡日为止，满 7 发一张。
+        //    同日重复结算时游标起点即发卡日，窗口长度为 0，天然防重发
+        let mut streak_reward_issued: i32 = query_optional(
+            conn,
+            "SELECT streak_reward_issued FROM user_like_streaks WHERE uid = ?1",
+            params![uid],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("读取连续点赞记录失败: {}", e))?
+        .unwrap_or(0);
+
+        let mut since_reward = 0i32;
+        let mut cursor = date;
+        loop {
+            let cursor_int = Self::date_to_int(cursor);
+            if streak_reward_issued > 0 && cursor_int == streak_reward_issued {
+                break; // 数到上次发卡日为止
+            }
+            if !date_set.contains(&cursor_int) {
+                break; // 连续段断档
+            }
+            since_reward += 1;
+            cursor = cursor - Duration::days(1);
         }
 
-        if current_streak >= 7 && (current_streak % 7) == 0 && streak_reward_issued != date_int {
+        if since_reward >= 7 {
             streak_reward_issued = date_int;
             rewards.streak_reward = true;
-            tx.execute(
+            conn.execute(
                 r#"
                 INSERT INTO retroactive_cards (uid, card_count, total_earned, weekly_first_claimed, last_earned_date)
                 VALUES (?1, 1, 1, 0, ?2)
@@ -893,7 +1037,7 @@ impl CheckinManager {
         }
 
         // 连赞标记与卡数在同一事务提交：标记写失败时上面的加卡会一起回滚
-        tx.execute(
+        conn.execute(
             r#"
             INSERT INTO user_like_streaks (uid, current_streak, last_like_date, streak_reward_issued)
             VALUES (?1, ?2, ?3, ?4)
@@ -902,33 +1046,16 @@ impl CheckinManager {
                 last_like_date = ?3,
                 streak_reward_issued = ?4
             "#,
-            params![uid, current_streak, date_int, streak_reward_issued],
+            params![uid, current_streak, last_like_date, streak_reward_issued],
         ).map_err(|e| format!("更新连续点赞标记失败: {}", e))?;
 
-        // 2. 规则 2：自然周内首次「当日点赞累计」达 30 奖卡（每周限 1 张）
-        //    与原子工程语义一致：阈值比较的是当日累计（user_daily_likes），而非周累计。
-        tx.execute(
-            r#"
-            INSERT INTO user_daily_likes (uid, like_date, total_likes)
-            VALUES (?1, ?2, ?3)
-            ON CONFLICT(uid, like_date) DO UPDATE SET
-                total_likes = total_likes + ?3
-            "#,
-            params![uid, date_int, likes],
-        ).map_err(|e| format!("累加当日点赞失败: {}", e))?;
-
-        let total_likes: i32 = tx
-            .query_row(
-                "SELECT total_likes FROM user_daily_likes WHERE uid = ?1 AND like_date = ?2",
-                params![uid, date_int],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("读取当日点赞累计失败: {}", e))?;
-
+        // 4. 周卡：自然周内首次「当日点赞累计」达 30 奖卡（每周限 1 张）。
+        //    与原子工程语义一致：阈值比较当日累计（user_daily_likes），而非周累计；
+        //    周起始按事件发生日取（补账历史日期按「按事件发生日结算」口径可追发上一自然周的卡）
         let week_start = Self::get_week_start_date(date);
         // 周首破标记存于 weekly_first_claimed（与原工程 RetroactiveCheckInModule::IssueWeeklyFirstReward 一致）
         let weekly_first_claimed: i32 = query_optional(
-            &tx,
+            conn,
             "SELECT weekly_first_claimed FROM retroactive_cards WHERE uid = ?1",
             params![uid],
             |row| row.get(0),
@@ -937,7 +1064,7 @@ impl CheckinManager {
         .unwrap_or(0);
 
         if total_likes >= 30 && weekly_first_claimed != week_start {
-            tx.execute(
+            conn.execute(
                 r#"
                 INSERT INTO retroactive_cards (uid, card_count, total_earned, weekly_first_claimed, last_earned_date)
                 VALUES (?1, 1, 1, ?2, ?3)
@@ -954,9 +1081,218 @@ impl CheckinManager {
         }
 
         rewards.daily_total = total_likes;
-        // 提交成功后才把奖励结果交回调用方：调用方据此 emit / 入 TTS 队列
-        tx.commit().map_err(|e| format!("提交点赞事务失败: {}", e))?;
         Ok(rewards)
+    }
+
+    /// 意图落库（T1）：把「这次点赞打算入账」先持久化，独立事务单独提交。
+    /// 返回意图行 id（可能复用既有行）。T1 失败意味着数据库整体不可写，调用方按
+    /// 「无法持久化」路径处理（此时任何方案都无法留痕，属必须接受的边界）。
+    ///
+    /// 非空 msg_id：同 (uid, msg_id) 已有行（此前失败残留的 pending，或扫描器补账
+    /// 留下的 done 凭证）时不再新插，返回该行 id —— 后续 settle 据 status 决定入账
+    /// 或跳过，天然防双计。空 msg_id：事件本就不参与去重（NoKey），每次新建意图行。
+    pub fn stage_like_intent(
+        &self,
+        uid: &str,
+        username: &str,
+        msg_id: &str,
+        like_count: i32,
+        date: NaiveDate,
+    ) -> Result<i64, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("开启点赞意图事务失败: {}", e))?;
+        let key = msg_id.trim();
+        let now = Utc::now().timestamp_millis();
+
+        if !key.is_empty() {
+            let existing: Option<i64> = query_optional(
+                &tx,
+                "SELECT id FROM pending_like_rewards WHERE uid = ?1 AND msg_id = ?2",
+                params![uid, key],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("查询点赞意图失败: {}", e))?;
+            if let Some(id) = existing {
+                // 复用既有行：无写入，事务随 drop 回滚即可
+                return Ok(id);
+            }
+        }
+
+        tx.execute(
+            r#"
+            INSERT INTO pending_like_rewards (uid, username, msg_id, like_date, like_count, created_at, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')
+            "#,
+            params![
+                uid,
+                username,
+                if key.is_empty() { None } else { Some(key) },
+                Self::date_to_int(date),
+                like_count,
+                now
+            ],
+        )
+        .map_err(|e| format!("写入点赞意图失败: {}", e))?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(|e| format!("提交点赞意图事务失败: {}", e))?;
+        Ok(id)
+    }
+
+    /// 结算一条点赞意图（T2）：入账核心与账本收尾在同一 `IMMEDIATE` 事务内，
+    /// 提交成功则「入账 + 销账」原子生效；任一失败整体回滚，账本行保留待下次重放。
+    ///
+    /// 实时链路与补偿扫描器共用本函数，行状态充当互斥裁判：
+    /// - 行不存在或 status='done'（已办凭证）→ `AlreadySettled`，调用方必须静默跳过；
+    /// - keep_receipt=false（实时路径）→ 成功后删除行（普通点赞不留凭证）；
+    /// - keep_receipt=true（扫描器补账）→ 成功后行转 done 保留，作为「已补账」凭证
+    ///   拦截同一事件此后的服务端重投（其 stage 命中该行，settle 读到 done 跳过）。
+    pub fn settle_like_intent(&self, id: i64, keep_receipt: bool) -> Result<SettleOutcome, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("开启点赞结算事务失败: {}", e))?;
+
+        let row: Option<(String, i32, i32, String)> = query_optional(
+            &tx,
+            "SELECT uid, like_date, like_count, status FROM pending_like_rewards WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .map_err(|e| format!("读取点赞意图失败: {}", e))?;
+
+        let Some((uid, like_date_int, like_count, status)) = row else {
+            // 已被另一处理者结算并删行（实时路径收尾为 DELETE）
+            return Ok(SettleOutcome::AlreadySettled);
+        };
+        if status != "pending" {
+            // 已办凭证：该事件此前已由扫描器补账，重投不得再次入账
+            return Ok(SettleOutcome::AlreadySettled);
+        }
+        let Some(like_date) = Self::int_to_date(like_date_int) else {
+            return Err(format!("点赞意图日期非法: {}", like_date_int));
+        };
+
+        let rewards = Self::add_likes_in_tx(&tx, &uid, like_count, like_date)?;
+
+        if keep_receipt {
+            tx.execute(
+                "UPDATE pending_like_rewards SET status = 'done', last_error = NULL WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| format!("更新点赞意图凭证状态失败: {}", e))?;
+        } else {
+            tx.execute(
+                "DELETE FROM pending_like_rewards WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| format!("销账点赞意图失败: {}", e))?;
+        }
+
+        tx.commit().map_err(|e| format!("提交点赞结算事务失败: {}", e))?;
+        Ok(SettleOutcome::Settled(rewards))
+    }
+
+    /// 记账本行的重试次数与错误摘要（独立小事务，best-effort：失败仅记日志不影响主流程）。
+    /// 只对仍处 pending 的行生效；错误摘要取自 SQL 环节文案（不含昵称/uid 等业务内容）。
+    pub fn bump_like_intent_failure(&self, id: i64, err_summary: &str) {
+        let conn = self.conn.lock().unwrap();
+        if let Err(e) = conn.execute(
+            "UPDATE pending_like_rewards SET retry_count = retry_count + 1, last_error = ?2 WHERE id = ?1 AND status = 'pending'",
+            params![id, err_summary],
+        ) {
+            crate::log_warn!("[Checkin] 点赞意图重试计数更新失败（id={}）: {}", id, e);
+        }
+    }
+
+    /// 列出待补点赞意图（按行 id 序 = 失败发生序，先丢的先补）。
+    /// 已标记放弃（last_error='abandoned'）的行**不再进入自动重放**但记录保留；
+    /// 显式按 id 调用 `settle_like_intent` 仍是人工恢复通道。
+    pub fn list_pending_like_intents(&self, limit: i64) -> Result<Vec<PendingLikeIntent>, String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, uid, username, msg_id, like_date, like_count, retry_count, last_error
+                 FROM pending_like_rewards
+                 WHERE status = 'pending' AND (last_error IS NULL OR last_error <> ?2)
+                 ORDER BY id LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![limit, LIKE_INTENT_ABANDONED], |row| {
+                Ok(PendingLikeIntent {
+                    id: row.get(0)?,
+                    uid: row.get(1)?,
+                    username: row.get(2)?,
+                    msg_id: row.get(3)?,
+                    like_date: row.get(4)?,
+                    like_count: row.get(5)?,
+                    retry_count: row.get(6)?,
+                    last_error: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// 把重试次数达到上限的意图行标记为放弃（**保留记录不删除**，删除等于丢失不可追溯），
+    /// 返回本次新标记的行；再次调用对已标记行返回空，保证「只提示一次」。
+    pub fn abandon_stale_like_intents(
+        &self,
+        max_retries: i32,
+    ) -> Result<Vec<PendingLikeIntent>, String> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, uid, username, msg_id, like_date, like_count, retry_count, last_error
+                 FROM pending_like_rewards
+                 WHERE status = 'pending' AND retry_count >= ?1
+                   AND (last_error IS NULL OR last_error <> ?2)
+                 ORDER BY id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![max_retries, LIKE_INTENT_ABANDONED], |row| {
+                Ok(PendingLikeIntent {
+                    id: row.get(0)?,
+                    uid: row.get(1)?,
+                    username: row.get(2)?,
+                    msg_id: row.get(3)?,
+                    like_date: row.get(4)?,
+                    like_count: row.get(5)?,
+                    retry_count: row.get(6)?,
+                    last_error: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut result = Vec::new();
+        for r in rows {
+            result.push(r.map_err(|e| e.to_string())?);
+        }
+        drop(stmt);
+        for row in &result {
+            tx.execute(
+                "UPDATE pending_like_rewards SET last_error = ?2 WHERE id = ?1",
+                params![row.id, LIKE_INTENT_ABANDONED],
+            )
+            .map_err(|e| format!("标记点赞意图放弃失败: {}", e))?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    /// 清理超过保留期的已办凭证行（done）。凭证只为拦截补账后的服务端重投，
+    /// 重投窗口有限，过期删除防止账本随事件量增长（pending 行不受影响）。
+    pub fn cleanup_done_like_intents(&self, retention_secs: i64) -> Result<usize, String> {
+        let cutoff = Utc::now().timestamp_millis() - retention_secs * 1000;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending_like_rewards WHERE status = 'done' AND created_at < ?1",
+            params![cutoff],
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// 读取连续点赞数据（行不存在返回 None，用于区分“无记录”与“有记录但为 0”）
@@ -1991,6 +2327,37 @@ mod tests {
         crate::paths::find_resource("captain_profiles.db")
     }
 
+    /// 迁移白名单断言：原表（除 retroactive_cards 仅追加列）结构逐字不变、不得删除，
+    /// 新增表必须恰为声明的两张 V2 专用表（按表名白名单，不用「数量 +N」的脆断言；
+    /// 将来新增第三张 V2 表时只需扩这里的白名单）
+    fn assert_migration_whitelist(before: &[(String, String)], after: &[(String, String)]) {
+        let after_map: std::collections::HashMap<&str, &str> =
+            after.iter().map(|(n, s)| (n.as_str(), s.as_str())).collect();
+        for (name, sql_before) in before.iter() {
+            let Some(sql_after) = after_map.get(name.as_str()) else {
+                panic!("原表 {} 不得被删除", name);
+            };
+            if name == "retroactive_cards" {
+                continue; // 该表仅追加列，CREATE 语句必然变化
+            }
+            assert_eq!(sql_before, sql_after, "表 {} 结构不得变更", name);
+        }
+        let before_names: std::collections::HashSet<&str> =
+            before.iter().map(|(n, _)| n.as_str()).collect();
+        let mut added: Vec<&str> = after
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| !before_names.contains(n))
+            .collect();
+        added.sort_unstable();
+        assert_eq!(
+            added,
+            vec!["pending_like_rewards", "processed_retro_commands"],
+            "新增表必须恰为声明的两张 V2 专用表，实际: {:?}",
+            added
+        );
+    }
+
     #[test]
     fn test_open_legacy_captain_profiles_db() {
         let temp_dir = std::env::temp_dir().join("mh_test_legacy_db");
@@ -2037,7 +2404,7 @@ mod tests {
         assert_eq!(mgr.grant_card("old_u", 1).unwrap(), 4);
 
         // 关键断言：迁移后 retroactive_cards 拥有 weekly_first_claimed；
-        // 原五张业务表结构逐字不变，只允许新增一张声明的 V2 补签幂等表
+        // 原五张业务表结构逐字不变，新增表按白名单口径断言恰为声明的两张 V2 专用表
         {
             let conn = Connection::open(&path).unwrap();
             assert!(
@@ -2045,28 +2412,8 @@ mod tests {
                 "老库应被追加 weekly_first_claimed 列"
             );
             let after = schema_snapshot(&conn);
-            assert_eq!(
-                after.len(),
-                before_schema.len() + 1,
-                "只允许新增一张 V2 专用表，原有表不得增删"
-            );
             // 按表名比对原五张表（新表插入排序后下标会错位，不能用 zip）
-            let after_map: std::collections::HashMap<String, String> = after.iter().cloned().collect();
-            for (name, sql_before) in before_schema.iter() {
-                let Some(sql_after) = after_map.get(name) else {
-                    panic!("原表 {} 不得被删除", name);
-                };
-                if name == "retroactive_cards" {
-                    continue; // 该表仅追加列，CREATE 语句必然变化
-                }
-                assert_eq!(sql_before, sql_after, "表 {} 结构不得变更", name);
-            }
-            let names: Vec<String> = after.iter().map(|(n, _)| n.clone()).collect();
-            assert!(
-                names.iter().any(|n| n == "processed_retro_commands"),
-                "新增的表必须是补签幂等表，实际: {:?}",
-                names
-            );
+            assert_migration_whitelist(&before_schema, &after);
         }
         drop(mgr);
 
@@ -2240,7 +2587,9 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, RetroExecResult::Done { remaining_cards: 2 });
 
-        // 关键断言：迁移仅向 retroactive_cards 追加 weekly_first_claimed，其余表结构逐字不变
+        // 关键断言：迁移仅向 retroactive_cards 追加 weekly_first_claimed，其余表结构逐字不变；
+        // 新增表按白名单口径断言（此前按「迁移不得增删表」的数量断言，会被两张 V2 专用表打穿，
+        // 且真实旧库文件缺位时该断言从未被执行过，属于靠 SKIP 保持绿色）
         let after_schema = {
             let conn = Connection::open(&dst).unwrap();
             assert!(
@@ -2249,13 +2598,7 @@ mod tests {
             );
             schema_snapshot(&conn)
         };
-        assert_eq!(before_schema.len(), after_schema.len(), "迁移不得增删表");
-        for (before, after_one) in before_schema.iter().zip(after_schema.iter()) {
-            if before.0 == "retroactive_cards" {
-                continue; // 该表仅追加列，CREATE 语句必然变化
-            }
-            assert_eq!(before, after_one, "表 {} 结构不得变更", before.0);
-        }
+        assert_migration_whitelist(&before_schema, &after_schema);
         drop(mgr);
 
         // 迁移幂等：再次打开同一库不产生任何结构变化
@@ -2838,18 +3181,13 @@ mod tests {
             );
         }
 
-        // 重复打开幂等：除 retroactive_cards（仅追加列）外，其余表结构逐字不变
+        // 重复打开幂等：除 retroactive_cards（仅追加列）外，其余表结构逐字不变；
+        // 新增表按白名单口径断言（与 test_open_legacy_captain_profiles_db 同一口径）
         {
             let _ = CheckinManager::new(Some(&dst)).unwrap();
             let conn = Connection::open(&dst).unwrap();
             let after = schema_snapshot(&conn);
-            assert_eq!(before.len(), after.len(), "迁移不得增删表");
-            for (b, a) in before.iter().zip(after.iter()) {
-                if b.0 == "retroactive_cards" {
-                    continue;
-                }
-                assert_eq!(b, a, "表 {} 结构不得变更", b.0);
-            }
+            assert_migration_whitelist(&before, &after);
         }
         let _ = std::fs::remove_file(&dst);
         println!("[PASS] test_publish_db_schema_migration_on_real_legacy passed");
@@ -3509,6 +3847,406 @@ mod tests {
         assert!(!again.weekly_reward, "同一自然周限领 1 张");
         assert_eq!(mgr.get_cards("weekly_fail").card_count, 1);
         println!("[PASS] test_add_likes_rolls_back_weekly_card_failure passed");
+    }
+
+    // ---------------- D3：点赞补偿意图账本（stage/settle 状态机） ----------------
+
+    /// 统计 pending_like_rewards 行数（可按状态过滤）
+    fn count_pending_like_rows(mgr: &CheckinManager, status: Option<&str>) -> i64 {
+        let conn = mgr.conn.lock().unwrap();
+        match status {
+            Some(s) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_like_rewards WHERE status = ?1",
+                    params![s],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            None => conn
+                .query_row("SELECT COUNT(*) FROM pending_like_rewards", [], |r| r.get(0))
+                .unwrap(),
+        }
+    }
+
+    /// D3：意图落库 → 结算 → 销账的基本闭环；重复结算不得二次入账
+    #[test]
+    fn test_stage_and_settle_like_intent_basic() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+
+        let id = mgr
+            .stage_like_intent("u_pay", "补偿水友", "msg_basic_1", 12, date)
+            .unwrap();
+        assert!(id > 0);
+        assert_eq!(
+            count_pending_like_rows(&mgr, Some("pending")),
+            1,
+            "T1 后应恰有一条 pending 意图"
+        );
+
+        // 结算：入账 + 销账原子生效
+        let out = mgr.settle_like_intent(id, false).unwrap();
+        let SettleOutcome::Settled(rewards) = out else {
+            panic!("首次结算必须真正入账");
+        };
+        assert_eq!(rewards.daily_total, 12);
+        assert_eq!(mgr.get_daily_like_total("u_pay", date), Some(12));
+        assert_eq!(
+            count_pending_like_rows(&mgr, None),
+            0,
+            "实时路径结算后意图行应被删除"
+        );
+
+        // 重复结算同一 id：行已删，返回 AlreadySettled，不得二次入账
+        assert_eq!(
+            mgr.settle_like_intent(id, false).unwrap(),
+            SettleOutcome::AlreadySettled
+        );
+        assert_eq!(
+            mgr.get_daily_like_total("u_pay", date),
+            Some(12),
+            "重复结算不得重复累加"
+        );
+        println!("[PASS] test_stage_and_settle_like_intent_basic passed");
+    }
+
+    /// D3：非空 msg_id 的意图按 (uid, msg_id) 去重（失败残留行被复用，不重复留行）；
+    /// 空 msg_id 不参与去重，多次事件各自留行
+    #[test]
+    fn test_stage_like_intent_dedup_and_no_key() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+
+        let id1 = mgr
+            .stage_like_intent("u_dedup", "水友", "msg_dup", 5, date)
+            .unwrap();
+        let id2 = mgr
+            .stage_like_intent("u_dedup", "水友", "msg_dup", 5, date)
+            .unwrap();
+        assert_eq!(id1, id2, "同 (uid, msg_id) 的意图必须复用同一行");
+        assert_eq!(count_pending_like_rows(&mgr, Some("pending")), 1);
+
+        // 不同 uid 同 msg_id：不互相挡
+        let other = mgr
+            .stage_like_intent("u_other", "别人", "msg_dup", 5, date)
+            .unwrap();
+        assert_ne!(id1, other);
+
+        // 空 msg_id：每次新建行（NoKey 语义，不做唯一性伪造）
+        let e1 = mgr
+            .stage_like_intent("u_nk", "水友", "", 1, date)
+            .unwrap();
+        let e2 = mgr
+            .stage_like_intent("u_nk", "水友", "", 1, date)
+            .unwrap();
+        assert_ne!(e1, e2, "空 msg_id 的事件各自留行");
+        assert_eq!(count_pending_like_rows(&mgr, Some("pending")), 4);
+        println!("[PASS] test_stage_like_intent_dedup_and_no_key passed");
+    }
+
+    /// D3：扫描器补账成功后的 done 凭证必须拦截同一事件此后的重投（防双计的核心用例）
+    #[test]
+    fn test_settle_done_receipt_blocks_redelivery() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+
+        // 失败残留的意图由扫描器补账（keep_receipt=true → 行转 done 保留）
+        let id = mgr
+            .stage_like_intent("u_receipt", "凭证水友", "msg_rcpt", 20, date)
+            .unwrap();
+        let out = mgr.settle_like_intent(id, true).unwrap();
+        let SettleOutcome::Settled(_) = out else {
+            panic!("补账必须入账");
+        };
+        assert_eq!(mgr.get_daily_like_total("u_receipt", date), Some(20));
+        assert_eq!(
+            count_pending_like_rows(&mgr, Some("done")),
+            1,
+            "补账后应留下 done 凭证"
+        );
+        assert_eq!(count_pending_like_rows(&mgr, Some("pending")), 0);
+
+        // 服务端重投同一事件：stage 命中凭证行（不新建），settle 读到 done → 跳过
+        let redelivered = mgr
+            .stage_like_intent("u_receipt", "凭证水友", "msg_rcpt", 20, date)
+            .unwrap();
+        assert_eq!(redelivered, id, "重投的 stage 必须命中同一凭证行");
+        assert_eq!(
+            mgr.settle_like_intent(redelivered, false).unwrap(),
+            SettleOutcome::AlreadySettled,
+            "重投撞上已办凭证必须静默跳过"
+        );
+        assert_eq!(
+            mgr.get_daily_like_total("u_receipt", date),
+            Some(20),
+            "重投不得二次累加"
+        );
+        println!("[PASS] test_settle_done_receipt_blocks_redelivery passed");
+    }
+
+    /// D3/A-1：丢一天后补账，连击必须按日期集合倒推修复（而非增量二次错位）
+    #[test]
+    fn test_out_of_order_replay_recomputes_streak() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let d = |i: i64| NaiveDate::from_ymd_opt(2026, 3, 1).unwrap() + Duration::days(i);
+
+        // 第 1–4 天正常入账（连击 4）
+        for i in 0..4 {
+            mgr.add_likes("u_oos", 1, d(i)).unwrap();
+        }
+        assert_eq!(mgr.get_like_streak("u_oos").unwrap().current_streak, 4);
+
+        // 第 5 天写库失败 → 只留意图（不入账）
+        let lost = mgr
+            .stage_like_intent("u_oos", "丢赞水友", "msg_oos5", 1, d(4))
+            .unwrap();
+
+        // 第 6 天正常入账：第 5 天确实缺失，连击按真实数据只有 1 天
+        mgr.add_likes("u_oos", 1, d(5)).unwrap();
+        assert_eq!(
+            mgr.get_like_streak("u_oos").unwrap().current_streak,
+            1,
+            "第 5 天缺失期间连击应为 1（与增量口径一致）"
+        );
+
+        // 补账第 5 天：倒推集合补全 {1..6}，连击修复为 6，游标不得倒退到补账日
+        let out = mgr.settle_like_intent(lost, false).unwrap();
+        let SettleOutcome::Settled(_) = out else {
+            panic!("补账必须入账");
+        };
+        let streak = mgr.get_like_streak("u_oos").unwrap();
+        assert_eq!(streak.current_streak, 6, "补账后连击应按日期集合重算为 6");
+        assert_eq!(
+            streak.last_like_date, 20260306,
+            "游标必须是集合最新日，不得倒退到补账日"
+        );
+        assert_eq!(
+            mgr.get_daily_like_total("u_oos", d(4)),
+            Some(1),
+            "丢失那天的赞应如实补记"
+        );
+        println!("[PASS] test_out_of_order_replay_recomputes_streak passed");
+    }
+
+    /// D3/A-1：丢的恰是第 7 天（发卡日），补账时按「距上次发卡连续满 7 天」补发连击卡
+    #[test]
+    fn test_streak_reward_backfilled_on_missing_day7() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let d = |i: i64| NaiveDate::from_ymd_opt(2026, 3, 1).unwrap() + Duration::days(i);
+
+        for i in 0..6 {
+            mgr.add_likes("u_bf7", 1, d(i)).unwrap();
+        }
+        assert_eq!(mgr.get_cards("u_bf7").card_count, 0, "前 6 天不发卡");
+
+        // 第 7 天丢失只留意图；第 8 天正常入账（断链归 1，不发卡）
+        let lost7 = mgr
+            .stage_like_intent("u_bf7", "丢卡水友", "msg_bf7", 1, d(6))
+            .unwrap();
+        let r8 = mgr.add_likes("u_bf7", 1, d(7)).unwrap();
+        assert!(!r8.streak_reward, "第 8 天断链状态下不得发卡");
+        assert_eq!(mgr.get_cards("u_bf7").card_count, 0);
+
+        // 补账第 7 天：从第 7 天往回数连续 7 天（1..7），距上次发卡（无）满 7 → 补发连击卡
+        let out = mgr.settle_like_intent(lost7, false).unwrap();
+        let SettleOutcome::Settled(rewards) = out else {
+            panic!("补账必须入账");
+        };
+        assert!(rewards.streak_reward, "丢失的第 7 天补账后应补发连击卡");
+        assert_eq!(mgr.get_cards("u_bf7").card_count, 1);
+        let streak = mgr.get_like_streak("u_bf7").unwrap();
+        assert_eq!(
+            streak.streak_reward_issued, 20260307,
+            "发卡标记记在补账的事件日"
+        );
+        assert_eq!(streak.current_streak, 8, "补账后连击修复为 8 天");
+
+        // 此后第 9 天：距上次发卡（第 7 天）只有 2 天连续，不得再发
+        let r9 = mgr.add_likes("u_bf7", 1, d(8)).unwrap();
+        assert!(!r9.streak_reward);
+        println!("[PASS] test_streak_reward_backfilled_on_missing_day7 passed");
+    }
+
+    /// D3/A-1：有序场景下倒推算法与原增量算法完全等价（连击逐日 +1、第 7/14 天发卡、同日不重发）
+    #[test]
+    fn test_add_likes_streak_matches_incremental_order() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+
+        for i in 0..14i64 {
+            let d = start + Duration::days(i);
+            let r = mgr.add_likes("u_eq", 1, d).unwrap();
+            assert_eq!(
+                mgr.get_like_streak("u_eq").unwrap().current_streak,
+                (i + 1) as i32
+            );
+            assert_eq!(
+                r.streak_reward,
+                (i + 1) % 7 == 0,
+                "第 {} 天的发卡判定应与增量口径一致",
+                i + 1
+            );
+        }
+        assert_eq!(mgr.get_cards("u_eq").card_count, 2, "14 天恰发第 7、14 天两张");
+
+        // 同日重复点赞：连击不变、不重发
+        let again = mgr.add_likes("u_eq", 1, start + Duration::days(13)).unwrap();
+        assert!(!again.streak_reward);
+        assert_eq!(mgr.get_like_streak("u_eq").unwrap().current_streak, 14);
+        println!("[PASS] test_add_likes_streak_matches_incremental_order passed");
+    }
+
+    /// D3：结算失败累计 retry_count，达上限后标记放弃但**保留记录**，且只提示一次；
+    /// 放弃行退出自动重放名单，显式按 id 结算仍是恢复通道
+    #[test]
+    fn test_like_intent_retry_limit_and_abandon_once() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+        let id = mgr
+            .stage_like_intent("u_giveup", "放弃水友", "msg_giveup", 3, date)
+            .unwrap();
+
+        // 注入：当日累计写入失败 → 每次结算都失败
+        refuse_writes_on(&mgr, "user_daily_likes", "INSERT");
+        assert!(mgr.settle_like_intent(id, true).is_err());
+        mgr.bump_like_intent_failure(id, "injected failure");
+        assert_eq!(
+            count_pending_like_rows(&mgr, Some("pending")),
+            1,
+            "失败回滚后意图必须保留"
+        );
+
+        // 未达上限（retry_count = 1 < 20）：不放弃
+        assert!(mgr
+            .abandon_stale_like_intents(LIKE_MAX_RETRIES)
+            .unwrap()
+            .is_empty());
+
+        for _ in 1..LIKE_MAX_RETRIES {
+            mgr.bump_like_intent_failure(id, "injected failure");
+        }
+        // 达到上限：标记放弃、行保留、只提示一次
+        let abandoned = mgr.abandon_stale_like_intents(LIKE_MAX_RETRIES).unwrap();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].id, id);
+        assert_eq!(abandoned[0].retry_count, LIKE_MAX_RETRIES);
+        assert!(mgr
+            .abandon_stale_like_intents(LIKE_MAX_RETRIES)
+            .unwrap()
+            .is_empty(), "已放弃的行不得重复提示");
+        assert_eq!(count_pending_like_rows(&mgr, Some("pending")), 1, "放弃只做标记，记录必须保留");
+
+        // 放弃行退出自动重放名单（记录保留，不再自动重试）
+        assert!(mgr.list_pending_like_intents(100).unwrap().is_empty());
+        drop_trigger(&mgr, "refuse_user_daily_likes_INSERT");
+        // 人工按 id 显式结算仍可救回
+        let out = mgr.settle_like_intent(id, true).unwrap();
+        let SettleOutcome::Settled(_) = out else {
+            panic!("人工结算放弃行应可入账");
+        };
+        println!("[PASS] test_like_intent_retry_limit_and_abandon_once passed");
+    }
+
+    /// D3：结算中途失败的整事件回滚 —— 入账半截状态与销账都不发生，意图行保留待重放
+    #[test]
+    fn test_settle_failure_rolls_back_and_keeps_intent() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+        let id = mgr
+            .stage_like_intent("u_rb", "回滚水友", "msg_rb", 30, date)
+            .unwrap();
+
+        refuse_writes_on(&mgr, "retroactive_cards", "INSERT");
+        let err = mgr
+            .settle_like_intent(id, false)
+            .expect_err("周卡写入失败必须整体回滚");
+        assert!(err.contains("周奖卡"), "{}", err);
+        drop_trigger(&mgr, "refuse_retroactive_cards_INSERT");
+
+        assert_eq!(
+            mgr.get_daily_like_total("u_rb", date),
+            None,
+            "回滚后当日累计不得留下"
+        );
+        assert_eq!(mgr.get_cards("u_rb").card_count, 0);
+        assert_eq!(
+            count_pending_like_rows(&mgr, Some("pending")),
+            1,
+            "意图行必须保留待重放"
+        );
+
+        // 重放成功：入账 + 销账一次完成
+        let out = mgr.settle_like_intent(id, false).unwrap();
+        let SettleOutcome::Settled(rewards) = out else {
+            panic!("重放必须入账");
+        };
+        assert!(rewards.weekly_reward);
+        assert_eq!(count_pending_like_rows(&mgr, None), 0);
+        println!("[PASS] test_settle_failure_rolls_back_and_keeps_intent passed");
+    }
+
+    /// D3：意图落库自身失败（库不可写）必须传播 Err —— 这是唯一无持久化可能的边界
+    #[test]
+    fn test_stage_like_intent_failure_propagates() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+
+        refuse_writes_on(&mgr, "pending_like_rewards", "INSERT");
+        let err = mgr
+            .stage_like_intent("u_t1fail", "水友", "msg_t1", 1, date)
+            .expect_err("意图写入失败必须返回 Err");
+        assert!(err.contains("写入点赞意图失败"), "{}", err);
+        drop_trigger(&mgr, "refuse_pending_like_rewards_INSERT");
+
+        assert!(mgr
+            .stage_like_intent("u_t1fail", "水友", "msg_t1", 1, date)
+            .is_ok());
+        println!("[PASS] test_stage_like_intent_failure_propagates passed");
+    }
+
+    /// D3：done 凭证按保留期清理，过期删除、未过期保留；pending 行不受清理影响
+    #[test]
+    fn test_cleanup_done_like_intents_by_retention() {
+        let mgr = CheckinManager::new_in_memory().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 3, 20).unwrap();
+
+        let fresh = mgr
+            .stage_like_intent("u_clean", "水友", "msg_fresh", 1, date)
+            .unwrap();
+        mgr.settle_like_intent(fresh, true).unwrap();
+        let stale = mgr
+            .stage_like_intent("u_clean", "水友", "msg_stale", 1, date)
+            .unwrap();
+        mgr.settle_like_intent(stale, true).unwrap();
+        let pending = mgr
+            .stage_like_intent("u_clean", "水友", "msg_pending", 1, date)
+            .unwrap();
+        assert_eq!(count_pending_like_rows(&mgr, Some("done")), 2);
+
+        // 把其中一条凭证的 created_at 拨到保留期之外
+        mgr.inject_sql_for_test(&format!(
+            "UPDATE pending_like_rewards SET created_at = created_at - {} WHERE id = {}",
+            (LIKE_DONE_RECEIPT_RETENTION_SECS + 3600) * 1000,
+            stale
+        ))
+        .unwrap();
+
+        let removed = mgr
+            .cleanup_done_like_intents(LIKE_DONE_RECEIPT_RETENTION_SECS)
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(
+            count_pending_like_rows(&mgr, Some("done")),
+            1,
+            "未过期凭证必须保留"
+        );
+        assert_eq!(
+            count_pending_like_rows(&mgr, Some("pending")),
+            1,
+            "pending 行不受清理影响"
+        );
+        let _ = pending;
+        println!("[PASS] test_cleanup_done_like_intents_by_retention passed");
     }
 
     /// D5/I01：同一 msg_id 的补签重投只能扣一张卡、只写一条明细
