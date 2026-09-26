@@ -753,16 +753,11 @@ export const MainWindow: React.FC = () => {
       {/* 左侧功能导航栏 */}
       <aside className="w-56 bg-neutral-900/90 border-r border-neutral-800 flex flex-col justify-between p-3 shrink-0">
         <div className="space-y-4">
-          {/* Logo 与标题 */}
-          <div className="flex items-center gap-2.5 px-2 py-1">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-amber-600 to-amber-400 flex items-center justify-center shadow-lg shadow-amber-600/30">
-              <Shield className="w-5 h-5 text-neutral-950" />
-            </div>
-            <div>
-              <div className="text-xs font-bold tracking-wider text-amber-300">MonsterOrderWilds</div>
-              <div className="text-[10px] text-neutral-400 font-mono">
-                Ascendance{appVersion ? ` (v ${appVersion})` : ""}
-              </div>
+          {/* 标题 */}
+          <div className="px-2 py-1">
+            <div className="text-xs font-bold tracking-wider text-amber-300">MonsterOrderWilds</div>
+            <div className="text-[10px] text-neutral-400 font-mono">
+              Ascendance{appVersion ? ` (v ${appVersion})` : ""}
             </div>
           </div>
 
