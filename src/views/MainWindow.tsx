@@ -65,7 +65,7 @@ const QUEUE_ROW_HEIGHT = 54;
 export const MainWindow: React.FC = () => {
   const [activeTab, setActiveTab] = useState<
     "queue" | "monster" | "bili" | "gm" | "settings"
-  >("queue");
+  >("bili");
   const [queue, setQueue] = useState<QueueItem[]>([]);
   // 编译期形态常量（vite --mode lite 注入）：完整版 false / Lite 版 true，运行期不可切换
   const isLite = __IS_LITE__;
