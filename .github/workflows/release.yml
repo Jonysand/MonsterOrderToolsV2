@@ -103,18 +103,29 @@ jobs:
 
       # macos-latest 为 Apple Silicon，bundle.targets="all" 在此产出 .app + aarch64 .dmg。
       # 注：产物为 adhoc 签名（无 TeamIdentifier，未公证），用户首次打开需右键「打开」放行。
-      # 与 Windows job 同口径连产完整版与 Lite 版（tauri.conf.lite.json），dmg 通配自动收录两版
+      # 与 Windows job 同口径连产完整版与 Lite 版（tauri.conf.lite.json）。
+      # 注意：tauri-bundler 打 DMG 前会清空整个 bundle/dmg 目录（remove_dir_all 后重建），
+      # 因此 Lite 构建会删掉完整版 dmg——完整版产物必须先暂存到 bundle-staging，最后统一归集上传。
+      # （Windows 的 msi/nsis 打包无此清空行为，两版产物同目录共存，无需暂存）
       - name: 打包完整版安装包
         run: npm run tauri build
 
+      - name: 暂存完整版 DMG
+        run: |
+          mkdir -p bundle-staging
+          cp src-tauri/target/release/bundle/dmg/*.dmg bundle-staging/
+
       - name: 打包 Lite 版安装包
         run: npm run tauri build -- --features lite --config src-tauri/tauri.conf.lite.json
+
+      - name: 归集 Lite 版 DMG
+        run: cp src-tauri/target/release/bundle/dmg/*.dmg bundle-staging/
 
       - name: 上传安装包为 Actions 产物
         uses: actions/upload-artifact@v7
         with:
           name: macos-installers
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: bundle-staging/*.dmg
           if-no-files-found: error
 
       - name: 附加到 GitHub Release
@@ -127,4 +138,4 @@ jobs:
           # 同上：并行 job 下 create 可能已被另一端完成，失败不阻断
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes || true
           gh release upload "$TAG" --clobber \
-            src-tauri/target/release/bundle/dmg/*.dmg
+            bundle-staging/*.dmg
