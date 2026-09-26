@@ -22,6 +22,11 @@ import os
 import sys
 from pathlib import Path
 
+# GitHub 的英文 Windows runner stdout 默认 cp1252，中文打印会抛 UnicodeEncodeError
+# （本机中文 GBK 反而不触发）；强制 UTF-8 并兜底替换，含 import 进来的生成器打印
+for _stream in (sys.stdout, sys.stderr):
+    _stream.reconfigure(encoding="utf-8", errors="replace")
+
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
