@@ -170,8 +170,8 @@ body {
 
 .overlay-title {
   font-family: var(--font-serif);
-  font-size: 13.5px;
-  font-weight: 600;
+  font-size: 16px;
+  font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--cream);
 }
@@ -179,7 +179,7 @@ body {
 .overlay-count {
   /* 计数与顺位数字统一用 DM Serif Display（设计说明 §1.4「顺位数字」） */
   font-family: var(--font-num);
-  font-size: 11px;
+  font-size: 13px;
   color: var(--hl);
   border: 1px solid var(--line-soft);
   padding: 1px 7px;
@@ -325,16 +325,17 @@ body {
   width: 20px;
   text-align: center;
   font-family: var(--font-num);
-  font-size: 12px;
+  font-size: 14px;
+  font-weight: 600;
   letter-spacing: -0.02em;
-  color: var(--ink-faint);
+  color: var(--ink-dim);
 }
 
 .queue-nick {
   flex: none;
-  width: 110px;
-  font-size: 13.5px;
-  font-weight: 500;
+  width: 140px;
+  font-size: 19px;
+  font-weight: 700;
   color: var(--ink-dim);
 }
 
@@ -384,9 +385,9 @@ body {
   flex: 1;
   min-width: 0;
   font-family: var(--font-serif);
-  font-size: 16px;
-  /* 可变字重取 650：明显比 600 更实，同时不踩设计说明「深底浅字不上 700」的红线 */
-  font-weight: 650;
+  font-size: 21.5px;
+  /* 加粗取 750：直播画面缩放后笔画仍厚实可读（随包宋体为 100-900 可变字重） */
+  font-weight: 750;
   letter-spacing: 0.03em;
   color: var(--cream);
   filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.85));
@@ -412,7 +413,7 @@ body {
 }
 
 .queue-chip {
-  font-size: 9.5px;
+  font-size: 11px;
   padding: 2px 6px;
   border-radius: 1px;
   border: 1px solid currentColor;
@@ -455,7 +456,7 @@ body {
   right: 12px;
   top: 50%;
   transform: translateY(-50%);
-  font-size: 11px;
+  font-size: 12.5px;
   color: var(--hl);
   opacity: 0;
   transition: opacity 0.2s;
@@ -502,7 +503,7 @@ body {
   top: 50%;
   font-family: var(--font-serif);
   font-weight: 600;
-  font-size: 15px;
+  font-size: 17px;
   letter-spacing: 0.14em;
   color: var(--stamp);
   border: 2px solid var(--stamp);
@@ -685,7 +686,7 @@ body {
   background: rgba(12, 10, 8, 0.94);
   border: 1px solid var(--danger);
   color: #ffb3a3;
-  font-size: 11.5px;
+  font-size: 13px;
   transform: translateX(-50%) translateY(10px);
   opacity: 0;
   pointer-events: none;
@@ -699,7 +700,7 @@ body {
 }
 
 .queue-undo button {
-  font-size: 11.5px;
+  font-size: 13px;
   padding: 3px 10px;
   border-radius: 2px;
   cursor: pointer;
@@ -723,7 +724,7 @@ body {
   justify-content: center;
   height: 100%;
   color: var(--ink-faint);
-  font-size: 12.5px;
+  font-size: 14px;
   letter-spacing: 0.12em;
 }
 

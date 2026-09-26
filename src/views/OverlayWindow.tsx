@@ -934,7 +934,7 @@ export const OverlayWindow: React.FC = () => {
           </span>
           {locked && (
             <span
-              className="pointer-events-none flex items-center gap-0.5 text-[9px] border px-1 py-0.5 rounded-sm shrink-0"
+              className="pointer-events-none flex items-center gap-0.5 text-[10.5px] border px-1 py-0.5 rounded-sm shrink-0"
               style={{ color: "var(--hl)", borderColor: "var(--line-soft)" }}
             >
               <Lock className="w-2.5 h-2.5" /> 已锁定
@@ -952,13 +952,13 @@ export const OverlayWindow: React.FC = () => {
                     ? { color: "var(--ink-dim)" }
                     : { ...marqueeStyle, color: "var(--hl2)", fontWeight: 700 }
                 }
-                className={isDefaultMarquee ? "animate-marquee text-[11px]" : "inline-block whitespace-nowrap text-[11px]"}
+                className={isDefaultMarquee ? "animate-marquee text-[12.5px] font-medium" : "inline-block whitespace-nowrap text-[12.5px]"}
               >
                 {marqueeText}
               </span>
             </span>
             {marqueeQueue.length > 0 && (
-              <span className="text-[9px] shrink-0 font-mono" style={{ color: "var(--ink-faint)" }}>
+              <span className="text-[10.5px] shrink-0 font-mono" style={{ color: "var(--ink-faint)" }}>
                 +{marqueeQueue.length}
               </span>
             )}
@@ -1033,7 +1033,7 @@ export const OverlayWindow: React.FC = () => {
                 <span className="pointer-events-none" style={{ color: "var(--ink-dim)" }}>
                   当前排队为空
                 </span>
-                <span className="text-[10px] pointer-events-none">
+                <span className="text-[11.5px] pointer-events-none">
                   发送弹幕【点怪 怪物名】即可上榜
                 </span>
               </div>
