@@ -605,65 +605,171 @@ body {
   to { opacity: 1; transform: none; }
 }
 
-/* 完成：钤印 500ms 与离场 420ms（延迟 500ms）重叠，总时长 950ms */
+/* 完成：钤印 560ms 与离场 420ms（延迟 560ms）重叠，总时长 980ms。
+   钤印特效在面板根的 .queue-clear-fx 层播放（虚拟列表滚动容器会裁切行内上溢，
+   行内只保留内容压暗与离场），行身与特效层共用同一套下沉/离场节奏 */
 .queue-row-completing {
   pointer-events: none;
-  animation: queueRowOut 0.42s 0.5s ease forwards;
+  animation:
+    queueRowOut 0.42s 0.56s ease forwards,
+    queueStampHit 0.26s 0.24s ease-in-out;
 }
+
+.queue-row-completing .queue-sheen { display: none; }
 
 @keyframes queueRowOut {
   to { opacity: 0; transform: scale(0.97); }
 }
 
+/* 钤印落定瞬间（约 260ms 处）行身轻沉，呼应官方钤印的「デンッ」 */
+@keyframes queueStampHit {
+  0% { transform: none; }
+  40% { transform: translateY(1.5px); }
+  65% { transform: translateY(-1px); }
+  100% { transform: none; }
+}
+
+/* 钤印主体：字面 34px（原 17px 的 2.0×），块高约 63px 超出行框约 7px。
+   印面文案 QUEST CLEAR 取自系列官方原字样，走随包 DM Serif（子集已含所需字母） */
 .queue-stamp {
   position: absolute;
   left: 50%;
   top: 50%;
-  font-family: var(--font-serif);
-  font-weight: 600;
-  font-size: 17px;
-  letter-spacing: 0.14em;
+  font-family: var(--font-num);
+  font-weight: 400;
+  font-size: 34px;
+  line-height: 1.42;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
   color: var(--stamp);
-  border: 2px solid var(--stamp);
-  border-radius: 3px;
-  padding: 2px 9px;
-  background: rgba(10, 8, 6, 0.35);
-  transform: translate(-50%, -50%) rotate(-11deg) scale(2.4);
+  border: 3px solid var(--stamp);
+  border-radius: 5px;
+  padding: 3px 20px;
+  background: rgba(10, 8, 6, 0.38);
+  transform: translate(-50%, -50%) rotate(-8deg) scale(3.2);
   opacity: 0;
   pointer-events: none;
-  text-shadow: 0 0 6px rgba(224, 71, 47, 0.5);
+  text-shadow: 0 0 14px rgba(224, 71, 47, 0.55);
+  z-index: 3;
 }
 
-.queue-row-completing .queue-stamp {
-  animation: queueStampIn 0.5s cubic-bezier(0.2, 1.5, 0.4, 1) forwards;
+/* 内衬细线：复刻官方印章「外粗内细」双线框 */
+.queue-stamp::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border: 1px solid rgba(224, 71, 47, 0.55);
+  border-radius: 2px;
+  pointer-events: none;
 }
 
+/* 油墨斑驳：径向暗角让红墨略不匀，贴近实体印章 */
+.queue-stamp::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  background:
+    radial-gradient(circle at 38% 32%, rgba(224, 71, 47, 0.16), transparent 52%),
+    radial-gradient(circle at 72% 74%, rgba(0, 0, 0, 0.3), transparent 46%);
+  pointer-events: none;
+}
+
+/* 特效层挂在面板根（.queue-clear-fx），不再位于完成行内 —— 动画触发选择器随之改挂 */
+.queue-clear-fx .queue-stamp {
+  animation: queueStampIn 0.56s cubic-bezier(0.2, 1.5, 0.4, 1) forwards;
+}
+
+/* 缩砸急停 + 落定回弹：3.2× 砸至 0.94 再弹回 1 */
 @keyframes queueStampIn {
-  0% { opacity: 0; transform: translate(-50%, -50%) rotate(-11deg) scale(2.4); filter: blur(4px); }
-  60% { opacity: 1; transform: translate(-50%, -50%) rotate(-11deg) scale(1); filter: blur(0); }
-  100% { opacity: 1; transform: translate(-50%, -50%) rotate(-11deg) scale(1); }
+  0% { opacity: 0; transform: translate(-50%, -50%) rotate(-8deg) scale(3.2); filter: blur(6px); }
+  30% { opacity: 1; }
+  46% { transform: translate(-50%, -50%) rotate(-8deg) scale(0.94); filter: blur(0); }
+  62% { transform: translate(-50%, -50%) rotate(-8deg) scale(1.03); }
+  76% { transform: translate(-50%, -50%) rotate(-8deg) scale(0.99); }
+  100% { opacity: 1; transform: translate(-50%, -50%) rotate(-8deg) scale(1); }
 }
 
 .queue-ring {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
-  border: 2px solid rgba(224, 71, 47, 0.85);
+  border: 3px solid rgba(224, 71, 47, 0.85);
   transform: translate(-50%, -50%) scale(0.4);
   opacity: 0;
   pointer-events: none;
 }
 
-.queue-row-completing .queue-ring {
+.queue-clear-fx .queue-ring {
   animation: queueRingOut 0.6s 0.05s ease-out forwards;
 }
 
 @keyframes queueRingOut {
   0% { opacity: 0.9; transform: translate(-50%, -50%) scale(0.4); }
-  100% { opacity: 0; transform: translate(-50%, -50%) scale(9); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(11); }
+}
+
+/* 冲击十字光：落定一瞬的短促亮线（横竖两条，随钤印落定同步散开） */
+.queue-flare {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.queue-flare i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  background: rgba(255, 230, 200, 0.9);
+}
+
+.queue-flare i:nth-child(1) {
+  width: 150px;
+  height: 2px;
+  transform: translate(-50%, -50%);
+}
+
+.queue-flare i:nth-child(2) {
+  width: 2px;
+  height: 150px;
+  transform: translate(-50%, -50%);
+}
+
+.queue-clear-fx .queue-flare {
+  animation: queueFlareOut 0.34s 0.24s ease-out forwards;
+}
+
+@keyframes queueFlareOut {
+  0% { opacity: 0.95; transform: translate(-50%, -50%) scale(0.25) rotate(0deg); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.15) rotate(24deg); }
+}
+
+/* 钤印期间行内容让位压暗：朱印成为唯一主角
+   （sheen 完成行内已隐藏，queue-hint 保持隐形不得被点亮） */
+.queue-row-completing > :not(.queue-sheen):not(.queue-hint) {
+  opacity: 0.38;
+  filter: saturate(0.55);
+  transition: opacity 0.3s 0.12s, filter 0.3s 0.12s;
+}
+
+/* 钤印特效层：面板根直挂、矩形对齐完成行，播放期间为悬浮窗最上层
+   （顶栏 z2 / 拖拽浮起 z30 / 业务气泡 z50 之上）。
+   行身下沉与离场和完成行同曲线同时点，钤印与行同步沉、同步淡出 */
+.queue-clear-fx {
+  position: absolute;
+  z-index: 60;
+  pointer-events: none;
+  animation:
+    queueRowOut 0.42s 0.56s ease forwards,
+    queueStampHit 0.26s 0.24s ease-in-out;
 }
 
 /* 装饰动效：默认关闭，设置开启后挂载（data-decor="on"） */
@@ -862,8 +968,9 @@ body {
     transition: none !important;
   }
 
-  /* 离场动画被禁用时立即呈现终态，避免行残留 */
-  .queue-row-completing {
+  /* 离场动画被禁用时立即呈现终态，避免行残留（特效层同样直接隐藏） */
+  .queue-row-completing,
+  .queue-clear-fx {
     opacity: 0;
   }
 }

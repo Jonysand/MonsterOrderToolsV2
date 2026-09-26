@@ -29,8 +29,8 @@ const MAX_BUBBLES = 5;
 const BUBBLE_TTL_MS = 15000;
 /** 虚拟列表行高：条目 56 + 间距 4（对齐原工程 ListViewItem Height=60） */
 const QUEUE_ROW_HEIGHT = 60;
-/** 完成动效总时长：钤印 500ms 与离场 420ms（延迟 500ms）重叠 */
-const COMPLETE_ANIM_MS = 950;
+/** 完成动效总时长：钤印 560ms 与离场 420ms（延迟 560ms）重叠 */
+const COMPLETE_ANIM_MS = 980;
 /** 撤销垫保留时长 */
 const UNDO_TTL_MS = 5200;
 
@@ -58,6 +58,8 @@ interface GhostRow {
   item: QueueItem;
   /** 完成时在渲染列表中的下标，合并时按下标插回原位 */
   index: number;
+  /** 完成时行的面板坐标：钤印特效层挂在面板根（虚拟列表滚动容器会裁切行内上溢），按此定位 */
+  rect: { left: number; top: number; width: number; height: number };
 }
 
 interface UndoRecord {
@@ -725,15 +727,18 @@ export const OverlayWindow: React.FC = () => {
     if (el && geom) el.style.transform = `translate3d(0, ${geom.y}px, 0)`;
   });
 
-  /** 完成一单：整行点击 → 钤印 → 离场，可撤销 */
-  const handleComplete = (item: QueueItem, index: number) => {
+  /** 完成一单：整行点击 → 钤印 → 离场，可撤销。
+   *  钤印特效不渲染在行内：虚拟列表滚动容器 overflow-y:auto 必裁行内上溢内容，
+   *  第一行的 2× 印面会被列表顶边裁掉 —— 特效层挂面板根（见渲染处 queue-clear-fx），
+   *  此处只捕获行完成瞬间的面板坐标 */
+  const handleComplete = (item: QueueItem, index: number, rect: GhostRow["rect"]) => {
     if (locked) return;
     if (completingRef.current.has(item.user_id)) return; // 行级锁：连点同一行只删一次
 
     completingRef.current.add(item.user_id);
     // 乐观移除 + 幽灵行插回原位：同一 key 就地复用 DOM，动画不会被打断。
     // 此处只改本地渲染 state，authoritativeRef 保持后端权威快照，等命令回执再更新
-    setGhosts((prev) => [...prev, { item, index }]);
+    setGhosts((prev) => [...prev, { item, index, rect }]);
     setQueue((prev) => prev.filter((i) => i.user_id !== item.user_id));
 
     // 串行链保证回执按序到达；版本检查会丢弃任何迟到的旧快照
@@ -803,8 +808,10 @@ export const OverlayWindow: React.FC = () => {
     </span>
   );
 
-  /** 行内容：列表行与浮起条目共用（浮起层 pointer-events: none，事件不会触发） */
-  const renderRowBody = (item: QueueItem, seq: number, ghost: boolean) => (
+  /** 行内容：列表行与浮起条目共用（浮起层 pointer-events: none，事件不会触发）。
+   *  钤印特效（环/十字光/印面）不在行内渲染 —— 列表滚动容器裁切行内上溢，
+   *  统一由面板根的 .queue-clear-fx 特效层承载 */
+  const renderRowBody = (item: QueueItem, seq: number) => (
     <>
       <span className="queue-spine" />
       <span className="queue-corner tl" />
@@ -854,15 +861,20 @@ export const OverlayWindow: React.FC = () => {
 
       <span className="queue-hint">点击完成</span>
       <span className="queue-sheen" />
-
-      {ghost && (
-        <>
-          <span className="queue-ring" />
-          <span className="queue-stamp">討伐完了</span>
-        </>
-      )}
     </>
   );
+
+  /** 行内容的面板坐标（面板与根容器同尺寸，差值即相对面板原点的偏移） */
+  const rowRectInPanel = (el: HTMLElement) => {
+    const panel = rootRef.current?.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    return {
+      left: r.left - (panel?.left ?? 0),
+      top: r.top - (panel?.top ?? 0),
+      width: r.width,
+      height: r.height,
+    };
+  };
 
   const renderQueueRow = (row: RenderRow, idx: number) => {
     const { item, ghost } = row;
@@ -881,9 +893,9 @@ export const OverlayWindow: React.FC = () => {
         data-priority={item.is_priority ? "1" : "0"}
         data-uid={item.user_id}
         data-no-window-drag
-        onClick={placeholder ? undefined : () => handleComplete(item, idx)}
+        onClick={placeholder ? undefined : (e) => handleComplete(item, idx, rowRectInPanel(e.currentTarget))}
       >
-        {placeholder ? null : renderRowBody(item, idx + 1, ghost)}
+        {placeholder ? null : renderRowBody(item, idx + 1)}
       </div>
     );
   };
@@ -1087,6 +1099,25 @@ export const OverlayWindow: React.FC = () => {
             <button onClick={handleUndo}>撤销</button>
           </div>
         )}
+
+        {/* 钤印特效层：面板根直挂，矩形对齐完成行。虚拟列表滚动容器 overflow-y:auto
+            必裁行内上溢内容（第一行的 2× 印面曾被列表顶边裁掉），列表外渲染才能
+            盖过顶栏；absolute 定位随窗口整体移动。z 压过顶栏/气泡/拖拽浮起，
+            播放期间（980ms）为悬浮窗最上层 */}
+        {ghosts.map((g) => (
+          <div
+            key={g.item.user_id}
+            className="queue-clear-fx"
+            style={{ left: g.rect.left, top: g.rect.top, width: g.rect.width, height: g.rect.height }}
+          >
+            <span className="queue-ring" />
+            <span className="queue-flare">
+              <i />
+              <i />
+            </span>
+            <span className="queue-stamp">QUEST CLEAR</span>
+          </div>
+        ))}
       </div>
 
       {/* 被抓起条目：脱离列表流浮起、跟手移动；列表内对应位置已空出（fixed 定位，不随列表滚动） */}
@@ -1102,7 +1133,7 @@ export const OverlayWindow: React.FC = () => {
             data-rarity={draggedRow.item.tempered_level}
             data-priority={draggedRow.item.is_priority ? "1" : "0"}
           >
-            {renderRowBody(draggedRow.item, draggedIndex + 1, false)}
+            {renderRowBody(draggedRow.item, draggedIndex + 1)}
           </div>
         </div>
       )}

@@ -1,0 +1,971 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>任务完成动效放大 · QUEST CLEAR 钤印复刻方案</title>
+<style>
+/* =============================================================================
+   任务完成动效放大设计方案（仅设计评审用，不代表已落地）
+   调查来源：怪物猎人历代「QUEST CLEAR」任务完成表现（见文档调查结论节）
+   悬浮窗结构、尺寸、变量名均对齐 src/App.css 与 src/views/OverlayWindow.tsx
+   ============================================================================= */
+
+:root {
+  /* 现有荒野主题变量（App.css 原值） */
+  --panel-a: 34 27 15;
+  --panel-b: 25 19 8;
+  --line: #5c4a15;
+  --line-soft: rgba(146, 120, 40, 0.34);
+  --ink: #f2ead4;
+  --ink-dim: #b8ae93;
+  --ink-faint: #7d7460;
+  --cream: #fcf5de;
+  --hl: #ddc94a;
+  --hl2: #ff7200;
+  --row-bg: rgba(0, 0, 0, 0.34);
+  --row-bg-hover: rgba(0, 0, 0, 0.52);
+
+  /* 稀有度 / 大航海（主题无关，全方案不动） */
+  --r-normal: #c7c0ab;
+  --r-tempered: #a78bfa;
+  --r-arch: #ffa02e;
+  --r-priority: #ffd66b;
+  --g1: #fed100;
+  --g2: #b48cf2;
+  --g3: #76dcff;
+  --stamp: #e0472f;
+  --danger: #c0392b;
+
+  /* 方案B新增：QUEST CLEAR 金印色阶（取自 MH World / Wilds 任务完成金字的金系） */
+  --gold-hi: #fff3c4;
+  --gold-main: #f0d47a;
+  --gold-deep: #b8863b;
+  --gold-line: #d9b558;
+
+  /* 模拟页字体（实际运行用随包思源宋 / DM Serif，见字体小节） */
+  --f-serif: "Noto Serif SC", "Source Han Serif SC", "SimSun", serif;
+  --f-sans: "Microsoft YaHei", "Noto Sans SC", "PingFang SC", sans-serif;
+  --f-num: Georgia, "Times New Roman", serif;
+}
+
+[data-theme="asc"] {
+  --panel-a: 13 33 56;
+  --panel-b: 8 25 44;
+  --line: #2f6d94;
+  --line-soft: rgba(118, 220, 255, 0.26);
+  --ink: #eef6fb;
+  --ink-dim: #9dc4dd;
+  --ink-faint: #5f7f96;
+  --hl: #76dcff;
+  --hl2: #8891f3;
+  --row-bg-lift: rgba(9, 24, 40, 0.97);
+  /* 钤印朱色不随主题切换：完成语义全局唯一（App.css 中 --stamp 未被 asc 覆盖） */
+  --stamp: #e0472f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 28px 20px 60px;
+  background: #0e1013;
+  color: #d8dde3;
+  font-family: var(--f-sans);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.page { max-width: 1180px; margin: 0 auto; }
+
+/* ---------------- 页头 ---------------- */
+
+.page-head h1 {
+  margin: 0 0 6px;
+  font-family: var(--f-serif);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  background: linear-gradient(94deg, #f0d47a, #fcf5de 44%, #e0472f 82%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.page-head p { margin: 0 0 4px; color: #9aa3ad; }
+
+.doc-tag {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 10px;
+  border: 1px solid #3a4048;
+  border-radius: 3px;
+  color: #8a929c;
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+}
+
+/* ---------------- 章节标题 ---------------- */
+
+h2 {
+  margin: 44px 0 4px;
+  font-family: var(--f-serif);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: #ecdfb8;
+  border-left: 4px solid var(--stamp);
+  padding-left: 10px;
+}
+h2 .sub { font-size: 12px; color: #8a929c; font-weight: 400; margin-left: 10px; letter-spacing: 0.04em; }
+h3 { margin: 24px 0 8px; font-size: 14px; color: #d9c98f; letter-spacing: 0.04em; }
+
+.note {
+  margin: 10px 0 0;
+  padding: 10px 14px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+  border-radius: 4px;
+  color: #aeb6bf;
+}
+.note b { color: #ecdfb8; }
+.note .warn { color: #e8a15c; }
+
+/* ---------------- 调查结论 ---------------- */
+
+.ref-list { margin: 10px 0 0; padding-left: 20px; color: #aeb6bf; }
+.ref-list li { margin: 4px 0; }
+.ref-list a { color: #7db8d8; text-decoration: none; }
+.ref-list a:hover { text-decoration: underline; }
+
+/* 调查要点三卡 */
+.ref-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+  margin-top: 14px;
+}
+.ref-card {
+  padding: 14px 16px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+  border-top: 3px solid var(--stamp);
+  border-radius: 4px;
+}
+.ref-card.gold { border-top-color: var(--gold-line); }
+.ref-card h4 { margin: 0 0 6px; font-size: 13px; color: #ecdfb8; letter-spacing: 0.05em; }
+.ref-card p { margin: 0; color: #a2aab3; font-size: 12.5px; line-height: 1.7; }
+.ref-card .kw {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 1px 8px;
+  border: 1px solid #3a4048;
+  border-radius: 2px;
+  color: #8a929c;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+
+/* ---------------- 规格表 ---------------- */
+
+table.spec {
+  margin-top: 12px;
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 860px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+}
+table.spec th, table.spec td {
+  border: 1px solid #262b32;
+  padding: 7px 12px;
+  text-align: left;
+  font-size: 12.5px;
+}
+table.spec th { background: #1c2128; color: #d9c98f; font-weight: 600; letter-spacing: 0.04em; }
+table.spec td.num { font-family: var(--f-num); color: #e8e2cf; }
+table.spec td.old { color: #8a929c; }
+table.spec td.new { color: #f0a08c; }
+table.spec td b { color: #ecdfb8; }
+
+/* ---------------- 新旧尺寸对比尺 ---------------- */
+
+.ruler {
+  position: relative;
+  width: 420px;
+  height: 216px;
+  margin-top: 16px;
+  border-left: 1px solid #3a4048;
+}
+.ruler .tick {
+  position: absolute;
+  left: 0;
+  width: 420px;
+  border-top: 1px dashed #3a4048;
+  font-size: 10.5px;
+  color: #6b7480;
+  padding-left: 4px;
+}
+.ruler .lab {
+  position: absolute;
+  left: 6px;
+  font-size: 11px;
+  color: #8a929c;
+  white-space: nowrap;
+}
+
+/* 对比尺里的行骨架（宽度按悬浮窗 440 - 面板内衬 ≈ 420） */
+.ruler .row-skeleton {
+  position: absolute;
+  left: 24px;
+  width: 380px;
+  height: 56px;
+  border: 1px solid rgba(146, 120, 40, 0.5);
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+/* 旧钤印（17px 字，块高约 34px）：虚线幽灵轮廓 */
+.ruler .stamp-old {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) rotate(-11deg);
+  font-family: var(--f-serif);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  padding: 2px 9px;
+  border: 2px solid rgba(224, 71, 47, 0.55);
+  border-radius: 3px;
+  color: rgba(224, 71, 47, 0.55);
+  white-space: nowrap;
+}
+
+/* 新钤印（34px 字，块高约 63px，超出行框上下各约 3.5px）：实色 */
+.ruler .stamp-new {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%) rotate(-8deg);
+  font-family: var(--f-serif);
+  font-size: 34px;
+  line-height: 1.42;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  padding: 3px 20px;
+  border: 3px solid var(--stamp);
+  border-radius: 5px;
+  color: var(--stamp);
+  white-space: nowrap;
+  box-shadow: 0 0 18px rgba(224, 71, 47, 0.35);
+}
+
+/* ---------------- 演示面板（对齐悬浮窗 440×360） ---------------- */
+
+.demo-grid {
+  display: grid;
+  grid-template-columns: 460px 460px;
+  gap: 22px;
+  margin-top: 16px;
+  align-items: start;
+}
+.demo-cell h3 { margin: 0 0 8px; }
+
+.demo-panel {
+  width: 440px;
+  height: 360px;
+  border: 1px solid #3a4048;
+  border-radius: 6px;
+  background: linear-gradient(155deg, rgb(var(--panel-a) / 0.92), rgb(var(--panel-b) / 0.96));
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+[data-theme="wilds"] .demo-panel {
+  border-color: #4a3d14;
+}
+
+.panel-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px 7px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.panel-title {
+  font-family: var(--f-serif);
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: var(--hl);
+}
+.conn { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--ink-faint); letter-spacing: 0.08em; }
+.conn i { width: 7px; height: 7px; border-radius: 50%; background: #59d98a; box-shadow: 0 0 6px #59d98a; }
+
+.rows { flex: 1; padding: 8px 10px 0; position: relative; }
+
+/* ---------------- 队列行（1:1 对齐 App.css） ---------------- */
+
+.queue-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 56px;
+  margin-bottom: 4px;
+  padding: 0 10px 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: var(--row-bg);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.16s, background 0.16s;
+  --rc: var(--r-normal);
+}
+.queue-row:hover { background: var(--row-bg-hover); border-color: var(--rc); }
+.queue-row[data-rarity="1"] { --rc: var(--r-tempered); }
+.queue-row[data-rarity="2"] { --rc: var(--r-arch); }
+.queue-row[data-priority="1"] { --rc: var(--r-priority); }
+
+.queue-spine {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--rc);
+}
+.queue-spine::after {
+  content: ""; position: absolute; inset: 0; background: var(--rc); filter: blur(6px); opacity: 0.55;
+}
+.queue-corner { position: absolute; width: 10px; height: 10px; border: 1.5px solid var(--rc); opacity: 0.5; pointer-events: none; }
+.queue-corner.tl { left: 5px; top: 5px; border-right: 0; border-bottom: 0; }
+.queue-corner.br { right: 5px; bottom: 5px; border-left: 0; border-top: 0; }
+
+.queue-handle { flex: none; width: 40px; display: flex; align-items: center; gap: 6px; cursor: grab; }
+.queue-grip { flex: none; width: 14px; display: flex; align-items: center; justify-content: center; color: var(--ink-faint); opacity: 0.55; }
+.queue-seq {
+  flex: none; width: 20px; text-align: center;
+  font-family: var(--f-num); font-size: 14px; font-weight: 600; letter-spacing: -0.02em; color: var(--ink-dim);
+}
+.queue-nick { flex: none; width: 140px; font-size: 19px; font-weight: 700; color: var(--ink-dim); }
+
+.queue-iconcard {
+  position: relative; flex: none; width: 38px; height: 38px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1.5px solid var(--rc); border-radius: 2px;
+  background: radial-gradient(circle at 50% 35%, rgba(255, 255, 255, 0.1), rgba(0, 0, 0, 0.5));
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.6);
+}
+.queue-iconcard::before, .queue-iconcard::after {
+  content: ""; position: absolute; left: 50%; width: 5px; height: 5px;
+  background: var(--rc); transform: translateX(-50%) rotate(45deg); opacity: 0.8;
+}
+.queue-iconcard::before { top: -3.5px; }
+.queue-iconcard::after { bottom: -3.5px; }
+.queue-iconcard svg { width: 30px; height: 30px; opacity: 0.85; }
+
+.queue-mon {
+  flex: 1; min-width: 0;
+  font-family: var(--f-serif);
+  font-size: 21.5px; font-weight: 750; letter-spacing: 0.03em;
+  color: var(--cream);
+  filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.85));
+  white-space: nowrap; overflow: hidden;
+}
+.queue-badges { flex: none; display: flex; align-items: center; gap: 5px; margin-left: auto; }
+.queue-chip {
+  font-size: 11px; padding: 2px 6px; border-radius: 1px; border: 1px solid currentColor;
+  letter-spacing: 0.06em; display: inline-flex; align-items: center; gap: 3px; line-height: 1.5; white-space: nowrap;
+}
+.queue-chip.g2 { color: var(--g2); }
+.queue-chip.prio { color: var(--r-priority); }
+
+.queue-hint {
+  position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+  font-size: 12.5px; color: var(--hl); opacity: 0; transition: opacity 0.2s;
+  white-space: nowrap; pointer-events: none; letter-spacing: 0.08em;
+}
+.queue-row:hover .queue-hint { opacity: 0.92; }
+
+/* =============================================================================
+   完成动效 · 本方案新增（落地时替换 App.css 对应段落）
+   ============================================================================= */
+
+/* 完成行：溢出可见——放大后的钤印要超出行框（这是本方案唯一的结构性改动）。
+   z-index 抬升保证溢出部分压住相邻行；sheen 在溢出态会外漏，完成行内直接关闭 */
+.queue-row.completing {
+  pointer-events: none;
+  overflow: visible;
+  z-index: 6;
+  animation:
+    queueRowOut 0.42s 0.56s ease forwards,
+    queueStampHit 0.26s 0.24s ease-in-out;
+}
+.queue-row.completing .queue-sheen { display: none; }
+
+@keyframes queueRowOut {
+  to { opacity: 0; transform: scale(0.97); }
+}
+/* 钤印落定瞬间（约 260ms 处）行身轻沉，呼应「デンッ」 */
+@keyframes queueStampHit {
+  0% { transform: none; }
+  40% { transform: translateY(1.5px); }
+  65% { transform: translateY(-1px); }
+  100% { transform: none; }
+}
+
+/* 钤印主体：2.0× 放大（17 → 34px），朱砂双线框 */
+.queue-stamp {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  font-family: var(--f-serif);
+  font-weight: 800;
+  font-size: 34px;
+  line-height: 1.42;
+  letter-spacing: 0.14em;
+  color: var(--stamp);
+  border: 3px solid var(--stamp);
+  border-radius: 5px;
+  padding: 3px 20px;
+  background: rgba(10, 8, 6, 0.38);
+  transform: translate(-50%, -50%) rotate(-8deg) scale(3.2);
+  opacity: 0;
+  pointer-events: none;
+  white-space: nowrap;
+  text-shadow: 0 0 14px rgba(224, 71, 47, 0.55);
+  z-index: 3;
+}
+/* 内衬细线：复刻原印章「外粗内细」双线框 */
+.queue-stamp::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border: 1px solid rgba(224, 71, 47, 0.55);
+  border-radius: 2px;
+  pointer-events: none;
+}
+/* 油墨斑驳：径向暗角让红墨略不匀，贴近实体印章 */
+.queue-stamp::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  background: radial-gradient(circle at 38% 32%, rgba(224, 71, 47, 0.16), transparent 52%),
+              radial-gradient(circle at 72% 74%, rgba(0, 0, 0, 0.3), transparent 46%);
+  pointer-events: none;
+}
+
+.queue-row.completing .queue-stamp {
+  animation: queueStampIn 0.56s cubic-bezier(0.2, 1.5, 0.4, 1) forwards;
+}
+@keyframes queueStampIn {
+  0%   { opacity: 0; transform: translate(-50%, -50%) rotate(-8deg) scale(3.2); filter: blur(6px); }
+  30%  { opacity: 1; }
+  46%  { transform: translate(-50%, -50%) rotate(-8deg) scale(0.94); filter: blur(0); }
+  62%  { transform: translate(-50%, -50%) rotate(-8deg) scale(1.03); }
+  76%  { transform: translate(-50%, -50%) rotate(-8deg) scale(0.99); }
+  100% { opacity: 1; transform: translate(-50%, -50%) rotate(-8deg) scale(1); }
+}
+
+/* 冲击环：随 2× 同步放大 */
+.queue-ring {
+  position: absolute; left: 50%; top: 50%;
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 3px solid rgba(224, 71, 47, 0.85);
+  transform: translate(-50%, -50%) scale(0.4);
+  opacity: 0; pointer-events: none;
+}
+.queue-row.completing .queue-ring { animation: queueRingOut 0.6s 0.05s ease-out forwards; }
+@keyframes queueRingOut {
+  0% { opacity: 0.9; transform: translate(-50%, -50%) scale(0.4); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(11); }
+}
+
+/* 冲击十字光：落定一瞬的短促亮线（可选装饰，落地时对应 OverlayWindow ghost 分支加一个 span） */
+.queue-flare {
+  position: absolute; left: 50%; top: 50%;
+  width: 3px; height: 3px;
+  opacity: 0; pointer-events: none;
+  z-index: 2;
+}
+.queue-flare i {
+  position: absolute; left: 50%; top: 50%; background: rgba(255, 230, 200, 0.9);
+}
+.queue-flare i:nth-child(1), .queue-flare i:nth-child(2) {
+  width: 150px; height: 2px; transform: translate(-50%, -50%);
+}
+.queue-flare i:nth-child(3), .queue-flare i:nth-child(4) {
+  width: 2px; height: 150px; transform: translate(-50%, -50%);
+}
+.queue-row.completing .queue-flare { animation: queueFlareOut 0.34s 0.24s ease-out forwards; }
+@keyframes queueFlareOut {
+  0% { opacity: 0.95; transform: translate(-50%, -50%) scale(0.25) rotate(0deg); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.15) rotate(24deg); }
+}
+
+/* 钤印期间行内容让位压暗：朱印成为唯一主角 */
+.queue-row.completing > :not(.queue-stamp):not(.queue-ring):not(.queue-flare):not(.queue-sheen) {
+  opacity: 0.38;
+  filter: saturate(0.55);
+  transition: opacity 0.3s 0.12s, filter 0.3s 0.12s;
+}
+
+/* ---------------- 方案B：金印光耀（QUEST CLEAR · World/Wilds 风） ---------------- */
+
+.queue-row.completing-gold {
+  pointer-events: none;
+  overflow: visible;
+  z-index: 6;
+  animation:
+    queueRowOut 0.42s 0.56s ease forwards,
+    queueStampHit 0.26s 0.2s ease-in-out;
+}
+.queue-row.completing-gold .queue-sheen { display: none; }
+.queue-row.completing-gold > :not(.queue-stamp-gold):not(.queue-rays):not(.queue-ring) {
+  opacity: 0.38;
+  filter: saturate(0.55);
+  transition: opacity 0.3s 0.12s, filter 0.3s 0.12s;
+}
+
+/* 金字：DM Serif 拉丁衬线 + 金渐变裁字（对齐怪物名的镌刻工艺） */
+.queue-stamp-gold {
+  position: absolute; left: 50%; top: 50%;
+  font-family: var(--f-num);
+  font-size: 40px;
+  line-height: 1.3;
+  letter-spacing: 0.1em;
+  font-weight: 400;
+  white-space: nowrap;
+  transform: translate(-50%, -50%) rotate(-4deg) scale(1.8);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 3;
+  background: linear-gradient(178deg, var(--gold-hi) 8%, var(--gold-main) 46%, var(--gold-deep) 88%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 1px rgba(60, 40, 8, 0.9)) drop-shadow(0 0 16px rgba(240, 212, 122, 0.35));
+}
+.queue-row.completing-gold .queue-stamp-gold {
+  animation: queueGoldIn 0.56s cubic-bezier(0.2, 1.4, 0.4, 1) forwards;
+}
+@keyframes queueGoldIn {
+  0%  { opacity: 0; transform: translate(-50%, -50%) rotate(-4deg) scale(1.8); filter: blur(8px); }
+  42% { opacity: 1; transform: translate(-50%, -50%) rotate(-4deg) scale(0.97); filter: blur(0); }
+  62% { transform: translate(-50%, -50%) rotate(-4deg) scale(1.015); }
+  100% { opacity: 1; transform: translate(-50%, -50%) rotate(-4deg) scale(1); }
+}
+
+/* 金色放射光束：字后铺开再收（repeating-conic + 径向遮罩） */
+.queue-rays {
+  position: absolute; left: 50%; top: 50%;
+  width: 340px; height: 240px;
+  transform: translate(-50%, -50%) scale(0.5);
+  opacity: 0; pointer-events: none; z-index: 2;
+  background: repeating-conic-gradient(from 0deg,
+    rgba(240, 212, 122, 0.2) 0deg 5deg, transparent 5deg 13deg);
+  -webkit-mask: radial-gradient(closest-side, #000 18%, transparent 74%);
+  mask: radial-gradient(closest-side, #000 18%, transparent 74%);
+}
+.queue-row.completing-gold .queue-rays { animation: queueRays 0.72s 0.06s ease-out forwards; }
+@keyframes queueRays {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+  38% { opacity: 0.9; }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.06); }
+}
+
+/* ---------------- 文案选项小样 ---------------- */
+
+.copy-grid { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 14px; }
+.copy-cell {
+  width: 240px;
+  padding: 14px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+  border-radius: 4px;
+  text-align: center;
+}
+.copy-cell .stamp-sample {
+  display: inline-block;
+  margin: 6px 0 16px; /* 旋转后的角会探出下缘，留出与说明文字的间距 */
+  font-family: var(--f-serif);
+  font-size: 26px;
+  line-height: 1.42;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--stamp);
+  border: 3px solid var(--stamp);
+  border-radius: 5px;
+  padding: 3px 16px;
+  background: rgba(10, 8, 6, 0.38);
+  transform: rotate(-8deg);
+  position: relative;
+  white-space: nowrap;
+}
+.copy-cell .stamp-sample::before {
+  content: ""; position: absolute; inset: 2px;
+  border: 1px solid rgba(224, 71, 47, 0.55); border-radius: 2px;
+}
+.copy-cell .stamp-sample.latin {
+  font-family: var(--f-num);
+  font-weight: 400;
+  letter-spacing: 0.1em;
+}
+.copy-cell p { margin: 10px 0 0; font-size: 12px; color: #a2aab3; text-align: left; }
+.copy-cell .rec { color: #9fd98a; }
+
+/* ---------------- 落地清单 ---------------- */
+
+ol.todo { margin: 10px 0 0; padding-left: 22px; color: #aeb6bf; }
+ol.todo li { margin: 6px 0; }
+ol.todo code, .note code {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: #e8d5a8;
+  background: #1d2128;
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+.ok { color: #9fd98a; }
+
+/* ---------------- 演示脚本按钮 ---------------- */
+
+.replay-tip { margin-top: 8px; font-size: 12px; color: #6b7480; }
+.replay-btn {
+  margin-top: 10px;
+  padding: 6px 16px;
+  background: #22262d;
+  color: #d9c98f;
+  border: 1px solid #3a4048;
+  border-radius: 3px;
+  cursor: pointer;
+  font-family: var(--f-sans);
+  font-size: 12.5px;
+  letter-spacing: 0.08em;
+}
+.replay-btn:hover { border-color: var(--gold-line); color: #ecdfb8; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="page-head">
+    <h1>任务完成动效放大 · QUEST CLEAR 钤印复刻方案</h1>
+    <p>悬浮窗「狩猎点单队列」完成钤印：字面 2.0× 放大并超出行框，视觉语言对齐怪物猎人历代任务完成（QUEST CLEAR）表现</p>
+    <p>对照组件：<code style="color:#e8d5a8">.queue-stamp / .queue-ring</code>（src/App.css 618–667）· ghost 分支（OverlayWindow.tsx 858–863）· <code style="color:#e8d5a8">COMPLETE_ANIM_MS = 950</code>（OverlayWindow.tsx 33）</p>
+    <span class="doc-tag">设计评审稿 · 2026-09-26 · 仅评审用不代表已落地</span>
+  </div>
+
+  <!-- ============================ 调查结论 ============================ -->
+  <h2>一、官方调查：怪物猎人任务完成的 QUEST CLEAR 表现 <span class="sub">网络调查结论</span></h2>
+
+  <div class="ref-grid">
+    <div class="ref-card">
+      <h4>经典系（初代～携带版）：朱印钤压</h4>
+      <p>任务达成瞬间，一枚<b style="color:#ecdfb8">红色方框印章</b>「デンッ」一声快速钤压在画面上：大比例缩砸急停、微颤落定，印面为<b style="color:#ecdfb8">外粗内细双线方框 + 英文衬线大写 QUEST CLEAR</b>，伴随钤印音与胜利短号。印章是系列任务完成的标志性符号。</p>
+      <span class="kw">缩砸急停 · 微颤 · 双线框 · 朱红印面</span>
+    </div>
+    <div class="ref-card gold">
+      <h4>现代系（World / Wilds）：金字光耀</h4>
+      <p>任务完成改为<b style="color:#ecdfb8">金色衬线大字 QUEST CLEAR / QUEST COMPLETE</b>：金渐变镌刻字配放射光束与纹样，背景压暗后浮现，再进入结算。金色 + 衬线 + 光效是现代作的任务完成语言。</p>
+      <span class="kw">金渐变衬线字 · 放射光束 · 背景压暗</span>
+    </div>
+    <div class="ref-card">
+      <h4>素材复用口径</h4>
+      <p>官方贴图与字体受版权保护，<b style="color:#ecdfb8">不做贴图搬用</b>；复用的是其<b style="color:#ecdfb8">表现语法</b>——朱印方案复刻「双线框印章 + 缩砸急停」（与本工程现有钤印设计同源），金印方案复刻「金渐变衬线字 + 放射光束」。全部以 CSS 重绘，无新增美术资产。</p>
+      <span class="kw">CSS 重绘 · 零新增素材 · 版权安全</span>
+    </div>
+  </div>
+
+  <ul class="ref-list">
+    <li><a href="https://www.youtube.com/watch?v=xab8oaBj13I">【MH】歴代クエストクリア演出集（YouTube）</a>——历代任务完成演出合集：初代起即为红色 QUEST CLEAR 印章钤压，可逐作核对动画节奏。</li>
+    <li><a href="https://nlab.itmedia.co.jp/cont/articles/3278612">ねとらぼ：デンッ「QUEST CLEAR」モンハン風の消しゴムはんこ</a>——爱好者用橡皮章复刻该印章，「与游戏中的印章一模一样」，佐证印章造型即系列标志性表现。</li>
+    <li><a href="https://videogamemusic.org">Videogamemusic.org：Quest Clear Theme</a>——MHW 任务完成画面专用号曲以 QUEST CLEAR 命名，佐证其为官方固定字样。</li>
+  </ul>
+
+  <!-- ============================ 现状与规格 ============================ -->
+  <h2>二、现状与放大规格 <span class="sub">字面 2.0×，块高超出行框</span></h2>
+
+  <p>现状钤印为 17px「討伐完了」+ 2px 单线框，块总高约 34px（行高 56px 的一半略多），直播缩放后观众辨识吃力；且行容器 <code>overflow: hidden</code> 会裁掉任何超出行框的部分——放大后必须放开。</p>
+
+  <table class="spec">
+    <tr><th>Token</th><th>现状</th><th>放大后</th><th>说明</th></tr>
+    <tr><td>字号 font-size</td><td class="num old">17px</td><td class="num new">34px（2.00×）</td><td>字重 600 → 800：大字下笔画不显薄</td></tr>
+    <tr><td>边框 border</td><td class="num old">2px 单线</td><td class="num new">3px + 内衬 1px 双线</td><td>复刻官方印章「外粗内细」双线框</td></tr>
+    <tr><td>内衬 padding</td><td class="num old">2px 9px</td><td class="num new">3px 20px</td><td>随字号放大，保持框内留白比例</td></tr>
+    <tr><td>倾角 rotate</td><td class="num old">-11°</td><td class="num new">-8°</td><td>字大后过斜溢出过多，收敛 3°</td></tr>
+    <tr><td>块总高</td><td class="num old">≈34px</td><td class="num new">≈63px</td><td><b>超出行高 56px 约 7px（上下各 ≈3.5px），满足「稍稍超出」</b></td></tr>
+    <tr><td>钤压曲线</td><td class="num old">2.4×→1，500ms</td><td class="num new">3.2×→0.94→1.03→1，560ms</td><td>加落定回弹与行身下沉（デンッ 感）</td></tr>
+    <tr><td>冲击环</td><td class="num old">12px，终态 ×9</td><td class="num new">14px 3px 描边，终态 ×11</td><td>随 2× 同步，新增冲击十字光（可选）</td></tr>
+    <tr><td>行内容</td><td class="num old">保持不动</td><td class="num new">压暗至 38%</td><td>钤印成为唯一主角（新增强调层）</td></tr>
+    <tr><td>总时长</td><td class="num old">950ms</td><td class="num new">980ms</td><td>COMPLETE_ANIM_MS 同步 950 → 980</td></tr>
+  </table>
+
+  <h3>新旧尺寸对比尺（虚线 = 现状 17px，实色 = 本方案 34px）</h3>
+  <div class="ruler">
+    <div class="tick" style="top: 14px;">— 演示区顶</div>
+    <div class="row-skeleton" style="top: 40px;"></div>
+    <div class="lab" style="top: 46px; left: 30px;">行高 56px（现状 overflow:hidden 会裁掉超出部分 → 完成行需放开）</div>
+    <div class="stamp-old" style="top: 68px;">討伐完了</div>
+    <div class="row-skeleton" style="top: 108px;"></div>
+    <div class="stamp-new" style="top: 136px;">討伐完了</div>
+    <div class="tick" style="top: 188px;">— 钤印上下各溢出行框约 3.5px，压住相邻行框线</div>
+  </div>
+
+  <!-- ============================ 方案A ============================ -->
+  <h2>三、方案A（推荐）：朱印复刻 QUEST CLEAR <span class="sub">经典印章表现 · 与现有钤印设计同源</span></h2>
+
+  <p>在现有朱红钤印基础上做三件事：<b style="color:#ecdfb8">① 字面 2.0× 并超出行框</b>；<b style="color:#ecdfb8">② 双线框 + 油墨斑驳</b>复刻官方印章造型；<b style="color:#ecdfb8">③ 缩砸急停加落定回弹与行身下沉</b>，强化「デンッ」的钤压感。朱红印面在荒野（暖金）与凌越（冷蓝）两主题下都保持完成态的唯一强语义（--stamp 不随主题切换）。</p>
+
+  <div class="demo-grid">
+    <div class="demo-cell">
+      <h3>荒野主题（默认）</h3>
+      <div class="demo-panel" data-theme="wilds" id="panel-wilds">
+        <div class="panel-head">
+          <span class="panel-title">狩猎点单队列</span>
+          <span class="conn"><i></i>已连接</span>
+        </div>
+        <div class="rows">
+          <div class="queue-row" data-rarity="1" data-uid="a1">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">01</span></span>
+            <span class="queue-nick">艾露猫店长</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#a78bfa"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">黑蚀龙</span>
+            <span class="queue-badges"><span class="queue-chip g2">提督</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-uid="a2">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">02</span></span>
+            <span class="queue-nick">此方_ing</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">煌雷龙</span>
+            <span class="queue-badges"><span class="queue-chip prio">优先</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-rarity="2" data-uid="a3">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">03</span></span>
+            <span class="queue-nick">锁刃龙好吃</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#ffa02e"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">锁刃龙</span>
+            <span class="queue-badges"></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-uid="a4">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">04</span></span>
+            <span class="queue-nick">观察团梅娅</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">护龙·波衣龙</span>
+            <span class="queue-badges"><span class="queue-chip g1">总督</span><span class="queue-chip prio">优先</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="demo-cell">
+      <h3>凌越主题（asc）</h3>
+      <div class="demo-panel" data-theme="asc" id="panel-asc">
+        <div class="panel-head">
+          <span class="panel-title">狩猎点单队列</span>
+          <span class="conn"><i></i>已连接</span>
+        </div>
+        <div class="rows">
+          <div class="queue-row" data-uid="b1">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">01</span></span>
+            <span class="queue-nick">阿波罗之刃</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">缠蛙</span>
+            <span class="queue-badges"><span class="queue-chip g3">舰长</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-rarity="1" data-uid="b2">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">02</span></span>
+            <span class="queue-nick">赫猿兽观察员</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#a78bfa"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">赫猿兽</span>
+            <span class="queue-badges"><span class="queue-chip g2">提督</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-uid="b3">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">03</span></span>
+            <span class="queue-nick">白色的波衣</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">波衣龙</span>
+            <span class="queue-badges"></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-uid="b4">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">04</span></span>
+            <span class="queue-nick">大团长法比安</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">护龙·煌雷龙</span>
+            <span class="queue-badges"><span class="queue-chip g1">总督</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="replay-tip">点击任意一行即可重播完成动效（钤印 560ms → 离场 420ms，总 980ms，与真实节奏一致；钤印块超出行框压住相邻行）。</p>
+  <button class="replay-btn" onclick="autoDemo()">▶ 自动演示一轮</button>
+
+  <!-- ============================ 方案B ============================ -->
+  <h2>四、方案B（备选）：金印光耀 QUEST CLEAR <span class="sub">World / Wilds 现代表现</span></h2>
+
+  <p>改走现代作语言：40px DM Serif 金渐变大字 + 放射光束，落定为「光耀浮现」（模糊收实 + 缩放落定），行内容同样压暗。金印气势更足，但有两个代价：悬浮窗整体本就是金色系（--hl #ddc94a），金字在暖面板里<b style="color:#ecdfb8">辨识度反而低于朱印</b>；且「点击完成 = 盖章」的动作隐喻与既有钤印设计一脉相承，金印会丢失这层语义。故作备选。</p>
+
+  <div class="demo-grid" style="grid-template-columns: 460px;">
+    <div class="demo-cell">
+      <div class="demo-panel" data-theme="wilds" id="panel-gold">
+        <div class="panel-head">
+          <span class="panel-title">狩猎点单队列</span>
+          <span class="conn"><i></i>已连接</span>
+        </div>
+        <div class="rows">
+          <div class="queue-row" data-uid="c1">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">01</span></span>
+            <span class="queue-nick">风漂龙骑士</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">风漂龙</span>
+            <span class="queue-badges"><span class="queue-chip g3">舰长</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-uid="c2">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">02</span></span>
+            <span class="queue-nick">猫饭永远的神</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">刺花蜘蛛</span>
+            <span class="queue-badges"></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+          <div class="queue-row" data-uid="c3">
+            <span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+            <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">03</span></span>
+            <span class="queue-nick">沼泽猎人</span>
+            <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="#c7c0ab"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+            <span class="queue-mon">泡狐龙</span>
+            <span class="queue-badges"><span class="queue-chip g1">总督</span></span>
+            <span class="queue-hint">点击完成</span>
+            <span class="queue-sheen"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="replay-tip">方案B 演示：点击行播放金印光耀（QUEST CLEAR 金字 + 放射光束）。</p>
+
+  <!-- ============================ 文案选项 ============================ -->
+  <h2>五、印面文案 <span class="sub">三选一，默认建议 QUEST CLEAR</span></h2>
+
+  <div class="copy-grid">
+    <div class="copy-cell">
+      <span class="stamp-sample latin">QUEST CLEAR</span>
+      <p><b class="rec">推荐</b>——系列官方原字样（初代起沿用至今），拉丁衬线大写在直播画面里辨识度最高，与随包 DM Serif 字体气质吻合；印面宽约 300px，行内放得下。</p>
+    </div>
+    <div class="copy-cell">
+      <span class="stamp-sample">討伐完了</span>
+      <p>现状文案，改动最小；日文四字与怪猎氛围相合，但并非游戏内任务完成的实际用字。</p>
+    </div>
+    <div class="copy-cell">
+      <span class="stamp-sample">狩猎完成</span>
+      <p>中文直白，观众零门槛；但比 QUEST CLEAR 少了系列原味，且四字中文在宋体大字下略平。</p>
+    </div>
+  </div>
+
+  <!-- ============================ 落地清单 ============================ -->
+  <h2>六、工程落地清单 <span class="sub">评审通过后执行</span></h2>
+
+  <ol class="todo">
+    <li><b>App.css 完成动效段落重写</b>（618–667 行区域）：<code>.queue-row-completing</code> 增加 <code>overflow: visible; z-index: 6;</code> 并隐藏 <code>.queue-sheen</code>（溢出态外漏）；<code>.queue-stamp / .queue-ring</code> 按第二节规格表更新；新增 <code>queueStampHit</code>（行身下沉）与 <code>.queue-flare</code>（冲击十字光，可选）；行内容压暗规则 <code>:not()</code> 排除钤印层。</li>
+    <li><b>OverlayWindow.tsx</b>：<code>COMPLETE_ANIM_MS</code> 950 → 980（与钤印 560ms + 离场 420ms 延迟对齐）；若采纳冲击十字光，ghost 分支补一个 <code>&lt;span className="queue-flare"&gt;&lt;i/&gt;&lt;i/&gt;&lt;i/&gt;&lt;i/&gt;&lt;/span&gt;</code>。</li>
+    <li><b>字体子集确认</b>：文案定为 QUEST CLEAR 时，核对随包 DM Serif 子集是否含 Q/U/E/S/T/C/L/R 八字符，缺则更新 <code>scripts/fonts/subset_fonts.py</code> 字表重新子集化。</li>
+    <li><b>Lite 形态</b>：完成钤印属队列核心动效，Lite 版随本体一并生效，无需 <code>ensure_not_lite</code> 守卫、不涉及 <code>IS_LITE</code> 分支。<span class="ok">✓ 无额外工作</span></li>
+    <li><b>验证</b>：纯 CSS/TSX 前端变更，无 Rust 业务改动——跑 <code>npm run build</code> 类型与打包检查；人工核对两主题 + 完成撤销（撤销垫 5.2s 内仍可还原行）。</li>
+  </ol>
+
+  <div class="note">
+    <b>风险备注</b>：① 完成行放开 overflow 后，钤印溢出部分会与相邻行重叠约 3.5px——这是「盖章压纸」的物理直觉，属预期表现，且完成行 980ms 后即离场；② 虚拟列表滚动中的行完成时钤印随行渲染，无额外处理；③ <code>queueRowIn</code> 入场动画不受影响（overflow 只在完成态放开）。
+  </div>
+
+</div>
+
+<script>
+/* ================= 演示脚本：点击行重播完成动效 =================
+   逻辑与真实组件一致：行加 completing / completing-gold 类播钤印，
+   980ms 后移除类并原样插回（演示里直接复位）。 */
+
+const STAMP_TEXT = "討伐完了"; /* 印面文案演示默认值，评审文案小节三选一 */
+
+function ensureGhost(row) {
+  if (row.dataset.ghosted) return;
+  row.dataset.ghosted = "1";
+  const gold = row.dataset.gold === "1";
+  const frag = document.createElement("template");
+  if (gold) {
+    frag.innerHTML = '<span class="queue-rays"></span><span class="queue-ring"></span><span class="queue-stamp-gold">QUEST CLEAR</span>';
+  } else {
+    frag.innerHTML = '<span class="queue-ring"></span><span class="queue-flare"><i></i><i></i><i></i><i></i></span><span class="queue-stamp">' + STAMP_TEXT + "</span>";
+  }
+  row.appendChild(frag.content);
+}
+
+function playComplete(row) {
+  const gold = row.dataset.gold === "1";
+  const cls = gold ? "completing-gold" : "completing";
+  if (row.classList.contains(cls)) return; /* 播放中拒绝重入（对齐行级锁） */
+  ensureGhost(row);
+  row.classList.add(cls);
+  setTimeout(() => {
+    row.classList.remove(cls);
+    delete row.dataset.ghosted;
+    row.querySelectorAll(".queue-ring, .queue-flare, .queue-rays, .queue-stamp, .queue-stamp-gold")
+      .forEach((n) => n.remove());
+  }, 980);
+}
+
+document.querySelectorAll(".demo-panel").forEach((panel) => {
+  const gold = panel.id === "panel-gold";
+  panel.querySelectorAll(".queue-row").forEach((row) => {
+    if (gold) row.dataset.gold = "1";
+    row.addEventListener("click", () => playComplete(row));
+  });
+});
+
+function autoDemo() {
+  document.querySelectorAll("#panel-wilds .queue-row").forEach((row, i) => {
+    setTimeout(() => playComplete(row), i * 300);
+  });
+}
+
+/* 进页自动演示一轮荒野面板第二行，评审打开即有效果参照 */
+window.addEventListener("load", () => {
+  setTimeout(() => {
+    const row = document.querySelector("#panel-wilds .queue-row[data-uid='a2']");
+    if (row) playComplete(row);
+  }, 400);
+});
+</script>
+</body>
+</html>
