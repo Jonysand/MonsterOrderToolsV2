@@ -17,7 +17,7 @@ pub struct QueueItem {
     pub monster_name: String,
     pub is_priority: bool,
     #[serde(default)]
-    pub guard_level: i32, // 1=总督, 2=提督, 3=舰长, 0=普通
+    pub guard_level: i32, // 1=总督, 2=提督, 3=舰长, 0=普通, 99=GM(特殊管理员)
     #[serde(default)]
     pub tempered_level: i32, // 0=普通, 1=历战, 2=历战王
     pub timestamp: i64,
@@ -29,7 +29,7 @@ impl QueueItem {
     /// 优先级比较算法：
     /// 1. 优先 (is_priority = true) 排在非优先前面
     /// 2. 两者都是优先：
-    ///    舰长等级 1 (总督) > 2 (提督) > 3 (舰长) > 0 (普通提权)
+    ///    GM (99) > 舰长等级 1 (总督) > 2 (提督) > 3 (舰长) > 0 (普通提权)
     ///    若等级相同，则先来后到 (timestamp 较小者排在前面)
     /// 3. 两者都是非优先：先来后到 (timestamp 较小者排在前面)
     pub fn compare_priority(&self, other: &Self) -> Ordering {
@@ -42,8 +42,18 @@ impl QueueItem {
         }
 
         if self.is_priority && other.is_priority {
-            let g1 = if self.guard_level > 0 { self.guard_level } else { 999 };
-            let g2 = if other.guard_level > 0 { other.guard_level } else { 999 };
+            // guard_level 数值越小等级越高，唯 GM=99 例外：按最高档（0）参与比较
+            let rank = |level: i32| -> i32 {
+                if level == crate::bilibili::GUARD_LEVEL_GM {
+                    0
+                } else if level > 0 {
+                    level
+                } else {
+                    999
+                }
+            };
+            let g1 = rank(self.guard_level);
+            let g2 = rank(other.guard_level);
             if g1 != g2 {
                 return g1.cmp(&g2);
             }
@@ -51,6 +61,15 @@ impl QueueItem {
         }
 
         self.timestamp.cmp(&other.timestamp)
+    }
+}
+
+/// 特殊管理员（GM）的队列展示归一化：该用户的队列条目舰长等级固定为 GM
+/// （guard_level = 99，最高档、高于提督），点怪列表徽章随之前端显示「GM」。
+/// 昵称保持弹幕原始昵称不变；History 留档与 TTS 播报不受影响。
+fn normalize_special_display(item: &mut QueueItem) {
+    if item.user_id == crate::bilibili::SPECIAL_OPEN_ID && item.guard_level != crate::bilibili::GUARD_LEVEL_GM {
+        item.guard_level = crate::bilibili::GUARD_LEVEL_GM;
     }
 }
 
@@ -149,11 +168,18 @@ impl QueueManager {
     }
 
     /// 添加新点单或对已存在用户提权
-    pub fn add_or_update(&mut self, new_item: QueueItem) -> bool {
+    pub fn add_or_update(&mut self, mut new_item: QueueItem) -> bool {
+        normalize_special_display(&mut new_item);
         if let Some(pos) = self.items.iter().position(|i| i.user_id == new_item.user_id) {
             // 已在队列中：如果新请求带有优先且原项非优先，或者带来更高舰长等级，则提权
             let existing = &mut self.items[pos];
             let mut changed = false;
+            // 旧落盘条目里 GM 可能仍是旧等级（总督/提督等）：借本次更新一并归一化
+            let guard_before = existing.guard_level;
+            normalize_special_display(existing);
+            if existing.guard_level != guard_before {
+                changed = true;
+            }
             if new_item.is_priority && !existing.is_priority {
                 existing.is_priority = true;
                 changed = true;
@@ -396,6 +422,10 @@ impl QueueManager {
         };
         let count = loaded_items.len();
         self.items = loaded_items;
+        // 冷启动同样归一化 GM 条目：旧文件中的真实昵称/低等级不会带到点怪列表
+        for it in &mut self.items {
+            normalize_special_display(it);
+        }
         self.rebuild_index();
         if from_legacy {
             // 旧格式迁移：按优先级归一化一次（后续以文件顺序为准，保留主播手动拖拽次序）
@@ -788,6 +818,139 @@ mod tests {
         let _ = fs::remove_file(&file_path);
         let _ = fs::remove_dir(&temp_dir);
         println!("[PASS] test_load_legacy_order_list_format passed");
+    }
+
+    #[test]
+    fn test_special_user_queue_display_normalization() {
+        let mut qm = QueueManager::new();
+
+        // ① 特殊用户入队：等级固定为 GM（99，高于提督），弹幕带来的低等级不采纳；
+        //    昵称保持弹幕原始昵称（GM 只体现在等级徽章，不改昵称）
+        let added = qm.add_or_update(QueueItem {
+            id: "gm-1".into(),
+            user_id: crate::bilibili::SPECIAL_OPEN_ID.into(),
+            user_name: "真实昵称保持不变".into(),
+            monster_name: "黑蚀龙".into(),
+            is_priority: true,
+            guard_level: 0,
+            tempered_level: 0,
+            timestamp: 100,
+            icon_url: "".into(),
+        });
+        assert!(added);
+        assert_eq!(qm.items[0].user_name, "真实昵称保持不变");
+        assert_eq!(qm.items[0].guard_level, crate::bilibili::GUARD_LEVEL_GM);
+
+        // ② 普通用户不受归一化影响
+        qm.add_or_update(QueueItem {
+            id: "u-1".into(),
+            user_id: "u_normal".into(),
+            user_name: "普通水友".into(),
+            monster_name: "土砂龙".into(),
+            is_priority: false,
+            guard_level: 2,
+            tempered_level: 0,
+            timestamp: 200,
+            icon_url: "".into(),
+        });
+        let normal = qm.items.iter().find(|i| i.user_id == "u_normal").unwrap();
+        assert_eq!(normal.user_name, "普通水友");
+        assert_eq!(normal.guard_level, 2);
+
+        // ③ 旧落盘条目（提督等级）借再次入队一并归一化为 GM，
+        //    且归一化改变等级时必须递增版本（防迟到旧快照覆盖）
+        qm.items.clear();
+        qm.items.push(QueueItem {
+            id: "gm-legacy".into(),
+            user_id: crate::bilibili::SPECIAL_OPEN_ID.into(),
+            user_name: "真实昵称保持不变".into(),
+            monster_name: "黑蚀龙".into(),
+            is_priority: false,
+            guard_level: 2,
+            tempered_level: 0,
+            timestamp: 50,
+            icon_url: "".into(),
+        });
+        qm.rebuild_index();
+        qm.saved_revision = qm.revision;
+        let added = qm.add_or_update(QueueItem {
+            id: "gm-2".into(),
+            user_id: crate::bilibili::SPECIAL_OPEN_ID.into(),
+            user_name: "真实昵称保持不变".into(),
+            monster_name: "黑蚀龙".into(),
+            is_priority: false,
+            guard_level: crate::bilibili::GUARD_LEVEL_GM,
+            tempered_level: 0,
+            timestamp: 300,
+            icon_url: "".into(),
+        });
+        assert!(!added);
+        assert_eq!(qm.items[0].user_name, "真实昵称保持不变");
+        assert_eq!(qm.items[0].guard_level, crate::bilibili::GUARD_LEVEL_GM);
+        assert!(qm.is_dirty(), "归一化改写了等级，必须递增版本");
+        println!("[PASS] test_special_user_queue_display_normalization passed");
+    }
+
+    #[test]
+    fn test_special_user_queue_file_load_normalized() {
+        let temp_dir = std::env::temp_dir().join("mh_test_queue_gm");
+        let _ = fs::create_dir_all(&temp_dir);
+        let file_path = temp_dir.join("order_list_gm_test.json");
+
+        // 旧文件里 GM 仍是普通等级 0：冷启动加载后必须归一化为 99，昵称保持原样
+        let content = format!(
+            r#"[{{"id":"i1","user_id":"{}","user_name":"旧文件原始昵称","monster_name":"黑蚀龙","is_priority":true,"guard_level":0,"tempered_level":0,"timestamp":10,"icon_url":""}},
+            {{"id":"i2","user_id":"u2","user_name":"普通水友","monster_name":"土砂龙","is_priority":false,"guard_level":2,"tempered_level":0,"timestamp":20,"icon_url":""}}]"#,
+            crate::bilibili::SPECIAL_OPEN_ID
+        );
+        fs::write(&file_path, &content).unwrap();
+
+        let mut qm = QueueManager::new();
+        let count = qm.load_from_file(&file_path).unwrap();
+        assert_eq!(count, 2);
+        let gm = qm
+            .items
+            .iter()
+            .find(|i| i.user_id == crate::bilibili::SPECIAL_OPEN_ID)
+            .unwrap();
+        assert_eq!(gm.user_name, "旧文件原始昵称");
+        assert_eq!(gm.guard_level, crate::bilibili::GUARD_LEVEL_GM);
+        let normal = qm.items.iter().find(|i| i.user_id == "u2").unwrap();
+        assert_eq!(normal.user_name, "普通水友");
+        assert_eq!(normal.guard_level, 2);
+
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_dir(&temp_dir);
+        println!("[PASS] test_special_user_queue_file_load_normalized passed");
+    }
+
+    #[test]
+    fn test_gm_guard_level_sorts_first_among_priority() {
+        let mut qm = QueueManager::new();
+
+        // 三个带优先的条目：GM(99) 必须排在总督(1)与提督(2)之前
+        for (id, uid, name, guard, ts) in [
+            ("1", "u_gm", crate::bilibili::SPECIAL_OPEN_ID, crate::bilibili::GUARD_LEVEL_GM, 300),
+            ("2", "u_gov", "总督水友", 1, 100),
+            ("3", "u_adm", "提督水友", 2, 200),
+        ] {
+            qm.add_or_update(QueueItem {
+                id: id.into(),
+                user_id: uid.into(),
+                user_name: name.into(),
+                monster_name: "黑蚀龙".into(),
+                is_priority: true,
+                guard_level: guard,
+                tempered_level: 0,
+                timestamp: ts,
+                icon_url: "".into(),
+            });
+        }
+
+        assert_eq!(qm.items[0].user_id, "u_gm", "GM 必须排所有大航海档位之前");
+        assert_eq!(qm.items[1].user_id, "u_gov");
+        assert_eq!(qm.items[2].user_id, "u_adm");
+        println!("[PASS] test_gm_guard_level_sorts_first_among_priority passed");
     }
 
     /// P1-12：user_id 索引与 items 必须始终一致（O(1) 判重依赖该索引）

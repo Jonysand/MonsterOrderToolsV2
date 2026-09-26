@@ -1017,6 +1017,11 @@ export const MainWindow: React.FC = () => {
                                       <Sparkles className="w-2.5 h-2.5" /> 历战
                                     </span>
                                   )}
+                                  {item.guard_level === 99 && (
+                                    <span className="text-[9px] bg-gradient-to-r from-emerald-500 to-green-400 text-white font-bold px-1 rounded">
+                                      GM
+                                    </span>
+                                  )}
                                   {item.guard_level === 1 && (
                                     <span className="text-[9px] bg-gradient-to-r from-red-600 to-amber-500 text-white font-bold px-1 rounded">
                                       总督

@@ -87,6 +87,8 @@
   --g1: #fed100;
   --g2: #b48cf2;
   --g3: #76dcff;
+  /* GM 档（99，特殊管理员专属） */
+  --g99: #34d399;
 
   --stamp: #e0472f;
   --danger: #c0392b;
@@ -546,6 +548,7 @@ body {
 .queue-chip.g1 { color: var(--g1); }
 .queue-chip.g2 { color: var(--g2); }
 .queue-chip.g3 { color: var(--g3); }
+.queue-chip.g99 { color: var(--g99); }
 .queue-chip.prio { color: var(--r-priority); animation: prioP 1.5s ease-in-out infinite; }
 
 @keyframes prioP {

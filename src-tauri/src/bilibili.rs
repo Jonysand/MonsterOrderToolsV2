@@ -13,8 +13,11 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// 特殊管理员用户 OpenID（对应原项目 SpecialUserHelper.h，永远自动赋权总督）
+/// 特殊管理员用户 OpenID（对应原项目 SpecialUserHelper.h）
 pub const SPECIAL_OPEN_ID: &str = "6ed4fb45ecd94f938a2cf747c5487707";
+/// 特殊管理员专属舰长等级：99 = GM（V2 新增，数值上超出 1/2/3 大航海档位，
+/// 排序时按最高档处理，点怪列表徽章显示「GM」）
+pub const GUARD_LEVEL_GM: i32 = 99;
 
 /// B站开放平台凭据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -385,7 +388,7 @@ pub struct DanmuData {
     pub timestamp: i64,
     pub has_medal: bool,
     pub medal_level: i32,
-    pub guard_level: i32, // 1=总督, 2=提督, 3=舰长, 0=普通
+    pub guard_level: i32, // 1=总督, 2=提督, 3=舰长, 0=普通, 99=GM(特殊管理员)
     pub msg_id: String,
     /// 是否付费礼物（仅礼物通道解析 paid 后置位；DM 通道恒 false）
     pub is_paid_gift: bool,
@@ -861,9 +864,9 @@ impl DanmuProcessor {
             0
         };
         let mut guard_level = data.get("guard_level").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        // 特殊管理员 OpenID 永远判定为总督 (guard_level = 1)
+        // 特殊管理员 OpenID 永远判定为 GM (guard_level = 99，高于总督/提督/舰长)
         if user_id == SPECIAL_OPEN_ID {
-            guard_level = 1;
+            guard_level = GUARD_LEVEL_GM;
         }
         let msg_id = data.get("msg_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
@@ -2327,8 +2330,8 @@ mod tests {
         );
 
         let dm = processor.parse_danmu_json(&raw_json).expect("Parse danmu failed");
-        // 关键断言：特定管理员 open_id 必须被自动提升为总督 (guard_level = 1)
-        assert_eq!(dm.guard_level, 1);
+        // 关键断言：特定管理员 open_id 必须被自动提升为 GM (guard_level = 99)
+        assert_eq!(dm.guard_level, GUARD_LEVEL_GM);
         assert_eq!(dm.user_id, SPECIAL_OPEN_ID);
 
         let mut matcher = crate::monster::MonsterDataManager::new();
@@ -2339,9 +2342,9 @@ mod tests {
         let res = processor.process_danmu(&dm, &matcher, &roster, &mut queue_mgr);
         assert!(res.matched);
         assert_eq!(queue_mgr.items.len(), 1);
-        // 总督水友的优先请求应被成功批准
+        // 特殊管理员的优先请求应被成功批准，队列条目等级归一化为 GM (99)
         assert!(queue_mgr.items[0].is_priority);
-        assert_eq!(queue_mgr.items[0].guard_level, 1);
+        assert_eq!(queue_mgr.items[0].guard_level, GUARD_LEVEL_GM);
         println!("[PASS] test_special_open_id_guard_override passed");
     }
 

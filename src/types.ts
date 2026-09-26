@@ -4,7 +4,7 @@
   user_name: string;
   monster_name: string;
   is_priority: boolean;
-  guard_level: number; // 1=总督, 2=提督, 3=舰长, 0=普通
+  guard_level: number; // 1=总督, 2=提督, 3=舰长, 0=普通, 99=GM(特殊管理员)
   tempered_level: number; // 0=普通, 1=历战, 2=历战王
   timestamp: number;
   icon_url: string;

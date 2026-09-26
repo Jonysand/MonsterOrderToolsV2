@@ -36,8 +36,8 @@ const UNDO_TTL_MS = 5200;
 
 type BubbleTone = "checkin" | "retro" | "like" | "gift" | "system";
 
-/** 大航海等级名（与原工程一致：1=总督, 2=提督, 3=舰长） */
-const GUARD_NAMES: Record<number, string> = { 1: "总督", 2: "提督", 3: "舰长" };
+/** 大航海等级名（与原工程一致：1=总督, 2=提督, 3=舰长；V2 新增 99=GM 特殊管理员） */
+const GUARD_NAMES: Record<number, string> = { 1: "总督", 2: "提督", 3: "舰长", 99: "GM" };
 
 /** 顶栏连接状态点配色 */
 const CONN_DOT_COLORS: Record<string, string> = {
@@ -799,10 +799,10 @@ export const OverlayWindow: React.FC = () => {
   // 锁定时使用穿透模式透明度（原 RefreshWindow 语义）
   const backgroundAlpha = (locked ? penetratingOpacity : opacity) / 100;
 
-  /** 大航海等级的双斜杠标记（数量对齐设计稿：直接取 guard_level） */
+  /** 大航海等级的双斜杠标记（数量对齐设计稿：直接取 guard_level；GM 档封顶 3 道） */
   const guardChevron = (level: number) => (
     <span className="queue-chev">
-      {Array.from({ length: level }, (_, i) => (
+      {Array.from({ length: Math.min(level, 3) }, (_, i) => (
         <i key={i} />
       ))}
     </span>
@@ -850,7 +850,7 @@ export const OverlayWindow: React.FC = () => {
 
       {/* 稀有度已由图鉴卡描边与脊线表达，徽章组只放舰长等级与优先，最多两枚 */}
       <span className="queue-badges">
-        {item.guard_level >= 1 && item.guard_level <= 3 && (
+        {(item.guard_level === 99 || (item.guard_level >= 1 && item.guard_level <= 3)) && (
           <span className={`queue-chip g${item.guard_level}`}>
             {guardChevron(item.guard_level)}
             {GUARD_NAMES[item.guard_level]}

@@ -1283,9 +1283,9 @@ pub fn handle_incoming_danmu(
     state: &AppState,
     mut danmu: bilibili::DanmuData,
 ) -> bilibili::DanmuProcessResult {
-    // 1. 特殊用户判定：特定 open_id 永远判定为总督 (guard_level = 1)
+    // 1. 特殊用户判定：特定 open_id 永远判定为 GM (guard_level = 99，高于总督/提督/舰长)
     if danmu.user_id == bilibili::SPECIAL_OPEN_ID {
-        danmu.guard_level = 1;
+        danmu.guard_level = bilibili::GUARD_LEVEL_GM;
     }
 
     let cfg = {
@@ -1572,7 +1572,9 @@ pub fn handle_incoming_danmu(
     if !IS_LITE && cfg.enable_voice {
         let msg_trim = danmu.message.trim();
         let passes_medal = !cfg.only_speek_wearing_medal || danmu.has_medal;
+        // GM 档（99）不属于任何大航海档位，永远放行（原工程中特殊用户恒为总督，同样全档放行）
         let passes_guard = cfg.only_speek_guard_level == 0
+            || danmu.guard_level == bilibili::GUARD_LEVEL_GM
             || (danmu.guard_level > 0 && danmu.guard_level <= cfg.only_speek_guard_level);
         // 注：原工程 ShouldSpeak 的 onlySpeekPaidGift 判定依赖 isPaidGift，而该字段在原工程
         // 从未被赋值（恒 false），开启开关会静音全部播报，属死逻辑；V2 不复刻，
@@ -3388,7 +3390,7 @@ mod tests {
             timestamp: 88888,
             has_medal: false,
             medal_level: 0,
-            guard_level: 0, // 初始为 0，由管道自动赋权总督 1
+            guard_level: 0, // 初始为 0，由管道自动赋权 GM 99
             msg_id: "sim_special_1".into(),
             is_paid_gift: false,
             has_history_required_fields: true,
@@ -3399,12 +3401,28 @@ mod tests {
         assert_eq!(res.monster_name, "霸主雌火龙");
         assert!(res.added_to_queue);
 
+        // 总督水友更早发出优先点怪：GM 档（99）仍必须排在总督（1）之前
+        let dm_governor = bilibili::DanmuData {
+            user_id: "u_governor".into(),
+            user_name: "总督水友".into(),
+            message: "点怪优先霸主太太".into(),
+            timestamp: 7777, // 比 GM 的 88888 更早
+            has_medal: false,
+            medal_level: 0,
+            guard_level: 1,
+            msg_id: "sim_governor_1".into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+        handle_incoming_danmu(None, &state, dm_governor);
+
         let q = state.queue_mgr.lock().unwrap();
-        assert_eq!(q.items.len(), 1);
-        assert_eq!(q.items[0].guard_level, 1);
+        assert_eq!(q.items.len(), 2);
+        assert_eq!(q.items[0].user_id, bilibili::SPECIAL_OPEN_ID, "GM 必须排在总督之前");
+        assert_eq!(q.items[0].guard_level, bilibili::GUARD_LEVEL_GM);
         assert!(q.items[0].is_priority);
-        // 点怪列表展示归一化：昵称固定为 GM（History/TTS 仍用弹幕原始昵称，不受影响）
-        assert_eq!(q.items[0].user_name, bilibili::SPECIAL_DISPLAY_NAME);
+        // 昵称保持弹幕原始昵称（GM 只体现在等级徽章，History/TTS 仍用原始昵称）
+        assert_eq!(q.items[0].user_name, "特殊神秘管理员");
         println!("[PASS] test_simulate_danmu_special_user_ordering passed");
     }
 
@@ -5442,6 +5460,34 @@ mod tests {
         assert_eq!(
             state.tts_mgr.dequeue_speak().expect("总督应入队").text,
             "总督水友 说：早上好"
+        );
+
+        // 总督档（=1）：除总督外全被拦；GM 档（99）不属于任何大航海档位，永远放行
+        {
+            let mut cfg = state.config.lock().unwrap();
+            cfg.only_speek_guard_level = 1;
+        }
+        handle_incoming_danmu(None, &state, dm(8, "低档提督", 2));
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "提督低于总督档不得入队");
+        handle_incoming_danmu(
+            None,
+            &state,
+            bilibili::DanmuData {
+                user_id: bilibili::SPECIAL_OPEN_ID.into(),
+                user_name: "GM管理员".into(),
+                message: "早上好".into(),
+                timestamp: 9,
+                has_medal: false,
+                medal_level: 0,
+                guard_level: 0, // 原始弹幕无舰长身份，由管道赋权 GM 99
+                msg_id: "guard_gm".into(),
+                is_paid_gift: false,
+                has_history_required_fields: true,
+            },
+        );
+        assert_eq!(
+            state.tts_mgr.dequeue_speak().expect("GM 应在任何档位放行").text,
+            "GM管理员 说：早上好"
         );
 
         println!("[PASS] test_read_aloud_respects_guard_level_filter passed");
