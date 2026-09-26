@@ -25,7 +25,7 @@
       },
       {
         "label": "overlay",
-        "title": "点怪姬",
+        "title": "桌面点怪悬浮窗",
         "url": "index.html#/overlay",
         "width": 440,
         "height": 360,
@@ -56,6 +56,16 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese"],
+        "displayLanguageSelector": false,
+        "template": "nsis/installer.nsi"
+      },
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
   }
 }
