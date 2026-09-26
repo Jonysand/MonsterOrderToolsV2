@@ -81,7 +81,6 @@ def main() -> int:
     print(f"       APP_ID            = {data.get('APP_ID', '')}")
     print(f"       ACCESS_KEY_ID     = {mask(str(data.get('ACCESS_KEY_ID', '')))}")
     print(f"       ACCESS_KEY_SECRET = {mask(str(data.get('ACCESS_KEY_SECRET', '')))}")
-    print(f"       mimo_tts_api_key  = {mask(str(data.get('mimo_tts_api_key', '')))}")
     print(f"       manbo_api_key     = {mask(str(data.get('manbo_api_key', '')))}")
     print(f"       chat_provider     = {data.get('chat_provider', '')}")
     print(f"       chat_api_key      = {mask(str(data.get('chat_api_key', '')))}")
