@@ -1,6 +1,6 @@
 ﻿# 核心点怪、打卡补签与日志的代码级修复方案
 
-> 方案日期：2026-09-25；设计基线：`cb0e2c56418b5f12228ea4922de5759900db5ee2`。问题证据、严重度及未验项在 `docs/CORE_FLOW_REVIEW_2026-09-25.md`。**本文件是实施方案，不代表代码、测试或发布包已经修改。**
+> 方案日期：2026-09-25；设计基线：`cb0e2c56418b5f12228ea4922de5759900db5ee2`。问题证据、严重度及未验项在 `docs/CORE_FLOW_REVIEW_2026-09-25.md`。**本文件是实施方案；实施进度以第 10 节「修复状态」为准，未落项在该节单独标出。**
 > 旧工程对照使用公开仓库 `Jonysand/MonsterOrderTools` 提交 `40bca8c9af3ad68c1f8c4acd77c96ac725c826be`。本文明确区分旧行为、V2 的有意差异及尚待产品确认之处。
 
 ## 1. 目标、约束和工程原理
@@ -218,7 +218,7 @@ setup 中 `ensure_seeded()` 后计算一次缺失资源集合，存入 AppState�
 
 ## 9. 实施顺序、测试矩阵与发布门禁
 
-建议顺序：**A1+A2（守住单）→ C1+C2（禁止资产假持久）→ D1+D2+D3+D4+D5（数据事务、三连补签与补签幂等）→ B1+B2+B3+B4（词库与名单）→ E1/E2/E3（轮换及网络）→ F1/F2/F3（历史及诊断）→ 第 8 节其余产品决策**。D5 的持久化去重需明确核准增加一张 V2 专用表；若产品不同意，暂停该项并修订门禁，不悄悄降级。每一批次先运行**该批次已实施范围**的反向测试和现有回归；只有进入最终发布门禁时才要求 A—F（含 D5）的全部测试同时通过。若新增 V2 去重表需额外用户确认而 D5 暂停，不能把 I01 测试列为已经通过或称本方案全部完成，须单独记录发布阻塞／已知风险并请用户重新定范围。若早期批次调整了 IPC 快照类型，两个前端及 Rust 事件一次性同步，不能在半套协议状态发布。
+建议顺序：**A1+A2（守住单）→ C1+C2（禁止资产假持久）→ D1+D2+D3+D4+D5（数据事务、三连补签与补签幂等）→ B1+B2+B3+B4（词库与名单）→ E1/E2/E3（轮换及网络）→ F1/F2/F3（历史及诊断）→ 第 8 节其余产品决策**。D5 的持久化去重需明确核准增加一张 V2 专用表（`processed_retro_commands`，**已核准并随 `f18d459` 落地**）；D3 所需的第二张表仍未核准，该项暂停并保留为发布阻塞，见第 10 节。每一批次先运行**该批次已实施范围**的反向测试和现有回归；只有进入最终发布门禁时才要求 A—F（含 D5）的全部测试同时通过。若新增 V2 去重表需额外用户确认而 D5 暂停，不能把 I01 测试列为已经通过或称本方案全部完成，须单独记录发布阻塞／已知风险并请用户重新定范围。若早期批次调整了 IPC 快照类型，两个前端及 Rust 事件一次性同步，不能在半套协议状态发布。
 
 | 门禁 | 必须验证的事实 | 数据隔离要求 |
 |---|---|---|
@@ -233,3 +233,31 @@ setup 中 `ensure_seeded()` 后计算一次缺失资源集合，存入 AppState�
 **性能数据采集方法（尚无结果）：**在隔离生产构建上用固定 175 条怪物词库，回放相同的 500／5000 条合成 DM，至少三次记录入口处理 p50/p95/p99、queue mutex 等待、每 500ms 磁盘写入次数与最长用时，以及启用／关闭 History 时的 WS 接收延迟；同时在单盘 I/O 故障、名单慢盘写入下观察排队延迟。记录 Windows 版本、CPU、盘型、构建模式与历史任务数。只有采样后才能决定 History 需不需要有界单写者队列，不能先声称锁外写盘或同步留档“性能更快”。
 
 **明确不承诺的范围：**进程内版本／写锁不能协调两个独立进程同时指向同一配置目录；Windows 目标文件被外部独占打开时重命名仍可能失败；`sync_all+rename` 不等于任意断电必不丢；AI／TTS 外部服务质量需独立人工验收。上述情况必须在发布说明中如实写出，而不是用缺乏实测的“完全兼容”代替。
+
+## 10. 修复状态（2026-09-26 补记）
+
+实施提交：`f18d459`（已推送）。除下表明确列出的未落项外，第 2—7 节设计的机制均已进入代码。请注意：第 2—9 节的**行号与函数名按设计时点 `cb0e2c5` 书写**，实施后行号已整体位移，定位代码请按符号名而不是老行号。
+
+| 阶段 | 状态 | 落地要点 |
+|---|---|---|
+| A（Q01、Q02、Q08、Q10） | 已落地 | `QueueManager` 的 `revision`／`saved_revision` 与 `QueueSnapshot{items,revision,persistence}`；`reorder_by_ids(ordered_user_ids, expected_revision)` 拒绝陈旧快照；`queue_flush_lock` 单写者（锁序恒为 flush → queue）；写盘用 `{name}.{pid}.{seq}.tmp` + `create_new` + `sync_all` + `rename`；`restore_order` 检查返回值并对重复入队返回冲突错误 |
+| B（Q03—Q07、Q09） | 已落地 | `upsert_entry` 拒绝新增撞名、改名覆盖与改名目标缺失；`exact_entry` + `picked_order_enqueue` 按原名精确取键并在名单 guard 内完成检查与入队；`roster` 的 `lock_edit`／`commit_locked`／`replace_if_revision` 串行编辑与版本 CAS；草稿冲突不再以“保存前已冲突”为门槛；选怪筛选失效时清空选中 |
+| C（D01、D06、M01） | 已落地 | `checkin_mgr: Option<Arc<CheckinManager>>` + `CheckinStatus`，建库失败显式停用打卡而非静默退回内存库；`resolve_db_path` + `checkin_active_db.json` 活动库标记 + 双库并存告警；Lite 在路径探测、`create_dir_all`、`Connection::open` 之前短路 |
+| D（D02—D05、D07、D03） | 已落地 | `record_checkin`／`add_likes`／`batch_checkin` 全事务化并以 `?` 传播 SQL 错误；`load_cards` 改 `Option` 语义区分“无行”与“SQL 故障”；`processed_retro_commands` 幂等表与扣卡、明细、档案同事务提交；补签与补签查询路由独立于 `should_skip_duplicate` 和打卡总开关 |
+| E（K01、L02、L03） | 已落地 | 共享 `Arc<RwLock<CredentialState>>` 凭据快照 + `publish_credentials`，配置页不再覆写密钥；`bili_lifecycle` 异步闸门 + `credential_gate` 短提交闸门，活跃会话与未确认关闭时拒绝导入；`parse_business_code` 对缺失／非整数／越界 `code` 一律报错；`SessionEndState` + `SessionCtl` 支持取消退避与可取消 WS select |
+| F（L01、L04—L06） | 已落地 | `record_business_history` 改由业务事件驱动（DM 进站、打卡／补签回复、SC／上舰、进场、礼物结算），不再由 TTS 出队触发；`startup_missing` + `get_missing_resources` 提供冷启动缺资源快照；`sanitize_field` 单行化，内存环与文件写入合并进同一临界区 |
+| D3 持久化重试补偿 | **未落地** | 现有实现已做到整事件回滚与 `like-reward-failed` 可见失败，但失败事件没有任何持久化记录，重启即丢。需核准第二张 V2 专用表 `pending_like_rewards`，并在 A-1／A-2 之间选定分支；见 `docs/D3_LIKE_REWARD_DURABLE_RETRY_GAP_2026-09-25.md` |
+| 第 8 节产品取舍 | **未决，保持现状** | 新点怪仍触发 `sort_queue` 全量排序，可覆盖主播手排结果；悬浮窗仍整行点击完成；气泡仍在事件接收时立即 emit，未与音频真正开始同步；周奖卡遇迟到赞回退领取标记、旧日期打卡回写 `last_checkin_date` 均未加校验 |
+
+已执行的验证（`f18d459` 时点，本机）：
+
+| 检查 | 结果 |
+|---|---|
+| `cargo test --manifest-path src-tauri/Cargo.toml` | `[PASS]`，230 passed / 0 failed / 0 ignored |
+| `cargo test --manifest-path src-tauri/Cargo.toml --features lite` | `[PASS]`，207 passed / 0 failed / 0 ignored |
+| `npm run build`、`npm run build:lite` | `[PASS]`，1893 modules transformed，无类型错误 |
+| `npm run check:encoding` | `[PASS]`，`bom-required=46 json=9`，`OK: all files follow encoding rules` |
+| `npm run check:fields` | `[PASS]`，`OK: all fields are wired`（仍只是引用计数门禁，不验证行为） |
+| `npm run tauri build`、正式包体在干净目录运行、第 9 节性能采样 | **未执行** |
+
+测试隔离现状（本次运行的边界，不等于第 9 节隔离改造已全部完成）：本机数据目录不含 `credentials.dat` 与打卡库，故真实凭据与真实旧库用例走 SKIP 分支；`registry.rs` 的往返用例会短暂写 `HKCU\Software\MonsterOrderWilds` 后还原，本次运行结束后该键无遗留值；`logging.rs` 崩溃报告用例已改为隔离临时目录并断言写入成功。带 `MH_PUBLISH_DB` 的旧包用例默认 SKIP，未触碰 `D:\publish_v2`。

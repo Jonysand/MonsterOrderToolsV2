@@ -2,7 +2,8 @@
 
 > 复核时间：2026-09-25。当前仓库 HEAD：`cb0e2c56418b5f12228ea4922de5759900db5ee2`。上一轮代码审查基线为 `221cd86e212e744fbd6d671bbabaafe69cac7b72`；两者之间仅修改 `scripts/check_orphan_fields.py` 的 Python 2 兼容逻辑，本文所查业务源码没有变化。
 > 迁移前对照：公开仓库 `Jonysand/MonsterOrderTools` 的固定提交 `40bca8c9af3ad68c1f8c4acd77c96ac725c826be`。本机不存在 AGENTS.md 指定的旧工程本地路径。`D:\publish_v2` 含旧版 `MonsterOrderWilds.exe`、WPF DLL 与历史文件，**不是 V2 运行包**。
-> 这是只读复核，**未修改或修复业务功能**。对应的完整代码级修复设计在 `docs/CORE_FLOW_REMEDIATION_PLAN_2026-09-25.md`。两份文件各自自洽；修复设计不是已实施结果。
+> 这是只读复核，**未修改或修复业务功能**。对应的完整代码级修复设计在 `docs/CORE_FLOW_REMEDIATION_PLAN_2026-09-25.md`。两份文件各自自洽；修复设计不是复核时点的实施结果，实施进度见下条补记。
+> **修复状态（2026-09-26 补记）：**本文 26 项发现的整改已由 `f18d459` 落地并推送。该提交时点本机实测：完整版 `cargo test` 230 passed、Lite 207 passed，`npm run build`、`npm run build:lite`、`npm run check:encoding`、`npm run check:fields` 通过；`npm run tauri build`、新版 GUI 与真实开播**仍未执行**。**未收口 2 项：**D3 的点赞持久化重试补偿只做到整事件回滚与可见失败提示，失败事件无持久化记录（缺口与候选方案见 `docs/D3_LIKE_REWARD_DURABLE_RETRY_GAP_2026-09-25.md`）；第 5 节末的 4 项产品取舍保持原状。正文按复核时点 `cb0e2c5` 的行号与「待确认」措辞保留，与本节冲突时以本节为准。
 
 ## 1. 问题定义、数据流与证据等级
 
@@ -82,7 +83,7 @@ B 站 WebSocket → bilibili.rs 解析 → lib.rs::handle_incoming_danmu
 
 ## 5. 旧问题、待产品确认的行为
 
-- **I01，旧问题继承，不算迁移回归；修复方案 D5 一并处理（需用户核准新增 V2 去重表）：**相同 `msg_id` 的“补签”弹幕重投，在 `bilibili.rs` 第808—814行点怪去重前，已于 `lib.rs` 第912—943行处理并 return；如果有两张卡、两个缺日，重投可扣两次。旧补签入口也没有 DM ID 去重。修复不能简单在 `handle_incoming_danmu` 顶部调用现有缓存，否则第一次点怪在 `process_danmu` 又被判重。
+- **I01，旧问题继承，不算迁移回归；已由修复方案 D5 落地修复（V2 专用去重表 `processed_retro_commands` 已获核准）：**相同 `msg_id` 的“补签”弹幕重投，在 `bilibili.rs` 第808—814行点怪去重前，已于 `lib.rs` 第912—943行处理并 return；如果有两张卡、两个缺日，重投可扣两次。旧补签入口也没有 DM ID 去重。修复不能简单在 `handle_incoming_danmu` 顶部调用现有缓存，否则第一次点怪在 `process_danmu` 又被判重。
 - 旧版及新版周奖卡均只比较 `weekly_first_claimed != week_start`；上周迟到赞可能使标记回退，但没有 B 站实际乱序证据。旧日期打卡覆写 `last_checkin_date` 亦为旧问题，不作为本轮迁移回归。
 - **待确认：**手动拖拽后新弹幕入队又触发 `queue.rs` 第114—119、196—199行全量排序，是否允许抹去主播人工顺序；悬浮窗当前整行点击即完成，旧工程亦如此，但历史审计记录称用户确认改为“显式完成按钮”；TTS 积压超过 15 秒时气泡可在出声前消失，是故意“即时气泡”还是应与旧版播音回调同步。完整方案给出默认建议，不在未确认前把这些取舍称为修复完成。
 
