@@ -961,20 +961,12 @@ fn save_id_code(id_code: String, state: State<'_, AppState>) -> Result<(), Strin
     Ok(())
 }
 
-/// 保存全部配置（敏感字段不会写入 JSON，凭据权威来源为 credentials.dat）。
-/// 保存后即时热更新：弹幕过滤器 + 广播 config-changed 供悬浮窗刷新
-#[tauri::command]
-fn save_app_config(
-    app: AppHandle,
-    mut new_cfg: AppConfig,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    // 身份码与 Manbo Key 的注册表同步统一由 AppConfig::save → persist_registry 完成
-    // （E2：移除此处重复写入；空值语义不变——仅非空才覆盖注册表）
-
-    // 敏感凭据全部由已验签的凭据文件独占：**忽略前端回传的敏感字段**，
-    // 前端 newCfg 里的这些值一律不采纳（避免配置页把密钥写坏或写空）
-    let prev = state.config.lock().map_err(|e| e.to_string())?.clone();
+/// 前端回传配置的统一裁决（save_app_config 与 update_config_memory 共用）：
+/// 敏感字段回填凭据文件权威值；悬浮窗位置由拖动链路独占；身份码由显式 save_id_code 独占。
+/// 防抖自动保存可能撞上身份码输入中途的半截串，回传值一律不采纳，
+/// 否则 persist_registry 的「非空即写入」会把半截串写进注册表污染权威存储。
+fn sanitize_incoming_config(state: &AppState, mut new_cfg: AppConfig) -> AppConfig {
+    let prev = state.config.lock().map(|c| c.clone()).unwrap_or_default();
     let creds_snapshot = state.credentials_snapshot();
     let creds = &creds_snapshot.creds;
     macro_rules! keep_cred {
@@ -997,19 +989,33 @@ fn save_app_config(
     new_cfg.top_pos_x = prev.top_pos_x;
     new_cfg.top_pos_y = prev.top_pos_y;
 
+    // 身份码权威链路是显式 save_id_code 命令，配置保存不承载它
+    new_cfg.id_code = prev.id_code.clone();
+
     // 防御：前端回传缺刻度标记（异常场景）时按旧口径减半，保证旧口径值只被换算一次
     new_cfg.normalize_volume_scale();
+    new_cfg
+}
 
-    let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
-    *cfg = new_cfg.clone();
-    cfg.save(None)?;
+/// 把裁决后的配置写入 config 锁并热更新全部运行时消费方，persist 决定是否落盘。
+/// 返回脱敏配置供调用方广播 config-changed（锁外发出，避免持锁跨 IPC）。
+fn apply_config_to_state(
+    state: &AppState,
+    new_cfg: AppConfig,
+    persist: bool,
+) -> Result<AppConfig, String> {
+    let sanitized = {
+        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
+        *cfg = new_cfg.clone();
+        if persist {
+            cfg.save(None)?;
+        }
+        cfg.sanitized()
+    };
 
     // 运行期热更新：点怪过滤开关立即生效（无需重启）；
     // 播报过滤（仅粉丝牌/舰长等级）由 handle_incoming_danmu 直接读 config 快照，无需另行同步
     state.danmu_processor.update_filters(new_cfg.only_medal_order);
-    // 广播脱敏配置，悬浮窗据此刷新跑马灯 / 透明度等
-    let _ = app.emit("config-changed", cfg.sanitized());
-
     state.ai_provider.set_api_key(new_cfg.deepseek_api_key.clone());
     state.tts_mgr.update_config(TTSConfig {
         engine: parse_tts_engine(&new_cfg.tts_engine),
@@ -1020,7 +1026,35 @@ fn save_app_config(
         manbo_api_key: new_cfg.manbo_api_key,
         manbo_voice: new_cfg.manbo_voice,
     });
+    Ok(sanitized)
+}
 
+/// 保存全部配置（敏感字段不会写入 JSON，凭据权威来源为 credentials.dat）。
+/// 保存后即时热更新：弹幕过滤器 + 广播 config-changed 供悬浮窗刷新
+#[tauri::command]
+fn save_app_config(
+    app: AppHandle,
+    new_cfg: AppConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let trusted = sanitize_incoming_config(&state, new_cfg);
+    let sanitized = apply_config_to_state(&state, trusted, true)?;
+    let _ = app.emit("config-changed", sanitized);
+    Ok(())
+}
+
+/// 设置实时生效通道：只更新内存配置并热更新运行时消费方（含 config-changed 广播），不落盘。
+/// 落盘由前端 800ms 防抖调用 save_app_config 完成；退出时 shutdown_app 无条件兜底落盘。
+/// 两者都经 sanitize_incoming_config 裁决，语义除「是否写盘」外完全一致。
+#[tauri::command]
+fn update_config_memory(
+    app: AppHandle,
+    new_cfg: AppConfig,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let trusted = sanitize_incoming_config(&state, new_cfg);
+    let sanitized = apply_config_to_state(&state, trusted, false)?;
+    let _ = app.emit("config-changed", sanitized);
     Ok(())
 }
 
@@ -2741,12 +2775,13 @@ fn hide_window(app_handle: AppHandle, label: String) -> Result<(), String> {
 /// V2 中队列/配置均为变更即时落盘，此处补做待写悬浮窗位置落盘、停止直播连接并记录日志，最后退出进程。
 /// 有意差异：不在退出路径阻塞调用 B 站下播接口（end_app API），避免网络等待拖慢退出
 fn shutdown_app(app_handle: &AppHandle, state: &AppState) {
-    // 1. 待写悬浮窗位置立即落盘（等价原工程 WriteQueue::Flush 的兜底落盘）
-    if apply_pending_position(state).is_some() {
-        if let Ok(cfg) = state.config.lock() {
-            if let Err(e) = cfg.save(None) {
-                crate::log_warn!("[App] 退出时保存悬浮窗位置失败: {}", e);
-            }
+    // 1. 待写悬浮窗位置并入内存配置后无条件落盘（等价原工程 WriteQueue::Flush 的兜底落盘）。
+    //    即时内存同步通道（update_config_memory）保证锁内始终是最新生效值，
+    //    这里兜底覆盖 800ms 落盘防抖窗口内的改动：关窗不丢任何已应用的设置
+    let _ = apply_pending_position(state);
+    if let Ok(cfg) = state.config.lock() {
+        if let Err(e) = cfg.save(None) {
+            crate::log_warn!("[App] 退出时保存配置失败: {}", e);
         }
     }
     // 2. 队列强制落盘（等价原工程退出前的 WriteQueue::Flush；覆盖 500ms 节流窗口内未写的变更）
@@ -3057,6 +3092,7 @@ pub fn run() {
             import_monster_roster,
             get_app_config,
             save_app_config,
+            update_config_memory,
             save_id_code,
             get_id_code,
             get_bili_connection_state,
@@ -3367,6 +3403,8 @@ mod tests {
         assert_eq!(q.items.len(), 1);
         assert_eq!(q.items[0].guard_level, 1);
         assert!(q.items[0].is_priority);
+        // 点怪列表展示归一化：昵称固定为 GM（History/TTS 仍用弹幕原始昵称，不受影响）
+        assert_eq!(q.items[0].user_name, bilibili::SPECIAL_DISPLAY_NAME);
         println!("[PASS] test_simulate_danmu_special_user_ordering passed");
     }
 
@@ -3971,7 +4009,7 @@ mod tests {
         println!("[PASS] test_credentials_status_reports_blocked_state passed");
     }
 
-    /// E1：敏感字段不得被配置页覆盖 —— save_app_config 忽略前端回传的密钥
+    /// E1：敏感字段不得被配置页覆盖 —— 统一裁决忽略前端回传的密钥
     #[test]
     fn test_config_save_ignores_frontend_secrets() {
         let state = AppState::new_test();
@@ -3990,20 +4028,64 @@ mod tests {
         hostile.deepseek_api_key = "sk-hacked".into();
         hostile.manbo_api_key = "manbo-hacked".into();
 
-        // 复刻 save_app_config 的字段裁决逻辑（keep_cred! 宏）
-        let snap = state.credentials_snapshot();
-        let mut new_cfg = hostile.clone();
-        new_cfg.app_id = snap.creds.app_id.clone();
-        new_cfg.access_key_id = snap.creds.access_key_id.clone();
-        new_cfg.access_key_secret = snap.creds.access_key_secret.clone();
-        new_cfg.deepseek_api_key = snap.creds.chat_api_key.clone();
-        new_cfg.manbo_api_key = snap.creds.manbo_api_key.clone();
+        let new_cfg = sanitize_incoming_config(&state, hostile);
 
         assert_eq!(new_cfg.app_id, "4004", "前端 app_id 不得覆盖凭据文件");
         assert_eq!(new_cfg.access_key_secret, "TRUSTED_SECRET", "密钥不得被前端覆盖");
         assert_eq!(new_cfg.deepseek_api_key, "sk-trusted");
         assert_eq!(new_cfg.manbo_api_key, "manbo-trusted", "Manbo Key 不得被前端覆盖");
         println!("[PASS] test_config_save_ignores_frontend_secrets passed");
+    }
+
+    /// G 加固：配置保存链路忽略回传 id_code —— 防抖窗口内输入中途的半截身份码
+    /// 不得进入 persist_registry（「非空即写入」会把它写进注册表污染权威存储）
+    #[test]
+    fn test_config_save_ignores_frontend_id_code() {
+        let state = AppState::new_test();
+        state.config.lock().unwrap().id_code = "TRUSTED_CODE".into();
+
+        let mut incoming = AppConfig::default();
+        incoming.id_code = "half_typed_code".into();
+        let trusted = sanitize_incoming_config(&state, incoming);
+
+        assert_eq!(
+            trusted.id_code, "TRUSTED_CODE",
+            "回传 id_code 必须被锁内权威值替换，身份码只能经 save_id_code 落注册表"
+        );
+        println!("[PASS] test_config_save_ignores_frontend_id_code passed");
+    }
+
+    /// G 加固：内存更新通道立即生效但不落盘 —— config 锁与运行时消费方
+    /// （点怪过滤 / TTS 参数 / AI Key）同步更新，persist=false 时不触发写盘
+    #[test]
+    fn test_update_config_memory_applies_without_disk_write() {
+        let state = AppState::new_test();
+        let mut incoming = AppConfig::default();
+        incoming.enable_voice = true;
+        incoming.only_medal_order = false;
+        incoming.only_speek_guard_level = 3;
+        incoming.speech_rate = -5;
+
+        let sanitized = apply_config_to_state(&state, incoming, false).expect("内存应用应成功");
+
+        // config 锁立即生效
+        {
+            let cfg = state.config.lock().unwrap();
+            assert!(cfg.enable_voice, "锁内 enable_voice 应立即更新");
+            assert_eq!(cfg.only_speek_guard_level, 3);
+        }
+        // 脱敏快照不含敏感字段，且配置值与锁内一致
+        assert!(sanitized.enable_voice);
+        assert!(sanitized.app_id.is_empty(), "脱敏快照不得携带 app_id");
+        // 运行时消费方立即同步
+        assert!(
+            !state.danmu_processor.only_medal_order.load(std::sync::atomic::Ordering::Relaxed),
+            "点怪过滤开关应立即热更新"
+        );
+        let tts_cfg = state.tts_mgr.config_snapshot();
+        assert!(tts_cfg.enable_voice, "TTS 配置应立即热更新");
+        assert_eq!(tts_cfg.speech_rate, -5);
+        println!("[PASS] test_update_config_memory_applies_without_disk_write passed");
     }
 
     /// Manbo Key 注入优先级：凭据文件（打包预置）非空时优先于配置镜像（与对话 Key 同口径），

@@ -278,8 +278,11 @@ export const MainWindow: React.FC = () => {
     });
 
     // 配置在别处变更（如退出前落盘、其他窗口修改）时刷新设置面板，
-    // 避免面板持有陈旧副本；top_pos 由后端独占维护，不受此影响
+    // 避免面板持有陈旧副本；top_pos 由后端独占维护，不受此影响。
+    // 本地有挂起的同步/落盘定时器（正在编辑）时跳过回读：自己触发的广播无需回读，
+    // 且回读的远端值可能落后于本地输入，会回滚正在输入的内容（如打卡触发词）
     const unlistenConfig = listen("config-changed", () => {
+      if (memorySyncTimerRef.current !== null || autoSaveTimerRef.current !== null) return;
       fetchConfig();
     });
 
@@ -676,22 +679,43 @@ export const MainWindow: React.FC = () => {
     }
   };
 
-  // 滑杆类控件：改动静音期（800ms）后自动保存并广播 config-changed，
-  // 使悬浮窗透明度/跑马灯等即时生效，且用户改完直接关窗也不会丢设置
-  // （对齐原工程：每个控件 ConfigChanged → SaveConfig + RefreshWindow）
+  // 最新配置镜像：防抖回调一律读 ref 而非闭包快照，保证保存的永远是
+  // 「回调触发时刻」的全量最新值 —— 无论改动来自哪个控件都不会被旧快照回滚
+  const configRef = useRef<AppConfig | null>(null);
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  // 设置实时生效双通道（对齐原工程逐控件 ConfigChanged 即改即生效）：
+  // 通道1：30ms 微防抖削峰后同步后端内存配置（update_config_memory），业务热路径
+  //        与悬浮窗广播即时生效，感知不到延迟；
+  // 通道2：800ms 静默期后落盘（save_app_config）；期间关窗由后端退出兜底落盘，不丢改动
+  const memorySyncTimerRef = useRef<number | null>(null);
   const autoSaveTimerRef = useRef<number | null>(null);
-  const applyConfigPatch = (patch: Partial<AppConfig>) => {
-    setConfig((prev) => {
-      if (!prev) return prev;
-      const next = { ...prev, ...patch };
-      if (autoSaveTimerRef.current !== null) window.clearTimeout(autoSaveTimerRef.current);
-      autoSaveTimerRef.current = window.setTimeout(() => {
-        invoke("save_app_config", { newCfg: next }).catch((err) =>
+  const scheduleConfigSync = () => {
+    if (memorySyncTimerRef.current !== null) window.clearTimeout(memorySyncTimerRef.current);
+    memorySyncTimerRef.current = window.setTimeout(() => {
+      memorySyncTimerRef.current = null;
+      if (configRef.current) {
+        invoke("update_config_memory", { newCfg: configRef.current }).catch((err) =>
+          showToast(`配置同步失败: ${err}`)
+        );
+      }
+    }, 30);
+    if (autoSaveTimerRef.current !== null) window.clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      if (configRef.current) {
+        invoke("save_app_config", { newCfg: configRef.current }).catch((err) =>
           showToast(`自动保存失败: ${err}`)
         );
-      }, 800);
-      return next;
-    });
+      }
+    }, 800);
+  };
+
+  const applyConfigPatch = (patch: Partial<AppConfig>) => {
+    setConfig((prev) => (prev ? { ...prev, ...patch } : prev));
+    scheduleConfigSync();
   };
 
   return (
@@ -1432,7 +1456,7 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={config.enable_voice}
-                      onChange={(e) => setConfig({ ...config, enable_voice: e.target.checked })}
+                      onChange={(e) => applyConfigPatch({ enable_voice: e.target.checked })}
                       className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                     />
                     <span>开启语音播报（总开关）</span>
@@ -1442,7 +1466,7 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={config.only_speek_wearing_medal}
-                      onChange={(e) => setConfig({ ...config, only_speek_wearing_medal: e.target.checked })}
+                      onChange={(e) => applyConfigPatch({ only_speek_wearing_medal: e.target.checked })}
                       className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                     />
                     <span>仅播报佩戴粉丝牌的弹幕</span>
@@ -1452,7 +1476,7 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={config.only_speek_paid_gift}
-                      onChange={(e) => setConfig({ ...config, only_speek_paid_gift: e.target.checked })}
+                      onChange={(e) => applyConfigPatch({ only_speek_paid_gift: e.target.checked })}
                       className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                     />
                     <span>仅播报付费礼物</span>
@@ -1462,7 +1486,7 @@ export const MainWindow: React.FC = () => {
                     <label className="block text-[11px] text-neutral-400 mb-1">播报至少等级（大航海）</label>
                     <select
                       value={config.only_speek_guard_level}
-                      onChange={(e) => setConfig({ ...config, only_speek_guard_level: Number(e.target.value) })}
+                      onChange={(e) => applyConfigPatch({ only_speek_guard_level: Number(e.target.value) })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
                       <option value={0}>所有人</option>
@@ -1479,7 +1503,7 @@ export const MainWindow: React.FC = () => {
                     <label className="block text-[11px] text-neutral-400 mb-1">播报引擎</label>
                     <select
                       value={config.tts_engine || "auto"}
-                      onChange={(e) => setConfig({ ...config, tts_engine: e.target.value })}
+                      onChange={(e) => applyConfigPatch({ tts_engine: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
                       <option value="auto">自动（按优先级依次尝试）</option>
@@ -1500,8 +1524,7 @@ export const MainWindow: React.FC = () => {
                       max={365}
                       value={config.tts_cache_days_to_keep}
                       onChange={(e) =>
-                        setConfig({
-                          ...config,
+                        applyConfigPatch({
                           tts_cache_days_to_keep: Math.min(365, Math.max(1, Number(e.target.value))),
                         })
                       }
@@ -1514,7 +1537,7 @@ export const MainWindow: React.FC = () => {
                     </label>
                     <select
                       value={config.manbo_voice}
-                      onChange={(e) => setConfig({ ...config, manbo_voice: e.target.value })}
+                      onChange={(e) => applyConfigPatch({ manbo_voice: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
                       {(manboVoices.length > 0 ? manboVoices : [config.manbo_voice || "曼波"]).map((voice) => (
@@ -1599,7 +1622,7 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="checkbox"
                       checked={config.only_medal_order}
-                      onChange={(e) => setConfig({ ...config, only_medal_order: e.target.checked })}
+                      onChange={(e) => applyConfigPatch({ only_medal_order: e.target.checked })}
                       className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                     />
                     <span>仅粉丝牌（含舰长）可点怪</span>
@@ -1612,7 +1635,7 @@ export const MainWindow: React.FC = () => {
                         <input
                           type="checkbox"
                           checked={config.enable_captain_checkin_ai}
-                          onChange={(e) => setConfig({ ...config, enable_captain_checkin_ai: e.target.checked })}
+                          onChange={(e) => applyConfigPatch({ enable_captain_checkin_ai: e.target.checked })}
                           className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
                         />
                         <span>开启舰长打卡 AI 功能</span>
@@ -1623,7 +1646,7 @@ export const MainWindow: React.FC = () => {
                         <input
                           type="text"
                           value={config.checkin_trigger_words}
-                          onChange={(e) => setConfig({ ...config, checkin_trigger_words: e.target.value })}
+                          onChange={(e) => applyConfigPatch({ checkin_trigger_words: e.target.value })}
                           className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                         />
                         <span className="text-[10px] text-neutral-500">默认：打卡,签到（支持中文逗号，清空则完全停用打卡指令）</span>
