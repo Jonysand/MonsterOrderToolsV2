@@ -909,13 +909,27 @@ export const OverlayWindow: React.FC = () => {
         style={{ "--panel-alpha": String(backgroundAlpha) } as React.CSSProperties}
         className="overlay-panel h-full w-full flex flex-col overflow-hidden relative cursor-move"
       >
-        {/* 环境装饰层（荒野：沙霾浮尘 / 凌越：云雾雷光，默认关闭） */}
+        {/* 环境装饰层（荒野：沙霾浮尘 / 凌越：蓝雾赤雷，默认关闭；凌越主题第三团为左下红雾） */}
         <span className="overlay-sky">
+          <i />
           <i />
           <i />
         </span>
         <div className="overlay-drift" />
         <div className="overlay-flash" />
+
+        {/* 凌越红轮水印：取自 ASCENDANCE logo 下部红轮法阵，仅凌越主题显示（样式见 App.css .overlay-ringwm） */}
+        <svg className="overlay-ringwm" viewBox="0 0 100 100" aria-hidden="true">
+          <g fill="none" stroke="currentColor">
+            <circle cx="50" cy="50" r="47" strokeWidth="1.2" />
+            <circle cx="50" cy="50" r="36" strokeWidth="0.8" strokeDasharray="3 4" />
+            <circle cx="50" cy="50" r="26" strokeWidth="1.6" />
+            <circle cx="50" cy="50" r="17" strokeWidth="0.8" strokeDasharray="6 3" />
+            <circle cx="50" cy="50" r="6" strokeWidth="2" />
+            <path d="M50 3v10M50 87v10M3 50h10M87 50h10" strokeWidth="1.4" />
+            <path d="M17 17l6 6M77 77l6 6M83 17l-6 6M23 77l-6 6" strokeWidth="1" />
+          </g>
+        </svg>
 
         {/* 顶栏与跑马灯合并为一行，腾出行高（对齐原工程 36px 跑马灯区） */}
         <div
@@ -974,20 +988,35 @@ export const OverlayWindow: React.FC = () => {
           </button>
         </div>
 
-        {/* 几何回纹饰带：MH 系列品牌纹样 */}
-        <svg
-          className="overlay-band relative z-[2] shrink-0"
-          viewBox="0 0 440 9"
-          preserveAspectRatio="none"
-          aria-hidden="true"
-        >
-          <defs>
-            <pattern id="overlay-meander" width="14" height="9" patternUnits="userSpaceOnUse">
-              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" strokeWidth="1" />
-            </pattern>
-          </defs>
-          <rect width="440" height="9" fill="url(#overlay-meander)" />
-        </svg>
+        {/* 几何回纹饰带：MH 系列品牌纹样（凌越主题在其上叠红色回纹，mask 只留右段，见 .overlay-band-red） */}
+        <div className="relative z-[2] shrink-0">
+          <svg
+            className="overlay-band"
+            viewBox="0 0 440 9"
+            preserveAspectRatio="none"
+            aria-hidden="true"
+          >
+            <defs>
+              <pattern id="overlay-meander" width="14" height="9" patternUnits="userSpaceOnUse">
+                <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" strokeWidth="1" />
+              </pattern>
+            </defs>
+            <rect width="440" height="9" fill="url(#overlay-meander)" />
+          </svg>
+          <svg
+            className="overlay-band-red"
+            viewBox="0 0 440 9"
+            preserveAspectRatio="none"
+            aria-hidden="true"
+          >
+            <defs>
+              <pattern id="overlay-meander-red" width="14" height="9" patternUnits="userSpaceOnUse">
+                <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" strokeWidth="1" />
+              </pattern>
+            </defs>
+            <rect width="440" height="9" fill="url(#overlay-meander-red)" />
+          </svg>
+        </div>
 
         {/* D4 业务气泡（多条堆叠，最多 5 条，15s 自动退场） */}
         {bubbles.length > 0 && (

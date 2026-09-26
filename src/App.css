@@ -68,7 +68,7 @@
   --hl: #ddc94a;
   --hl2: #ff7200;
   --glow: rgba(221, 201, 74, 0.35);
-  /* 环境闪频色：荒野偏暖（热浪掠光），凌越偏冷（雷光） */
+  /* 环境闪频色：荒野偏暖（热浪掠光），凌越掺赤（赤雷，见 [data-theme="asc"] 覆盖） */
   --flash: rgba(255, 238, 200, 0.9);
   /* 环境雾霭底色：比 --glow 更淡，只铺氛围不抢内容 */
   --decor-glow: rgba(221, 201, 74, 0.2);
@@ -103,9 +103,127 @@
   --hl: #76dcff;
   --hl2: #8891f3;
   --glow: rgba(118, 220, 255, 0.4);
-  --flash: rgba(180, 235, 255, 0.9);
+  /* 闪频掺赤：24s 一次的雷光改为「赤雷」（评审定稿，见 docs/design/overlay_asc_red_accent.html） */
+  --flash: rgba(255, 150, 130, 0.9);
   --decor-glow: rgba(118, 220, 255, 0.2);
   --row-bg-lift: rgba(9, 24, 40, 0.97);
+
+  /* 下部红纹（ASCENDANCE logo：赤龙尾迹 / 红轮法阵 / 朱色流线） */
+  --red-main: #c74034;
+  --red-bright: #ef6a55;
+  --red-glow: rgba(214, 84, 64, 0.45);
+  --red-decor: rgba(199, 64, 52, 0.2);
+}
+
+/* =============================================================================
+   凌越主题红纹点缀（评审定稿：docs/design/overlay_asc_red_accent.html 方案C，不含朱讯）
+   取自 ASCENDANCE logo 下部：赤龙尾迹 / 红轮法阵 / 朱色流线
+   仅 data-theme="asc" 生效；荒野主题不受影响，行内语义色（稀有度/大航海/优先）不动
+   ============================================================================= */
+
+/* 标题渐变字：复刻 ASCENDANCE 左蓝右红的鎏金渐变（不支持裁切的浏览器保留米白实色） */
+@supports ((background-clip: text) or (-webkit-background-clip: text)) {
+  [data-theme="asc"] .overlay-title {
+    background: linear-gradient(94deg, #9fd4ef, var(--ink) 42%, var(--red-bright) 76%, var(--red-main));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}
+
+/* 计数徽章转红：呼应红轮法阵的印章感 */
+[data-theme="asc"] .overlay-count {
+  color: var(--red-bright);
+  border-color: rgba(239, 106, 85, 0.45);
+}
+
+/* 饰带右段红：蓝色回纹上叠一层红色回纹，mask 只留右段渐显（左蓝右红，对应 DOM 中 .overlay-band-red） */
+.overlay-band-red {
+  display: none;
+}
+
+@supports ((mask-image: linear-gradient(90deg, #000, #000)) or (-webkit-mask-image: linear-gradient(90deg, #000, #000))) {
+  [data-theme="asc"] .overlay-band-red {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 9px;
+    color: var(--red-bright);
+    opacity: 0.95;
+    -webkit-mask-image: linear-gradient(90deg, transparent 38%, #000 74%);
+    mask-image: linear-gradient(90deg, transparent 38%, #000 74%);
+    pointer-events: none;
+  }
+}
+
+/* 面板底边红色渐隐光线：对应 logo 下部赤龙尾迹收底 */
+[data-theme="asc"] .overlay-panel::after {
+  content: "";
+  position: absolute;
+  left: 6%;
+  right: 6%;
+  bottom: 0;
+  height: 2px;
+  z-index: 1;
+  background: linear-gradient(90deg, transparent, var(--red-bright) 50%, transparent);
+  opacity: 0.6;
+  box-shadow: 0 0 14px var(--red-glow);
+  pointer-events: none;
+}
+
+/* 红轮水印：面板右下低透明度装饰（对应 logo 下部红轮法阵），环境装饰开启时缓慢旋转 */
+.overlay-ringwm {
+  display: none;
+}
+
+[data-theme="asc"] .overlay-ringwm {
+  display: block;
+  position: absolute;
+  right: -34px;
+  bottom: -40px;
+  width: 190px;
+  height: 190px;
+  z-index: 0;
+  opacity: 0.14;
+  color: var(--red-main);
+  pointer-events: none;
+}
+
+[data-theme="asc"][data-decor="on"] .overlay-ringwm {
+  animation: ringWmSpin 70s linear infinite;
+}
+
+@keyframes ringWmSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 凌越第三团红雾：左下，与右上蓝雾对角呼应（复刻 logo 上蓝下红构图）；荒野主题不显示。
+   top 用百分比：雾团随面板高度始终搭在面板下缘（.overlay-sky 高度为面板 1.8 倍） */
+[data-theme="asc"] .overlay-sky i:nth-child(3) {
+  display: block;
+  width: 300px;
+  height: 200px;
+  left: -70px;
+  top: 68%;
+  background: radial-gradient(closest-side, var(--red-decor), transparent 72%);
+}
+
+[data-theme="asc"][data-decor="on"] .overlay-sky i:nth-child(3) {
+  animation: skyDrift3 56s ease-in-out infinite;
+}
+
+@keyframes skyDrift3 {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(40px, -22px);
+  }
 }
 
 body {
@@ -738,6 +856,7 @@ body {
   .overlay-sky i,
   .overlay-drift,
   .overlay-flash,
+  .overlay-ringwm,
   .queue-chip {
     animation: none !important;
     transition: none !important;

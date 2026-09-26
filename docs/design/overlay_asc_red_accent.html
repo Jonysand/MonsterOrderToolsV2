@@ -1,0 +1,1109 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>凌越主题 · 下部红纹元素模拟方案</title>
+<style>
+/* =============================================================================
+   凌越主题掺红模拟方案（仅设计评审用，不代表已落地）
+   取色来源：MONSTER HUNTER WILDS: ASCENDANCE 标题 logo 下部红纹
+   （赤龙纹章 / 红轮法阵 / 左右朱色流线）
+   悬浮窗结构、尺寸、变量名均对齐 src/App.css 的 [data-theme="asc"]
+   ============================================================================= */
+
+:root {
+  /* 现有凌越主题变量（App.css 原值） */
+  --panel-a: 13 33 56;
+  --panel-b: 8 25 44;
+  --line: #2f6d94;
+  --line-soft: rgba(118, 220, 255, 0.26);
+  --ink: #eef6fb;
+  --ink-dim: #9dc4dd;
+  --ink-faint: #5f7f96;
+  --hl: #76dcff;
+  --hl2: #8891f3;
+  --glow: rgba(118, 220, 255, 0.4);
+  --flash: rgba(180, 235, 255, 0.9);
+  --decor-glow: rgba(118, 220, 255, 0.2);
+  --row-bg: rgba(0, 0, 0, 0.34);
+  --row-bg-hover: rgba(0, 0, 0, 0.52);
+  --cream: #fcf5de;
+
+  /* 稀有度 / 大航海（主题无关，全方案不动） */
+  --r-normal: #c7c0ab;
+  --r-tempered: #a78bfa;
+  --r-arch: #ffa02e;
+  --r-priority: #ffd66b;
+  --g1: #fed100;
+  --g2: #b48cf2;
+  --g3: #76dcff;
+  --stamp: #e0472f;
+  --danger: #c0392b;
+
+  /* 新增：logo 下部红纹色阶（方案变量，暂定名 --red-*） */
+  --red-deep: #7e1f1a;
+  --red-main: #c74034;
+  --red-bright: #ef6a55;
+  --red-glow: rgba(214, 84, 64, 0.45);
+  --red-decor: rgba(199, 64, 52, 0.2);
+
+  /* 模拟页字体（实际运行用随包思源字体） */
+  --f-serif: "Noto Serif SC", "Source Han Serif SC", "SimSun", serif;
+  --f-sans: "Microsoft YaHei", "Noto Sans SC", "PingFang SC", sans-serif;
+  --f-num: Georgia, "Times New Roman", serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 28px 20px 60px;
+  background: #0e1013;
+  color: #d8dde3;
+  font-family: var(--f-sans);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.page { max-width: 1120px; margin: 0 auto; }
+
+/* ---------------- 页头 ---------------- */
+
+.page-head h1 {
+  margin: 0 0 6px;
+  font-family: var(--f-serif);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  /* 页头标题直接示范「渐变字」效果 */
+  background: linear-gradient(94deg, #9fd4ef, #eef6fb 44%, #ef6a55 78%, #c74034);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.page-head .sub { color: #8b939c; font-size: 12.5px; }
+
+.page-head .sub b { color: #ef6a55; font-weight: 700; }
+
+.toolbar { margin: 16px 0 4px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+.decor-btn {
+  font-family: var(--f-sans);
+  font-size: 12px;
+  font-weight: 700;
+  color: #9dc4dd;
+  background: #15181d;
+  border: 1px solid #2c3a47;
+  border-radius: 7px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: 0.15s;
+}
+
+.decor-btn:hover { border-color: var(--hl); color: var(--hl); }
+
+.decor-btn.on { color: #0e1013; background: var(--hl); border-color: var(--hl); }
+
+.toolbar .tip { color: #6b7480; font-size: 11.5px; }
+
+/* ---------------- 取色条 ---------------- */
+
+.palette {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  margin: 18px 0 8px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid #262b31;
+}
+
+.palette .sw {
+  flex: 1;
+  min-width: 96px;
+  padding: 10px 12px 9px;
+  font-size: 10.5px;
+  font-family: var(--f-num);
+  letter-spacing: 0.04em;
+}
+
+.palette .sw small {
+  display: block;
+  font-family: var(--f-sans);
+  font-size: 10px;
+  opacity: 0.85;
+  margin-top: 1px;
+}
+
+.palette .gap {
+  flex: 0 0 14px;
+  background: repeating-linear-gradient(45deg, #22262b 0 4px, transparent 4px 8px);
+}
+
+.palette .cap {
+  flex: 0 0 auto;
+  writing-mode: vertical-rl;
+  padding: 8px 7px;
+  font-size: 10.5px;
+  letter-spacing: 0.28em;
+  background: #171a1f;
+  color: #98a1ab;
+}
+
+/* ---------------- 方案卡片 ---------------- */
+
+.variant {
+  display: flex;
+  gap: 18px;
+  margin-top: 26px;
+  padding: 18px;
+  border: 1px solid #23282e;
+  border-radius: 14px;
+  background: #14171b;
+  align-items: flex-start;
+}
+
+.variant > .notes { flex: 1; min-width: 250px; }
+
+@media (max-width: 900px) {
+  .variant { flex-direction: column; }
+}
+
+.variant h2 {
+  margin: 0 0 2px;
+  font-family: var(--f-serif);
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  color: #eef2f6;
+}
+
+.variant h2 .tag {
+  display: inline-block;
+  vertical-align: 2px;
+  margin-left: 8px;
+  font-family: var(--f-sans);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(239, 106, 85, 0.45);
+  color: #ef6a55;
+}
+
+.variant h2 .tag.blue {
+  border-color: rgba(118, 220, 255, 0.4);
+  color: #76dcff;
+}
+
+.variant .slogan { color: #8b939c; font-size: 12px; margin-bottom: 10px; }
+
+.variant ul { margin: 0; padding: 0; list-style: none; }
+
+.variant li {
+  position: relative;
+  padding: 5px 0 5px 26px;
+  border-bottom: 1px dashed #23282e;
+  font-size: 12.5px;
+}
+
+.variant li:last-child { border-bottom: 0; }
+
+.variant li .no {
+  position: absolute;
+  left: 0;
+  top: 7px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: rgba(199, 64, 52, 0.18);
+  border: 1px solid rgba(239, 106, 85, 0.65);
+  color: #ff9a86;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.variant li b { color: #eef2f6; }
+
+.variant li code, .codeloc code {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11px;
+  color: #f2b8ab;
+  background: rgba(199, 64, 52, 0.1);
+  border: 1px solid rgba(199, 64, 52, 0.28);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+.codeloc {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #101318;
+  border: 1px solid #23282e;
+  font-size: 11.5px;
+  color: #8b939c;
+}
+
+.codeloc b { color: #9dc4dd; }
+
+/* =============================================================================
+   悬浮窗复刻（.mock = 悬浮窗面板；变量与 App.css 同名）
+   ============================================================================= */
+
+.mock-outer {
+  flex: 0 0 486px;
+  width: 486px;
+  /* 模拟游戏画面桌面底 */
+  background:
+    radial-gradient(340px 200px at 78% 12%, rgba(120, 160, 110, 0.16), transparent 70%),
+    radial-gradient(280px 220px at 12% 86%, rgba(180, 120, 80, 0.1), transparent 70%),
+    linear-gradient(135deg, #1a2620, #0d1420 55%, #221418);
+  border-radius: 12px;
+  padding: 16px 8px;
+}
+
+.mock-cap {
+  text-align: center;
+  color: #5d6670;
+  font-size: 10.5px;
+  margin-top: 8px;
+}
+
+.mock {
+  position: relative;
+  width: 470px;
+  height: 358px;
+  margin: 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: linear-gradient(160deg, rgb(var(--panel-a) / 0.93), rgb(var(--panel-b) / 0.93));
+  font-family: var(--f-sans);
+}
+
+/* —— 环境装饰层（App.css：overlay-sky / drift / flash） —— */
+
+.ov-sky { position: absolute; inset: -40%; pointer-events: none; z-index: 0; }
+
+.ov-sky i { position: absolute; border-radius: 50%; display: block; }
+
+.ov-sky i:nth-child(1) {
+  width: 320px; height: 190px; left: -70px; top: 0;
+  background: radial-gradient(closest-side, var(--decor-glow), transparent 72%);
+}
+
+.ov-sky i:nth-child(2) {
+  width: 280px; height: 210px; right: -60px; bottom: -30px;
+  background: radial-gradient(closest-side, var(--decor-glow), transparent 72%);
+}
+
+.mock[data-v="c"] .ov-sky i:nth-child(3) {
+  width: 300px; height: 200px; left: -70px; top: 68%;
+  background: radial-gradient(closest-side, var(--red-decor), transparent 72%);
+}
+
+.ov-drift {
+  position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: 0;
+  background: linear-gradient(102deg, transparent 36%, var(--glow) 50%, transparent 64%);
+}
+
+.ov-flash {
+  position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: 0;
+  background: var(--flash);
+}
+
+.mock[data-v="c"] .ov-flash { background: rgba(255, 150, 130, 0.9); }
+
+.mock[data-decor="on"] .ov-drift { animation: ovDrift 12s ease-in-out infinite; }
+.mock[data-decor="on"] .ov-flash { animation: ovBolt 24s linear infinite; }
+.mock[data-decor="on"] .ov-sky i { animation: ovFloat 48s ease-in-out infinite; }
+
+@keyframes ovDrift {
+  0%, 16% { opacity: 0; transform: translateX(-16%); }
+  40% { opacity: 0.5; }
+  62% { opacity: 0.5; }
+  86%, 100% { opacity: 0; transform: translateX(16%); }
+}
+
+@keyframes ovBolt {
+  0%, 91%, 100% { opacity: 0; }
+  92% { opacity: 0.14; }
+  92.6% { opacity: 0; }
+  93.4% { opacity: 0.24; }
+  94% { opacity: 0; }
+}
+
+@keyframes ovFloat {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(46px, -14px); }
+}
+
+/* —— 顶栏 —— */
+
+.ov-head {
+  position: relative; z-index: 2;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px 4px;
+}
+
+.ov-dot {
+  width: 6px; height: 6px; border-radius: 50%; flex: none;
+  background: #59d98a; box-shadow: 0 0 6px #59d98a;
+}
+
+.ov-title {
+  font-family: var(--f-serif);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--cream);
+  white-space: nowrap;
+}
+
+.ov-count {
+  font-family: var(--f-num);
+  font-size: 13px;
+  color: var(--hl);
+  border: 1px solid var(--line-soft);
+  padding: 1px 7px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.ov-marquee {
+  flex: 1; min-width: 0;
+  overflow: hidden; white-space: nowrap;
+  display: flex; align-items: center; gap: 6px;
+}
+
+.ov-marquee .ico { color: var(--hl); flex: none; font-size: 11px; }
+
+.ov-marquee .txt {
+  font-size: 12.5px; font-weight: 700; overflow: hidden; text-overflow: ellipsis;
+  color: var(--hl2); /* 业务消息态（默认循环文本为 --ink-dim） */
+}
+
+.ov-close { color: var(--ink-faint); font-size: 13px; flex: none; padding: 2px 4px; border-radius: 3px; }
+
+.ov-close:hover { background: rgba(255, 60, 40, 0.3); color: #ffd9d2; }
+
+/* —— 方案A①：标题渐变字（复刻 ASCENDANCE 左蓝右红） —— */
+
+.mock[data-v="a"] .ov-title,
+.mock[data-v="b"] .ov-title,
+.mock[data-v="c"] .ov-title {
+  background: linear-gradient(94deg, #9fd4ef, #eef6fb 42%, #ef6a55 76%, #c74034);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* —— 方案A②：计数徽章转红（红轮印章感） —— */
+
+.mock[data-v="a"] .ov-count,
+.mock[data-v="b"] .ov-count,
+.mock[data-v="c"] .ov-count {
+  color: var(--red-bright);
+  border-color: rgba(239, 106, 85, 0.45);
+}
+
+/* —— 方案A④：面板底边红色渐隐光线（赤龙尾迹） —— */
+
+.mock[data-v="a"]::after,
+.mock[data-v="b"]::after,
+.mock[data-v="c"]::after {
+  content: "";
+  position: absolute;
+  left: 6%; right: 6%; bottom: 0;
+  height: 2px;
+  z-index: 1;
+  background: linear-gradient(90deg, transparent, var(--red-bright) 50%, transparent);
+  opacity: 0.6;
+  box-shadow: 0 0 14px var(--red-glow);
+  pointer-events: none;
+}
+
+/* —— 回纹饰带（双层：蓝底 + 右段红，A/B/C） —— */
+
+.ov-band {
+  position: relative; z-index: 2;
+  display: block; width: 100%; height: 9px;
+  color: var(--line);
+  opacity: 0.85;
+}
+
+.ov-band.red {
+  position: absolute;
+  left: 0; right: 0; top: 33px; /* 顶栏高度 33px 处叠放 */
+  color: var(--red-bright); /* 细纹样在深底上偏暗，用亮朱保证 9px 高度下可读 */
+  opacity: 0.95;
+  /* 只留右段：左 40% 全透明，向右渐显 —— 与饰带蓝层叠加即「左蓝右红」 */
+  -webkit-mask-image: linear-gradient(90deg, transparent 38%, #000 74%);
+  mask-image: linear-gradient(90deg, transparent 38%, #000 74%);
+}
+
+.mock[data-v="base"] .ov-band.red { display: none; }
+
+/* —— 队列行（尺寸/结构对齐 App.css .queue-row） —— */
+
+.ov-list { position: relative; z-index: 2; padding: 3px 4px 0; }
+
+.q-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 56px;
+  margin-bottom: 4px;
+  padding: 0 10px 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: var(--row-bg);
+  overflow: hidden;
+  --rc: var(--r-normal);
+}
+
+.q-row[data-rarity="1"] { --rc: var(--r-tempered); }
+.q-row[data-rarity="2"] { --rc: var(--r-arch); }
+.q-row[data-priority="1"] { --rc: var(--r-priority); }
+
+/* 模拟 hover 态（App.css .queue-row:hover） */
+.q-row.hov { background: var(--row-bg-hover); border-color: var(--rc); }
+
+.q-spine { position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--rc); }
+
+.q-spine::after {
+  content: ""; position: absolute; inset: 0;
+  background: var(--rc); filter: blur(6px); opacity: 0.55;
+}
+
+.q-corner { position: absolute; width: 10px; height: 10px; border: 1.5px solid var(--rc); opacity: 0.5; }
+
+.q-corner.tl { left: 5px; top: 5px; border-right: 0; border-bottom: 0; }
+.q-corner.br { right: 5px; bottom: 5px; border-left: 0; border-top: 0; }
+
+.q-row.hov .q-corner { opacity: 1; }
+
+/* —— 方案B⑤：业务跑马灯转赤（点怪成功 / 优先插队提示） —— */
+
+.mock[data-v="b"] .ov-marquee .txt,
+.mock[data-v="c"] .ov-marquee .txt {
+  color: var(--red-bright);
+}
+
+/* —— 方案B⑥：行悬停角标转赤（边框仍随稀有度） —— */
+
+.mock[data-v="b"] .q-row.hov .q-corner,
+.mock[data-v="c"] .q-row.hov .q-corner {
+  border-color: var(--red-bright);
+  filter: drop-shadow(0 0 3px var(--red-glow));
+}
+
+.q-handle { flex: none; width: 40px; display: flex; align-items: center; gap: 6px; }
+
+.q-grip { flex: none; width: 14px; color: var(--ink-faint); opacity: 0.55; text-align: center; font-size: 12px; }
+
+.q-seq {
+  flex: none; width: 20px; text-align: center;
+  font-family: var(--f-num); font-size: 14px; font-weight: 600;
+  color: var(--ink-dim);
+}
+
+.q-nick { flex: none; width: 140px; font-size: 19px; font-weight: 700; color: var(--ink-dim); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+.q-iconcard {
+  position: relative; flex: none; width: 38px; height: 38px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1.5px solid var(--rc); border-radius: 2px;
+  background: radial-gradient(circle at 50% 35%, rgba(255, 255, 255, 0.1), rgba(0, 0, 0, 0.5));
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.6);
+  color: var(--rc);
+}
+
+.q-iconcard::before, .q-iconcard::after {
+  content: ""; position: absolute; left: 50%; width: 5px; height: 5px;
+  background: var(--rc); transform: translateX(-50%) rotate(45deg); opacity: 0.8;
+}
+
+.q-iconcard::before { top: -3.5px; }
+.q-iconcard::after { bottom: -3.5px; }
+
+.q-iconcard svg { width: 24px; height: 24px; }
+
+.q-mon {
+  flex: 1; min-width: 0;
+  font-family: var(--f-serif);
+  font-size: 21.5px;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  color: var(--cream);
+  filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.85));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background: linear-gradient(#ffffff, var(--cream) 46%, #b9c4cf);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.q-badges { flex: none; display: flex; align-items: center; gap: 5px; margin-left: auto; }
+
+.q-chip {
+  font-size: 11px; padding: 2px 6px; border-radius: 1px;
+  border: 1px solid currentColor; letter-spacing: 0.06em;
+  display: inline-flex; align-items: center; gap: 3px; line-height: 1.5;
+  white-space: nowrap;
+}
+
+.q-chip.g1 { color: var(--g1); }
+.q-chip.g3 { color: var(--g3); }
+.q-chip.prio { color: var(--r-priority); animation: prioP 1.5s ease-in-out infinite; }
+
+@keyframes prioP {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 214, 107, 0); }
+  50% { box-shadow: 0 0 9px 1px rgba(255, 214, 107, 0.5); }
+}
+
+.q-chev { display: inline-flex; gap: 1.5px; }
+
+.q-chev i { width: 3px; height: 7px; background: currentColor; display: block; transform: skewX(-18deg); opacity: 0.9; }
+
+.q-hint {
+  position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+  font-size: 12.5px; color: var(--hl); letter-spacing: 0.08em;
+  opacity: 0; white-space: nowrap;
+}
+
+.q-row.hov .q-hint { opacity: 0.92; }
+.q-row.hov .q-badges { opacity: 0; }
+
+/* —— 完成钤印（全方案不动：本就是红，掺红后与主题呼应） —— */
+
+.q-row.ghost { pointer-events: none; }
+
+.q-stamp {
+  position: absolute; left: 50%; top: 50%;
+  font-family: var(--f-serif); font-weight: 600; font-size: 17px; letter-spacing: 0.14em;
+  color: var(--stamp); border: 2px solid var(--stamp); border-radius: 3px;
+  padding: 2px 9px;
+  background: rgba(10, 8, 6, 0.35);
+  transform: translate(-50%, -50%) rotate(-11deg);
+  text-shadow: 0 0 6px rgba(224, 71, 47, 0.5);
+  z-index: 3;
+}
+
+/* —— 方案C⑦：红色环形纹水印（呼应 logo 下部红轮法阵） —— */
+
+.ov-ringwm {
+  position: absolute;
+  right: -34px; bottom: -40px;
+  width: 190px; height: 190px;
+  z-index: 0;
+  opacity: 0.14;
+  pointer-events: none;
+  color: var(--red-main);
+}
+
+.mock[data-v="c"][data-decor="on"] .ov-ringwm { animation: wmSpin 70s linear infinite; }
+
+@keyframes wmSpin { to { transform: rotate(360deg); } }
+
+.mock[data-v="base"] .ov-ringwm, .mock[data-v="a"] .ov-ringwm, .mock[data-v="b"] .ov-ringwm { display: none; }
+
+/* —— 撤销垫（全方案不动：本就是红） —— */
+
+.ov-undo {
+  position: absolute; left: 50%; bottom: 9px; z-index: 6;
+  display: flex; align-items: center; gap: 12px;
+  padding: 5px 12px; border-radius: 3px;
+  background: rgba(12, 10, 8, 0.94);
+  border: 1px solid var(--danger);
+  color: #ffb3a3; font-size: 12.5px;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.ov-undo button {
+  font-size: 12.5px; padding: 2px 10px; border-radius: 2px;
+  cursor: pointer; background: transparent;
+  border: 1px solid #ff8b7a; color: #ff8b7a;
+}
+
+/* —— 位置标注点（评审用，非 UI） —— */
+
+.mk {
+  position: absolute; z-index: 40;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: rgba(126, 31, 26, 0.85);
+  border: 1.5px solid #ffb3a3;
+  color: #fff;
+  font-size: 10px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 8px rgba(214, 84, 64, 0.7);
+  pointer-events: none;
+}
+
+@keyframes mkPulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.16); } }
+
+.mk { animation: mkPulse 2.4s ease-in-out infinite; }
+
+.foot {
+  margin-top: 30px;
+  padding: 12px 16px;
+  border: 1px solid #23282e;
+  border-radius: 10px;
+  background: #101318;
+  color: #8b939c;
+  font-size: 12px;
+}
+
+.foot b { color: #9dc4dd; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="page-head">
+    <h1>凌越主题 · 下部红纹元素模拟方案</h1>
+    <div class="sub">
+      取色自 <b>MONSTER HUNTER WILDS: ASCENDANCE</b> 标题 logo 下部红纹（赤龙纹章 / 红轮法阵 / 朱色流线）。
+      现有凌越主题为纯蓝青体系；以下给出 <b>现状对照 + 三个力度递进的掺红方案</b>，悬浮窗结构、尺寸、变量名均对齐 <code>src/App.css</code> 的 <code>[data-theme="asc"]</code>。
+    </div>
+    <div class="toolbar">
+      <button class="decor-btn" id="decorBtn" type="button">环境装饰：关</button>
+      <span class="tip">开启后演示斜掠灵光 / 闪频 / 雾霭漂移动效（对应主窗口「环境装饰」开关）</span>
+    </div>
+  </div>
+
+  <div class="palette">
+    <div class="cap">现有凌越蓝</div>
+    <div class="sw" style="background:#2f6d94;color:#e8f4fb">--line #2F6D94<small>钢蓝 · 面板描边</small></div>
+    <div class="sw" style="background:#76dcff;color:#08303f">--hl #76DCFF<small>亮青 · 高亮</small></div>
+    <div class="sw" style="background:#8891f3;color:#101440">--hl2 #8891F3<small>蓝紫 · 次高亮</small></div>
+    <div class="gap"></div>
+    <div class="cap">logo 下部红</div>
+    <div class="sw" style="background:#7e1f1a;color:#ffd9d2">--red-deep #7E1F1A<small>深赤 · 龙纹暗部</small></div>
+    <div class="sw" style="background:#c74034;color:#ffe4de">--red-main #C74034<small>朱红 · 红轮主色</small></div>
+    <div class="sw" style="background:#ef6a55;color:#43120c">--red-bright #EF6A55<small>亮朱 · 流线高光</small></div>
+    <div class="sw" style="background:#ff8a70;color:#4a1208">光晕 #FF8A70<small>辉光过渡端</small></div>
+  </div>
+
+  <!-- ======================== 现状对照 ======================== -->
+  <div class="variant">
+    <div class="mock-outer">
+      <div class="mock" data-v="base" data-decor="off">
+        <span class="ov-sky"><i></i><i></i></span>
+        <div class="ov-drift"></div>
+        <div class="ov-flash"></div>
+
+        <div class="ov-head">
+          <span class="ov-dot"></span>
+          <span class="ov-title">狩猎点单队列</span>
+          <span class="ov-count">04</span>
+          <div class="ov-marquee">
+            <span class="ico">🔊</span>
+            <span class="txt">弦月_逐龙 点怪 锁刃龙 成功！</span>
+          </div>
+          <span class="ov-close">✕</span>
+        </div>
+
+        <svg class="ov-band" viewBox="0 0 440 9" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <pattern id="meander-b" width="14" height="9" patternUnits="userSpaceOnUse">
+              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="440" height="9" fill="url(#meander-b)"/>
+        </svg>
+
+        <div class="ov-list">
+          <div class="q-row">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">01</span></span>
+            <span class="q-nick">弦月_逐龙</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">锁刃龙</span>
+            <span class="q-badges"><span class="q-chip g3"><span class="q-chev"><i></i><i></i><i></i></span>舰长</span></span>
+          </div>
+
+          <div class="q-row hov" data-rarity="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">02</span></span>
+            <span class="q-nick">卡普空十级厨</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">煌雷龙</span>
+            <span class="q-hint">点击完成</span>
+          </div>
+
+          <div class="q-row" data-rarity="2" data-priority="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">03</span></span>
+            <span class="q-nick">艾露猫猫车</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">波衣龙</span>
+            <span class="q-badges"><span class="q-chip g1"><span class="q-chev"><i></i></span>总督</span><span class="q-chip prio">优先</span></span>
+          </div>
+
+          <div class="q-row ghost">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">04</span></span>
+            <span class="q-nick">大团长辅佐</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">泥鱼龙</span>
+            <span class="q-stamp">討伐完了</span>
+          </div>
+        </div>
+
+        <div class="ov-undo"><span>「锁刃龙」讨伐完毕 · 可撤销 1 单</span><button type="button">撤销</button></div>
+      </div>
+      <div class="mock-cap">示意宽 470px · 字体为系统近似，实际使用随包思源字体</div>
+    </div>
+
+    <div class="notes">
+      <h2>现状对照<span class="tag blue">BASE</span></h2>
+      <div class="slogan">纯蓝青体系 —— 面板深蓝、饰线钢蓝、高亮亮青、次高亮蓝紫。</div>
+      <ul>
+        <li>红色目前只出现在 <b>讨伐钤印</b>、<b>撤销垫</b>、<b>关闭按钮悬停</b> 三处功能性位置，与凌越主题本身没有呼应，显得孤立。</li>
+        <li>标题、饰带、计数徽章、跑马灯均为蓝青系，与 logo「上部蓝钢」一致，但缺少 logo <b>下部的红</b>。</li>
+      </ul>
+      <div class="codeloc">对应 <b>src/App.css</b> → <code>[data-theme="asc"]</code> 现有变量（无改动）</div>
+    </div>
+  </div>
+
+  <!-- ======================== 方案A ======================== -->
+  <div class="variant">
+    <div class="mock-outer">
+      <div class="mock" data-v="a" data-decor="off">
+        <span class="ov-sky"><i></i><i></i></span>
+        <div class="ov-drift"></div>
+        <div class="ov-flash"></div>
+
+        <div class="ov-head">
+          <span class="ov-dot"></span>
+          <span class="ov-title">狩猎点单队列</span>
+          <span class="ov-count">04</span>
+          <div class="ov-marquee">
+            <span class="ico">🔊</span>
+            <span class="txt">弦月_逐龙 点怪 锁刃龙 成功！</span>
+          </div>
+          <span class="ov-close">✕</span>
+        </div>
+
+        <svg class="ov-band" viewBox="0 0 440 9" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <pattern id="meander-a" width="14" height="9" patternUnits="userSpaceOnUse">
+              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="440" height="9" fill="url(#meander-a)"/>
+        </svg>
+        <svg class="ov-band red" viewBox="0 0 440 9" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <pattern id="meander-ar" width="14" height="9" patternUnits="userSpaceOnUse">
+              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="440" height="9" fill="url(#meander-ar)"/>
+        </svg>
+
+        <div class="ov-list">
+          <div class="q-row">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">01</span></span>
+            <span class="q-nick">弦月_逐龙</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">锁刃龙</span>
+            <span class="q-badges"><span class="q-chip g3"><span class="q-chev"><i></i><i></i><i></i></span>舰长</span></span>
+          </div>
+
+          <div class="q-row hov" data-rarity="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">02</span></span>
+            <span class="q-nick">卡普空十级厨</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">煌雷龙</span>
+            <span class="q-hint">点击完成</span>
+          </div>
+
+          <div class="q-row" data-rarity="2" data-priority="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">03</span></span>
+            <span class="q-nick">艾露猫猫车</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">波衣龙</span>
+            <span class="q-badges"><span class="q-chip g1"><span class="q-chev"><i></i></span>总督</span><span class="q-chip prio">优先</span></span>
+          </div>
+
+          <div class="q-row ghost">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">04</span></span>
+            <span class="q-nick">大团长辅佐</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">泥鱼龙</span>
+            <span class="q-stamp">討伐完了</span>
+          </div>
+        </div>
+
+        <div class="ov-undo"><span>「锁刃龙」讨伐完毕 · 可撤销 1 单</span><button type="button">撤销</button></div>
+
+        <span class="mk" style="left:96px; top:9px;">1</span>
+        <span class="mk" style="left:216px; top:9px;">2</span>
+        <span class="mk" style="right:88px; top:33px;">3</span>
+        <span class="mk" style="left:50%; bottom:6px; transform:translateX(-50%);">4</span>
+      </div>
+      <div class="mock-cap">示意宽 470px · 字体为系统近似，实际使用随包思源字体</div>
+    </div>
+
+    <div class="notes">
+      <h2>方案A · 赤痕<span class="tag">最小介入</span></h2>
+      <div class="slogan">只动「标题 + 饰带 + 底边」三处结构性位置，复刻 logo 的蓝→红走向。</div>
+      <ul>
+        <li><span class="no">1</span><b>标题渐变字</b>：<code>linear-gradient(94deg, 亮蓝, 米白 42%, 亮朱, 朱红)</code> 裁切进文字 —— 对应 logo「ASCENDANCE」左蓝右红的鎏金渐变。</li>
+        <li><span class="no">2</span><b>计数徽章转红</b>：描边与数字改亮朱 —— 呼应红轮法阵的印章感，紧随渐变标题右端的红。</li>
+        <li><span class="no">3</span><b>饰带回纹左蓝右红</b>：蓝色回纹上叠一层红色回纹，用 <code>mask-image</code> 只留右段渐显。</li>
+        <li><span class="no">4</span><b>面板底边红色渐隐光线</b>：2px 亮朱光线 + 辉光 —— 对应 logo 下部赤龙尾迹收底。</li>
+        <li>行内语义色全部不动：稀有度紫 / 橙、优先金、大航海金紫青保留原样。</li>
+      </ul>
+      <div class="codeloc">代码落点：<b>src/App.css</b> → <code>[data-theme="asc"]</code> 增加 <code>--red-*</code> 变量 + 4 处规则，荒野主题不受影响</div>
+    </div>
+  </div>
+
+  <!-- ======================== 方案B ======================== -->
+  <div class="variant">
+    <div class="mock-outer">
+      <div class="mock" data-v="b" data-decor="off">
+        <span class="ov-sky"><i></i><i></i></span>
+        <div class="ov-drift"></div>
+        <div class="ov-flash"></div>
+
+        <div class="ov-head">
+          <span class="ov-dot"></span>
+          <span class="ov-title">狩猎点单队列</span>
+          <span class="ov-count">04</span>
+          <div class="ov-marquee">
+            <span class="ico">🔊</span>
+            <span class="txt">弦月_逐龙 点怪 锁刃龙 成功！</span>
+          </div>
+          <span class="ov-close">✕</span>
+        </div>
+
+        <svg class="ov-band" viewBox="0 0 440 9" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <pattern id="meander-b2" width="14" height="9" patternUnits="userSpaceOnUse">
+              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="440" height="9" fill="url(#meander-b2)"/>
+        </svg>
+        <svg class="ov-band red" viewBox="0 0 440 9" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <pattern id="meander-br" width="14" height="9" patternUnits="userSpaceOnUse">
+              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="440" height="9" fill="url(#meander-br)"/>
+        </svg>
+
+        <div class="ov-list">
+          <div class="q-row">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">01</span></span>
+            <span class="q-nick">弦月_逐龙</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">锁刃龙</span>
+            <span class="q-badges"><span class="q-chip g3"><span class="q-chev"><i></i><i></i><i></i></span>舰长</span></span>
+          </div>
+
+          <div class="q-row hov" data-rarity="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">02</span></span>
+            <span class="q-nick">卡普空十级厨</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">煌雷龙</span>
+            <span class="q-hint">点击完成</span>
+          </div>
+
+          <div class="q-row" data-rarity="2" data-priority="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">03</span></span>
+            <span class="q-nick">艾露猫猫车</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">波衣龙</span>
+            <span class="q-badges"><span class="q-chip g1"><span class="q-chev"><i></i></span>总督</span><span class="q-chip prio">优先</span></span>
+          </div>
+
+          <div class="q-row ghost">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">04</span></span>
+            <span class="q-nick">大团长辅佐</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">泥鱼龙</span>
+            <span class="q-stamp">討伐完了</span>
+          </div>
+        </div>
+
+        <div class="ov-undo"><span>「锁刃龙」讨伐完毕 · 可撤销 1 单</span><button type="button">撤销</button></div>
+
+        <span class="mk" style="right:96px; top:9px;">5</span>
+        <span class="mk" style="left:14px; top:118px;">6</span>
+      </div>
+      <div class="mock-cap">示意宽 470px · 字体为系统近似，实际使用随包思源字体</div>
+    </div>
+
+    <div class="notes">
+      <h2>方案B · 赤痕 + 朱讯<span class="tag">行级点缀</span></h2>
+      <div class="slogan">在方案A基础上，把「信息闪现」类位置也接入红色语义。</div>
+      <ul>
+        <li>含方案A全部四项改动。</li>
+        <li><span class="no">5</span><b>业务跑马灯转红</b>：点怪成功 / 优先插队提示改用亮朱（现 <code>--hl2</code> 蓝紫）—— 雷光中掺赤信，与「讨伐钤印」的红一脉相承。</li>
+        <li><span class="no">6</span><b>行悬停角标转红</b>：悬停时四角角标改亮朱并加微光，边框仍随稀有度色 —— 模拟游戏内锁定框锁定瞬间的红光。</li>
+        <li>钤印与撤销垫本来就是红，主题掺红后这两处不再孤立。</li>
+      </ul>
+      <div class="codeloc">代码落点：方案A + <code>.queue-hint</code> 相关两条规则、跑马灯业务态取色改 <code>--red-bright</code></div>
+    </div>
+  </div>
+
+  <!-- ======================== 方案C ======================== -->
+  <div class="variant">
+    <div class="mock-outer">
+      <div class="mock" data-v="c" data-decor="off">
+        <span class="ov-sky"><i></i><i></i><i></i></span>
+        <div class="ov-drift"></div>
+        <div class="ov-flash"></div>
+
+        <svg class="ov-ringwm" viewBox="0 0 100 100" aria-hidden="true">
+          <g fill="none" stroke="currentColor">
+            <circle cx="50" cy="50" r="47" stroke-width="1.2"/>
+            <circle cx="50" cy="50" r="36" stroke-width="0.8" stroke-dasharray="3 4"/>
+            <circle cx="50" cy="50" r="26" stroke-width="1.6"/>
+            <circle cx="50" cy="50" r="17" stroke-width="0.8" stroke-dasharray="6 3"/>
+            <circle cx="50" cy="50" r="6" stroke-width="2"/>
+            <path d="M50 3v10M50 87v10M3 50h10M87 50h10" stroke-width="1.4"/>
+            <path d="M17 17l6 6M77 77l6 6M83 17l-6 6M23 77l-6 6" stroke-width="1"/>
+          </g>
+        </svg>
+
+        <div class="ov-head">
+          <span class="ov-dot"></span>
+          <span class="ov-title">狩猎点单队列</span>
+          <span class="ov-count">04</span>
+          <div class="ov-marquee">
+            <span class="ico">🔊</span>
+            <span class="txt">弦月_逐龙 点怪 锁刃龙 成功！</span>
+          </div>
+          <span class="ov-close">✕</span>
+        </div>
+
+        <svg class="ov-band" viewBox="0 0 440 9" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <pattern id="meander-c" width="14" height="9" patternUnits="userSpaceOnUse">
+              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="440" height="9" fill="url(#meander-c)"/>
+        </svg>
+        <svg class="ov-band red" viewBox="0 0 440 9" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <pattern id="meander-cr" width="14" height="9" patternUnits="userSpaceOnUse">
+              <path d="M1 8V1h12v6H4V3h7" fill="none" stroke="currentColor" stroke-width="1"/>
+            </pattern>
+          </defs>
+          <rect width="440" height="9" fill="url(#meander-cr)"/>
+        </svg>
+
+        <div class="ov-list">
+          <div class="q-row">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">01</span></span>
+            <span class="q-nick">弦月_逐龙</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">锁刃龙</span>
+            <span class="q-badges"><span class="q-chip g3"><span class="q-chev"><i></i><i></i><i></i></span>舰长</span></span>
+          </div>
+
+          <div class="q-row hov" data-rarity="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">02</span></span>
+            <span class="q-nick">卡普空十级厨</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">煌雷龙</span>
+            <span class="q-hint">点击完成</span>
+          </div>
+
+          <div class="q-row" data-rarity="2" data-priority="1">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">03</span></span>
+            <span class="q-nick">艾露猫猫车</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">波衣龙</span>
+            <span class="q-badges"><span class="q-chip g1"><span class="q-chev"><i></i></span>总督</span><span class="q-chip prio">优先</span></span>
+          </div>
+
+          <div class="q-row ghost">
+            <span class="q-spine"></span><span class="q-corner tl"></span><span class="q-corner br"></span>
+            <span class="q-handle"><span class="q-grip">⋮</span><span class="q-seq">04</span></span>
+            <span class="q-nick">大团长辅佐</span>
+            <span class="q-iconcard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.6 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span>
+            <span class="q-mon">泥鱼龙</span>
+            <span class="q-stamp">討伐完了</span>
+          </div>
+        </div>
+
+        <div class="ov-undo"><span>「锁刃龙」讨伐完毕 · 可撤销 1 单</span><button type="button">撤销</button></div>
+
+        <span class="mk" style="right:110px; bottom:56px;">7</span>
+        <span class="mk" style="left:14px; bottom:44px;">9</span>
+      </div>
+      <div class="mock-cap">示意宽 470px · 字体为系统近似，实际使用随包思源字体 · 开启上方「环境装饰」可看 ⑧ 赤雷闪频</div>
+    </div>
+
+    <div class="notes">
+      <h2>方案C · 赤痕 + 朱讯 + 赤雷<span class="tag">氛围层</span></h2>
+      <div class="slogan">在方案B基础上，把 logo 下部的「红轮法阵」与「赤雷」引入环境装饰。</div>
+      <ul>
+        <li>含方案A、B全部改动。</li>
+        <li><span class="no">7</span><b>红色环形纹水印</b>：面板右下低透明度（14%）红轮法阵纹 —— 直接取材 logo 下部红轮，环境装饰开启时缓慢旋转。</li>
+        <li><b>⑧ 环境闪频改赤</b>：原「雷光」闪频从亮青改红（<code>--flash</code> → 亮朱），24s 一次的闪电变成「赤雷」。</li>
+        <li><span class="no">9</span><b>雾霭补一团红</b>：左下新增红色雾团，与右上蓝雾对角呼应 —— 复刻 logo 上蓝下红的对角构图。</li>
+        <li>关闭环境装饰时与方案B完全一致（水印 ⑦ 仍保留，可按需去掉）。</li>
+      </ul>
+      <div class="codeloc">代码落点：方案B + <code>.overlay-sky</code> 增加第三个 <code>&lt;i&gt;</code>、<code>--flash</code> 主题值、水印 SVG 挂载点</div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <b>评审结论（2026-09-26）：</b>采纳<b>方案C（赤雷）</b>，去除朱讯两项（⑤ 业务跑马灯转红、⑥ 行悬停角标转红）——跑马灯保持蓝紫，悬停角标保持稀有度色。
+    已落地 <code>src/App.css</code>（<code>[data-theme="asc"]</code> 变量 + 「凌越主题红纹点缀」规则段）与 <code>src/views/OverlayWindow.tsx</code>（饰带双层结构、红轮水印、第三团红雾），Lite 与完整版共用。
+    <br><b>落地说明：</b>三个方案为力度递进关系（A ⊂ B ⊂ C），可任选一档。实施只改 <b>src/App.css</b> 的 <code>[data-theme="asc"]</code> 块与少量规则，
+    不触碰行内语义色（稀有度 / 大航海 / 优先），荒野主题零影响。凌越主题为悬浮窗外观层，Lite 与完整版共用悬浮窗，两版默认同步生效。
+  </div>
+
+</div>
+
+<script>
+  // 环境装饰演示开关：同步切换全部模拟卡片的 data-decor
+  (function () {
+    var btn = document.getElementById("decorBtn");
+    var on = false;
+    btn.addEventListener("click", function () {
+      on = !on;
+      btn.classList.toggle("on", on);
+      btn.textContent = on ? "环境装饰：开" : "环境装饰：关";
+      document.querySelectorAll(".mock").forEach(function (m) {
+        m.setAttribute("data-decor", on ? "on" : "off");
+      });
+    });
+  })();
+</script>
+</body>
+</html>
