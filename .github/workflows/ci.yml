@@ -46,6 +46,14 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
+      # credentials.dat 为加密凭据不入库，但 tauri.conf.json 将其声明为随包资源，
+      # tauri-build 编译期校验存在性——构建前须先生成（Secret 注入真实凭据，缺省占位；
+      # 与 release.yml 同口径透传 Secret，配置错误可在 CI 门禁提前暴露）
+      - name: 生成随包预置凭据
+        env:
+          CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+        run: python scripts/ci_credentials.py
+
       # tauri-build 在编译期会校验 frontendDist(../dist) 是否存在，
       # 故必须先产出前端产物，否则 cargo test 会直接构建失败。
       - name: 前端类型检查与构建
@@ -91,6 +99,11 @@ jobs:
 
       - name: 安装前端依赖
         run: npm ci
+
+      - name: 生成随包预置凭据
+        env:
+          CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+        run: python scripts/ci_credentials.py
 
       - name: 前端类型检查与构建
         run: npm run build

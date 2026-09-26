@@ -34,6 +34,11 @@ jobs:
       - name: 准备 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
       - name: 缓存 Cargo 依赖
         uses: Swatinem/rust-cache@v2
         with:
@@ -41,6 +46,13 @@ jobs:
 
       - name: 安装前端依赖
         run: npm ci
+
+      # credentials.dat 为加密凭据不入库，但 tauri.conf.json 将其声明为随包资源，
+      # 打包前须先生成：配置 Secret CREDENTIALS_JSON_B64 则随包预置真实凭据，缺省占位
+      - name: 生成随包预置凭据
+        env:
+          CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+        run: python scripts/ci_credentials.py
 
       # 连产两版（同 job 串行：第二次构建复用依赖缓存，仅重编译本 crate）：
       # 1) 完整版：beforeBuildCommand(npm run build) 先产前端，再按 bundle.targets="all" 生成 msi + nsis
@@ -93,6 +105,11 @@ jobs:
       - name: 准备 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
       - name: 缓存 Cargo 依赖
         uses: Swatinem/rust-cache@v2
         with:
@@ -100,6 +117,12 @@ jobs:
 
       - name: 安装前端依赖
         run: npm ci
+
+      # 同 Windows job：Secret 注入真实凭据，缺省占位
+      - name: 生成随包预置凭据
+        env:
+          CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+        run: python scripts/ci_credentials.py
 
       # macos-latest 为 Apple Silicon，bundle.targets="all" 在此产出 .app + aarch64 .dmg。
       # 注：产物为 adhoc 签名（无 TeamIdentifier，未公证），用户首次打开需右键「打开」放行。
