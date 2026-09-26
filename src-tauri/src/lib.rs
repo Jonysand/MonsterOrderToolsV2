@@ -224,11 +224,7 @@ impl Default for AppState {
 
         // 6. 初始化弹幕处理器（过滤开关运行时热更新）
         let danmu_processor = bilibili::DanmuProcessor::new();
-        danmu_processor.update_filters(
-            app_cfg.only_medal_order,
-            app_cfg.only_speek_wearing_medal,
-            app_cfg.only_speek_guard_level,
-        );
+        danmu_processor.update_filters(app_cfg.only_medal_order);
 
         Self {
             queue_mgr: Arc::new(Mutex::new(queue_mgr)),
@@ -1001,16 +997,16 @@ fn save_app_config(
     new_cfg.top_pos_x = prev.top_pos_x;
     new_cfg.top_pos_y = prev.top_pos_y;
 
+    // 防御：前端回传缺刻度标记（异常场景）时按旧口径减半，保证旧口径值只被换算一次
+    new_cfg.normalize_volume_scale();
+
     let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
     *cfg = new_cfg.clone();
     cfg.save(None)?;
 
-    // 运行期热更新：过滤开关立即生效（无需重启）
-    state.danmu_processor.update_filters(
-        new_cfg.only_medal_order,
-        new_cfg.only_speek_wearing_medal,
-        new_cfg.only_speek_guard_level,
-    );
+    // 运行期热更新：点怪过滤开关立即生效（无需重启）；
+    // 播报过滤（仅粉丝牌/舰长等级）由 handle_incoming_danmu 直接读 config 快照，无需另行同步
+    state.danmu_processor.update_filters(new_cfg.only_medal_order);
     // 广播脱敏配置，悬浮窗据此刷新跑马灯 / 透明度等
     let _ = app.emit("config-changed", cfg.sanitized());
 
@@ -2535,6 +2531,25 @@ fn get_current_tts_engine(state: State<'_, AppState>) -> String {
     state.tts_mgr.current_engine_name()
 }
 
+/// 试听当前语音参数（设置面板音量滑块旁按钮）：
+/// 按当前所选 TTS 引擎播报，引擎选择与实际播报一致
+/// （首选引擎健康则用之，Manbo 失败自动降级 SAPI）；
+/// 音量/语速/音调用前端传入滑块即时值（绕开 800ms 自动保存防抖），
+/// 不受语音总开关限制（试听语义 = 配置阶段听当前参数效果）
+#[tauri::command]
+async fn test_speech_volume(
+    state: State<'_, AppState>,
+    volume: i32,
+    rate: i32,
+    pitch: i32,
+) -> Result<(), String> {
+    ensure_not_lite(&state, "TTS语音模块")?;
+    state
+        .tts_mgr
+        .speak_test_sample("语音音量试听", volume, rate, pitch)
+        .await
+}
+
 /// 运行日志快照（前端「运行日志」视图轮询读取）
 #[derive(serde::Serialize)]
 struct LogsSnapshot {
@@ -3055,6 +3070,7 @@ pub fn run() {
             confirm_action,
             get_manbo_voice_list,
             get_current_tts_engine,
+            test_speech_volume,
             get_recent_logs,
             clear_recent_logs,
             get_overlay_locked,
@@ -3262,6 +3278,47 @@ mod tests {
         });
         assert_eq!(q.items.len(), 1);
         println!("[PASS] test_ensure_not_lite_guard_matches_build_flavor passed");
+    }
+
+    /// 试听命令：E1 守卫分门（Lite 拒绝 / 完整版放行）；完整版下显式 SAPI 引擎试听
+    /// 直接本地入队（测试构建播放线程为静音桩）。Manbo 路径需真实网络，不在单测覆盖
+    #[test]
+    fn test_speech_volume_test_sample_guard_and_enqueue() {
+        let state = AppState::new_test();
+        let guard = ensure_not_lite(&state, "TTS语音模块");
+        if IS_LITE {
+            assert_eq!(guard.unwrap_err(), "Lite模式下TTS语音模块已停用");
+        } else {
+            assert!(guard.is_ok());
+            // 显式 SAPI 引擎，避免测试触发真实 Manbo 网络请求
+            let mgr = TTSManager::new(TTSConfig {
+                engine: TTSEngineType::Sapi,
+                ..TTSConfig::default()
+            });
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let r = rt.block_on(mgr.speak_test_sample("语音音量试听", 150, 2, 3));
+            assert!(r.is_ok());
+            // 极值参数原样透传，由 build_sapi_command 负责钳制（越界不报错）
+            let r2 = rt.block_on(mgr.speak_test_sample("语音音量试听", 0, -10, -10));
+            assert!(r2.is_ok());
+
+            // 试听必须可观测：入口日志带上文本与首选引擎落进内存环
+            // （marker 含进程号，避免并行测试的日志串扰）
+            let marker = format!("试听观测-{}", std::process::id());
+            let r3 = rt.block_on(mgr.speak_test_sample(&marker, 100, 0, 0));
+            assert!(r3.is_ok());
+            let entry = logging::recent_entries(50, None)
+                .into_iter()
+                .find(|e| e.message.contains(&marker))
+                .unwrap_or_else(|| panic!("试听后内存环应出现含「{}」的日志", marker));
+            assert_eq!(entry.level, "INFO");
+            assert!(
+                entry.message.contains("试听播报") && entry.message.contains("首选引擎=sapi"),
+                "日志应记录动作与引擎: {}",
+                entry.message
+            );
+        }
+        println!("[PASS] test_speech_volume_test_sample_guard_and_enqueue passed");
     }
 
     /// E3：退出清理 —— 待写悬浮窗位置并入内存配置并清空 pending（不落盘）
@@ -5244,6 +5301,104 @@ mod tests {
         let task = state.tts_mgr.dequeue_speak().expect("有牌水友应入队");
         assert_eq!(task.text, "有牌水友 说：早上好");
         println!("[PASS] test_read_aloud_respects_speak_filters passed");
+    }
+
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_read_aloud_respects_guard_level_filter() {
+        let state = AppState::new_test();
+        let dm = |uid: i64, name: &str, guard: i32| bilibili::DanmuData {
+            user_id: format!("u_guard_{}", uid),
+            user_name: name.into(),
+            message: "早上好".into(),
+            timestamp: uid,
+            has_medal: false,
+            medal_level: 0,
+            guard_level: guard,
+            msg_id: format!("guard_{}", uid),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        // 舰长档（only_speek_guard_level=3）：普通用户被拦，舰长及以上放行
+        {
+            let mut cfg = state.config.lock().unwrap();
+            cfg.enable_voice = true;
+            cfg.only_speek_guard_level = 3;
+        }
+        handle_incoming_danmu(None, &state, dm(1, "普通水友", 0));
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "guard_level=0 不得入队");
+        handle_incoming_danmu(None, &state, dm(2, "舰长水友", 3));
+        assert_eq!(
+            state.tts_mgr.dequeue_speak().expect("舰长应入队").text,
+            "舰长水友 说：早上好"
+        );
+        handle_incoming_danmu(None, &state, dm(3, "提督水友", 2));
+        assert_eq!(
+            state.tts_mgr.dequeue_speak().expect("提督应入队").text,
+            "提督水友 说：早上好"
+        );
+        handle_incoming_danmu(None, &state, dm(4, "总督水友", 1));
+        assert_eq!(
+            state.tts_mgr.dequeue_speak().expect("总督应入队").text,
+            "总督水友 说：早上好"
+        );
+
+        // 提督档（=2）：舰长被拦，提督/总督放行（guard_level 数值越小等级越高）
+        {
+            let mut cfg = state.config.lock().unwrap();
+            cfg.only_speek_guard_level = 2;
+        }
+        handle_incoming_danmu(None, &state, dm(5, "低档舰长", 3));
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "舰长低于提督档不得入队");
+        handle_incoming_danmu(None, &state, dm(6, "提督水友", 2));
+        assert_eq!(
+            state.tts_mgr.dequeue_speak().expect("提督应入队").text,
+            "提督水友 说：早上好"
+        );
+        handle_incoming_danmu(None, &state, dm(7, "总督水友", 1));
+        assert_eq!(
+            state.tts_mgr.dequeue_speak().expect("总督应入队").text,
+            "总督水友 说：早上好"
+        );
+
+        println!("[PASS] test_read_aloud_respects_guard_level_filter passed");
+    }
+
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_read_aloud_combined_medal_and_guard_filters() {
+        let state = AppState::new_test();
+        {
+            let mut cfg = state.config.lock().unwrap();
+            cfg.enable_voice = true;
+            cfg.only_speek_wearing_medal = true; // 仅粉丝牌
+            cfg.only_speek_guard_level = 3; // 最低条件：舰长
+        }
+        let dm = |uid: i64, name: &str, has_medal: bool, guard: i32| bilibili::DanmuData {
+            user_id: format!("u_combo_{}", uid),
+            user_name: name.into(),
+            message: "早上好".into(),
+            timestamp: uid,
+            has_medal: has_medal,
+            medal_level: if has_medal { 5 } else { 0 },
+            guard_level: guard,
+            msg_id: format!("combo_{}", uid),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        // 两条件为 AND：任一不满足即被拦
+        handle_incoming_danmu(None, &state, dm(1, "无牌舰长", false, 3));
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "舰长但无粉丝牌不得入队");
+        handle_incoming_danmu(None, &state, dm(2, "有牌水友", true, 0));
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "有牌但非舰长不得入队");
+        handle_incoming_danmu(None, &state, dm(3, "有牌舰长", true, 3));
+        assert_eq!(
+            state.tts_mgr.dequeue_speak().expect("两条件同时满足应入队").text,
+            "有牌舰长 说：早上好"
+        );
+        println!("[PASS] test_read_aloud_combined_medal_and_guard_filters passed");
     }
 
     #[test]

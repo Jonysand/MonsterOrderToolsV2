@@ -661,6 +661,21 @@ export const MainWindow: React.FC = () => {
     }
   };
 
+  // 试听语音音量：显式传滑块即时值（绕开 800ms 自动保存防抖），
+  // 后端按当前所选 TTS 引擎播报（Manbo 失败自动降级 SAPI），即时反映当前参数效果
+  const handleTestVolume = async () => {
+    if (!config) return;
+    try {
+      await invoke("test_speech_volume", {
+        volume: config.speech_volume,
+        rate: config.speech_rate,
+        pitch: config.speech_pitch,
+      });
+    } catch (err) {
+      showToast(`试听失败: ${err}`);
+    }
+  };
+
   // 滑杆类控件：改动静音期（800ms）后自动保存并广播 config-changed，
   // 使悬浮窗透明度/跑马灯等即时生效，且用户改完直接关窗也不会丢设置
   // （对齐原工程：每个控件 ConfigChanged → SaveConfig + RefreshWindow）
@@ -1529,9 +1544,19 @@ export const MainWindow: React.FC = () => {
                     />
                   </div>
                   <div>
-                    <label className="block text-[11px] text-neutral-400 mb-1">
-                      语音音量 ({config.speech_volume})
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[11px] text-neutral-400">
+                        语音音量 ({config.speech_volume})
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleTestVolume}
+                        className="px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 text-[11px] font-bold rounded-md border border-neutral-700 transition"
+                        title="按当前所选引擎与音量/语速/音调播报一句试听"
+                      >
+                        试听
+                      </button>
+                    </div>
                     <input
                       type="range"
                       min="0"

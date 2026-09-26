@@ -64,7 +64,10 @@ export interface AppConfig {
   tts_engine: string;
   enable_voice: boolean;
   speech_rate: number;
+  /** 语音音量（新刻度 0~200：100 = 旧刻度满量 200），由后端完成旧刻度减半迁移 */
   speech_volume: number;
+  /** 音量刻度版本（2 = 新刻度），前端原样回传即可 */
+  volume_scale: number;
   speech_pitch: number;
   manbo_api_key: string;
   manbo_voice: string;

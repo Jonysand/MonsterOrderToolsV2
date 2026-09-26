@@ -22,7 +22,12 @@ pub struct AppConfig {
     pub tts_engine: String,
     pub enable_voice: bool,
     pub speech_rate: i32,
+    /// 语音音量（新刻度 0~200：100 = 旧刻度满量 200，200 = 旧刻度 400 的 2 倍增益）。
+    /// 旧刻度（V0.1.9 及以前，100 = 半量）由 [`AppConfig::normalize_volume_scale`] 一次性减半迁移
     pub speech_volume: i32,
+    /// 音量刻度版本：2 = 新刻度。磁盘/前端回传中缺省或非 2 视为旧刻度，读入时减半换算
+    #[serde(default)]
+    pub volume_scale: i32,
     pub speech_pitch: i32,
     #[serde(skip_serializing)]
     pub manbo_api_key: String,
@@ -64,7 +69,9 @@ impl Default for AppConfig {
             tts_engine: "auto".into(),
             enable_voice: false,
             speech_rate: 0,
-            speech_volume: 100,
+            // 新刻度 50 = 旧刻度 100（原工程默认）的等效响度，升级用户听感不变
+            speech_volume: 50,
+            volume_scale: 2,
             speech_pitch: 0,
             manbo_api_key: String::new(),
             // 原工程默认音色为「曼波」（专用端点 /apis/mbAIscvip，speed = speech_rate × 5）
@@ -126,8 +133,18 @@ impl AppConfig {
             return Self::from_legacy(&val);
         }
 
-        match serde_json::from_value(val) {
-            Ok(cfg) => cfg,
+        // 未显式写 speech_volume 的配置（空/部分配置文件）其值来自默认（已是新刻度），
+        // 直接打新刻度标记避免被误减半；显式写了 speech_volume 的旧文件保持未标记（0），
+        // 由 load 出口的 normalize_volume_scale 统一减半迁移
+        let has_explicit_volume = val.get("speech_volume").is_some();
+
+        match serde_json::from_value::<AppConfig>(val) {
+            Ok(mut cfg) => {
+                if !has_explicit_volume {
+                    cfg.volume_scale = 2;
+                }
+                cfg
+            }
             Err(e) => {
                 crate::log_warn!("[Config] 配置字段解析失败，按字段默认值加载: {}", e);
                 Self::dump_invalid(src_path, content);
@@ -169,6 +186,9 @@ impl AppConfig {
     /// 旧文件键为 SCREAMING_SNAKE；idCode / manboApiKey 不落 JSON（走注册表）。
     fn from_legacy(v: &serde_json::Value) -> Self {
         let mut cfg = Self::default();
+        // 原工程配置为旧音量刻度：标记归零，交由 load 出口统一减半换算；
+        // 未写 SPEECH_VOLUME 键时值来自默认（已是新刻度），直接打标避免误减半
+        cfg.volume_scale = if v.get("SPEECH_VOLUME").is_some() { 0 } else { 2 };
 
         macro_rules! set_bool {
             ($key:literal, $field:ident) => {
@@ -244,6 +264,9 @@ impl AppConfig {
             }
         };
 
+        // 音量刻度一次性迁移：旧刻度值减半换算为新刻度并打标（详见 normalize_volume_scale）
+        cfg.normalize_volume_scale();
+
         // 遵循原工程设计规格：优先从注册表读取 idCode
         let reg_id_code = crate::registry::read_id_code().unwrap_or_default();
         if !reg_id_code.trim().is_empty() {
@@ -266,6 +289,18 @@ impl AppConfig {
         }
 
         cfg
+    }
+
+    /// 音量刻度一次性迁移：未标记新刻度（volume_scale != 2）的配置视为旧刻度
+    /// （V0.1.9 及以前，100 = 原满量 200 的一半），统一减半换算并打标。
+    /// load（磁盘/原工程迁移）与 save_app_config（前端回传防御）共用，
+    /// 保证「任何进入内存/存储的旧口径值只被换算一次」，升级用户听感不变。
+    pub fn normalize_volume_scale(&mut self) {
+        const VOLUME_SCALE_V2: i32 = 2;
+        if self.volume_scale != VOLUME_SCALE_V2 {
+            self.speech_volume = (self.speech_volume / 2).clamp(0, 200);
+            self.volume_scale = VOLUME_SCALE_V2;
+        }
     }
 
     /// 脱敏副本：清空全部凭据字段，供返回 WebView / 事件广播使用（不落盘）
@@ -537,6 +572,45 @@ mod tests {
         println!("[PASS] test_empty_object_config_is_all_defaults passed");
     }
 
+    /// 音量刻度迁移:解析层按「是否显式写 speech_volume」标记旧刻度,
+    /// normalize_volume_scale(load/save 出口调用)对未标记配置一次性减半
+    #[test]
+    fn test_volume_scale_migration() {
+        // 旧版 V2 配置:speech_volume=100(旧刻度半量)→ 减半为新刻度 50,并打标 2
+        let old = r#"{ "speech_volume": 100, "enable_voice": true }"#;
+        let mut cfg = AppConfig::parse_content(old, None);
+        assert_eq!(cfg.speech_volume, 100, "解析层保留旧口径原值");
+        assert_eq!(cfg.volume_scale, 0, "显式写 speech_volume 且无标记 → 视为旧刻度");
+        cfg.normalize_volume_scale();
+        assert_eq!(cfg.speech_volume, 50);
+        assert_eq!(cfg.volume_scale, 2);
+        // 迁移幂等:已打标配置再走一次不变化
+        cfg.normalize_volume_scale();
+        assert_eq!(cfg.speech_volume, 50);
+
+        // 新刻度配置:volume_scale=2,speech_volume=100(=原满量)原样保留
+        let new_scale = r#"{ "speech_volume": 100, "volume_scale": 2 }"#;
+        let cfg2 = AppConfig::parse_content(new_scale, None);
+        assert_eq!(cfg2.speech_volume, 100);
+        assert_eq!(cfg2.volume_scale, 2);
+        let mut cfg2n = cfg2.clone();
+        cfg2n.normalize_volume_scale();
+        assert_eq!(cfg2n.speech_volume, 100, "新刻度不得被减半");
+
+        // 部分配置(未写 speech_volume):值来自默认(新刻度 50),不得误减半
+        let partial = r#"{ "opacity": 80 }"#;
+        let cfg3 = AppConfig::parse_content(partial, None);
+        assert_eq!(cfg3.speech_volume, AppConfig::default().speech_volume);
+        assert_eq!(cfg3.volume_scale, 2);
+
+        // 越界钳制:旧口径 500 减半后 clamp 到 200
+        let oversized = r#"{ "speech_volume": 500 }"#;
+        let mut cfg4 = AppConfig::parse_content(oversized, None);
+        cfg4.normalize_volume_scale();
+        assert_eq!(cfg4.speech_volume, 200);
+        println!("[PASS] test_volume_scale_migration passed");
+    }
+
     #[test]
     fn test_invalid_config_dumps_diagnostic_copy() {
         let temp_dir = std::env::temp_dir().join("mh_test_config_invalid");
@@ -589,7 +663,9 @@ mod tests {
         let cfg = AppConfig::load(Some(&path));
         assert!(!cfg.only_medal_order);
         assert!(cfg.enable_voice);
-        assert_eq!(cfg.speech_volume, 50);
+        // 旧口径 SPEECH_VOLUME=50（旧刻度半量）→ 新刻度一次性减半为 25 并打标
+        assert_eq!(cfg.speech_volume, 25);
+        assert_eq!(cfg.volume_scale, 2);
         assert_eq!(cfg.opacity, 80);
         assert_eq!(cfg.penetrating_mode_opacity, 50);
         assert_eq!(cfg.tts_engine, "sapi");

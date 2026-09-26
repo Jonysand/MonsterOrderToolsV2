@@ -6,7 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -747,8 +747,6 @@ pub struct DanmuProcessor {
     priority_patterns: Vec<Regex>,
     msg_id_cache: Mutex<MsgIdCache>,
     pub only_medal_order: AtomicBool,
-    pub only_speek_wearing_medal: AtomicBool,
-    pub only_speek_guard_level: AtomicI32,
 }
 
 impl Default for DanmuProcessor {
@@ -780,21 +778,13 @@ impl DanmuProcessor {
             priority_patterns,
             msg_id_cache: Mutex::new(MsgIdCache::new(100_000)),
             only_medal_order: AtomicBool::new(false),
-            only_speek_wearing_medal: AtomicBool::new(false),
-            only_speek_guard_level: AtomicI32::new(0),
         }
     }
 
-    /// 运行期热更新过滤开关（配置保存后即时生效，无需重启）
-    pub fn update_filters(
-        &self,
-        only_medal_order: bool,
-        only_speek_wearing_medal: bool,
-        only_speek_guard_level: i32,
-    ) {
+    /// 运行期热更新过滤开关（配置保存后即时生效，无需重启）。
+    /// 播报过滤（仅粉丝牌/舰长等级）不在此列：实际判定直接读 config 锁快照。
+    pub fn update_filters(&self, only_medal_order: bool) {
         self.only_medal_order.store(only_medal_order, Ordering::Relaxed);
-        self.only_speek_wearing_medal.store(only_speek_wearing_medal, Ordering::Relaxed);
-        self.only_speek_guard_level.store(only_speek_guard_level, Ordering::Relaxed);
     }
 
     /// 非弹幕事件（点赞等）复用同一 msg_id 去重缓存（对齐原工程 DanmuProcessor::IsDuplicateMsgId）
@@ -2311,14 +2301,14 @@ mod tests {
         };
 
         // 运行期开启"仅粉丝牌可点怪"：无粉丝牌弹幕不入队
-        processor.update_filters(true, false, 0);
+        processor.update_filters(true);
         let res = processor.process_danmu(&make_no_medal_danmu("msg_nm_1"), &matcher, &roster, &mut queue_mgr);
         assert!(!res.matched);
         assert!(!res.added_to_queue);
         assert_eq!(queue_mgr.items.len(), 0);
 
         // 运行期关闭过滤（无需重启）：随后的新弹幕立即可入队
-        processor.update_filters(false, false, 0);
+        processor.update_filters(false);
         let res2 = processor.process_danmu(&make_no_medal_danmu("msg_nm_2"), &matcher, &roster, &mut queue_mgr);
         assert!(res2.matched);
         assert!(res2.added_to_queue);

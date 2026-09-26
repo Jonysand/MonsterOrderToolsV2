@@ -65,7 +65,8 @@ impl Default for TTSConfig {
             engine: TTSEngineType::Manbo,
             enable_voice: true,
             speech_rate: 0,
-            speech_volume: 100,
+            // 新刻度 50 = 旧刻度 100（原工程默认）的等效响度
+            speech_volume: 50,
             speech_pitch: 0,
             manbo_api_key: String::new(),
             // 原工程默认音色为「曼波」，走 /apis/mbAIscvip 专用端点
@@ -81,7 +82,10 @@ impl Default for TTSConfig {
 /// 播放任务载荷（音量随任务携带：对齐原工程 `AudioPlayer::SetVolume` 在起播前设置 MCI 音量）
 #[derive(Debug)]
 enum AudioJob {
+    /// 本地音效：增益 = volume_gain（不做语音响度校准）
     Bytes { bytes: Vec<u8>, volume: i32 },
+    /// 云端 TTS 语音（Manbo）：增益 = volume_gain × MANBO_LOUDNESS_GAIN（响度与 SAPI 对齐）
+    TtsBytes { bytes: Vec<u8>, volume: i32 },
     File { path: PathBuf, volume: i32 },
     Sapi { text: String, params: SapiParams },
 }
@@ -130,6 +134,13 @@ impl AudioQueue {
             .map_err(|e| e.to_string())
     }
 
+    /// 云端 TTS 语音入队：增益额外乘响度校准系数（与本地音效区分）
+    pub fn play_tts_bytes(&self, bytes: Vec<u8>, volume: i32) -> Result<(), String> {
+        self.tx
+            .send(AudioJob::TtsBytes { bytes, volume })
+            .map_err(|e| e.to_string())
+    }
+
     pub fn play_file(&self, path: PathBuf, volume: i32) -> Result<(), String> {
         self.tx
             .send(AudioJob::File { path, volume })
@@ -149,6 +160,7 @@ impl AudioQueue {
         {
             let _ = match job {
                 AudioJob::Bytes { bytes, volume } => bytes.len() + *volume as usize,
+                AudioJob::TtsBytes { bytes, volume } => bytes.len() + *volume as usize,
                 AudioJob::File { path, volume } => path.as_os_str().len() + *volume as usize,
                 AudioJob::Sapi { text, params } => text.len() + params.rate.unsigned_abs() as usize,
             };
@@ -157,13 +169,18 @@ impl AudioQueue {
         match job {
             AudioJob::Bytes { bytes, volume } => {
                 if let Ok(decoder) = Decoder::new(Cursor::new(bytes.clone())) {
-                    play_decoder_sync(decoder, *volume);
+                    play_decoder_sync(decoder, volume_gain(*volume));
+                }
+            }
+            AudioJob::TtsBytes { bytes, volume } => {
+                if let Ok(decoder) = Decoder::new(Cursor::new(bytes.clone())) {
+                    play_decoder_sync(decoder, tts_stream_gain(*volume));
                 }
             }
             AudioJob::File { path, volume } => {
                 if let Ok(file) = File::open(path) {
                     if let Ok(decoder) = Decoder::new(file) {
-                        play_decoder_sync(decoder, *volume);
+                        play_decoder_sync(decoder, volume_gain(*volume));
                     }
                 }
             }
@@ -174,21 +191,34 @@ impl AudioQueue {
     }
 }
 
-/// 配置音量（原工程 0~200，MCI 0~1000 即 `volume × 5`）换算为 rodio 的 0.0~1.0 增益
+/// 配置音量换算为 rodio 增益：新刻度 0~200（100 = 旧刻度满量 200 即 1.0 增益，
+/// 200 = 2.0 增益，对应用户要求的「新 200 = 旧 400」），增益可大于 1.0（rodio 支持放大）
 pub fn volume_gain(speech_volume: i32) -> f32 {
-    (speech_volume.clamp(0, 200) as f32) / 200.0
+    (speech_volume.clamp(0, 200) as f32) / 100.0
+}
+
+/// Manbo 云端语音响度校准增益：实测「佩奇猪」音色原始输出 RMS 与
+/// Windows SAPI 满档（$s.Volume=100，Huihui）对齐所得（三次测量 0.748/0.741/0.724，
+/// 中位数取 0.74，即佩奇猪原始输出比 SAPI 满档约响 2.6 dB，需衰减对齐），
+/// 测量工具见 `test_manbo_peiqi_loudness_calibration`（#[ignore]，可复跑）。
+/// 仅应用于云端 TTS 流；本地音效保持各自原始响度，不受此系数影响。
+pub const MANBO_LOUDNESS_GAIN: f32 = 0.74;
+
+/// 云端 TTS 流的 rodio 增益 = 用户刻度增益 × 响度校准系数
+pub fn tts_stream_gain(speech_volume: i32) -> f32 {
+    volume_gain(speech_volume) * MANBO_LOUDNESS_GAIN
 }
 
 /// rodio 同步播放（带 60s 播放超时保护，防止异常流卡死播放线程）
 #[cfg(not(test))]
-fn play_decoder_sync<R>(decoder: Decoder<R>, speech_volume: i32) -> bool
+fn play_decoder_sync<R>(decoder: Decoder<R>, gain: f32) -> bool
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
     if let Ok((_stream, handle)) = OutputStream::try_default() {
         if let Ok(sink) = Sink::try_new(&handle) {
             // 对齐原工程：起播前按配置设置音量（Manbo/本地音效同样生效）
-            sink.set_volume(volume_gain(speech_volume));
+            sink.set_volume(gain);
             sink.append(decoder);
             let deadline = Instant::now() + PLAYBACK_TIMEOUT;
             while !sink.empty() {
@@ -226,7 +256,8 @@ pub fn build_sapi_ssml(text: &str, pitch: i32) -> String {
 pub fn build_sapi_command(text: &str, params: &SapiParams) -> String {
     let ssml = build_sapi_ssml(text, params.pitch).replace('\'', "''");
     let rate = params.rate.clamp(-10, 10);
-    let volume = (params.volume / 2).clamp(0, 100);
+    // SAPI 档位 0~100：新刻度 100 即满档（等价旧刻度 200），200 起钳制到满档
+    let volume = params.volume.clamp(0, 100);
     format!(
         "Add-Type -AssemblyName System.Speech; \
 $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; \
@@ -285,11 +316,11 @@ fn run_local_speech(text: &str, params: &SapiParams) -> bool {
 
 /// SAPI 档位参数 → `say` 参数映射（纯函数，便于单测）。
 /// - `rate`：SAPI 为 -10~10 档位，`say -r` 为词/分钟（系统默认约 175），按 15 wpm/档折算
-/// - `volume`：本工程配置为 0~200，映射为 `say` 内嵌音量命令的 0.0~1.0
+/// - `volume`：新刻度 0~200（100 = 原满量），映射为 `say` 内嵌音量命令的 0.0~1.0（上限 1.0）
 pub fn say_params_from(rate: i32, volume: i32) -> (i32, f64) {
     (
         (175 + rate.clamp(-10, 10) * 15).clamp(80, 400),
-        (volume.clamp(0, 200) as f64) / 200.0,
+        ((volume.clamp(0, 200) as f64) / 100.0).min(1.0),
     )
 }
 
@@ -1044,7 +1075,8 @@ impl TTSManager {
 
     /// 当前配置的播报音量（0~200），用于非 SAPI 播放路径
     fn current_volume(&self) -> i32 {
-        self.config.lock().map(|c| c.speech_volume).unwrap_or(100)
+        // 锁中毒兜底 50 = 旧口径 100（原工程默认）的等效响度
+        self.config.lock().map(|c| c.speech_volume).unwrap_or(50)
     }
 
     /// 播放云端合成音频；`checkin_username` 非空时按签到音频留档（对齐原工程仅留档签到 TTS）
@@ -1058,7 +1090,7 @@ impl TTSManager {
                 crate::log_warn!("[TTS] 签到音频留档失败（不影响播放）");
             }
         }
-        AudioQueue::global().play_bytes(bytes.to_vec(), self.current_volume())
+        AudioQueue::global().play_tts_bytes(bytes.to_vec(), self.current_volume())
     }
 
     /// 查找并播放本地特殊音效（zip 优先、散装目录回退）
@@ -1215,6 +1247,77 @@ impl TTSManager {
         };
         AudioQueue::global().speak_sapi(trimmed.to_string(), params)
     }
+
+    /// 试听指定参数的测试句（设置面板「试听」按钮）。
+    /// 引擎选择与实际播报一致（首选引擎健康则用之，Manbo 失败自动降级 SAPI）；
+    /// 音量/语速/音调用传入即时值（绕开配置自动保存防抖），
+    /// 不受语音总开关限制（试听语义 = 配置阶段听当前参数效果）
+    pub async fn speak_test_sample(
+        &self,
+        text: &str,
+        volume: i32,
+        rate: i32,
+        pitch: i32,
+    ) -> Result<(), String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let cfg = self.config.lock().unwrap().clone();
+        let client = reqwest::Client::builder()
+            .timeout(Self::REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let preferred = self.select_active_engine();
+        crate::log_info!(
+            "[TTS] 试听播报: 文本=「{}」, 首选引擎={}, 音量={}, 语速={}, 音调={}",
+            trimmed,
+            preferred.provider_name(),
+            volume,
+            rate,
+            pitch
+        );
+
+        if preferred == TTSEngineType::Manbo {
+            // 曼波默认音色的 speed 参数按试听即时语速覆盖（其余音色无此参数，
+            // 音调/音量对 Manbo 云端无效，音量在本地播放端应用）
+            let url = Self::build_manbo_url(
+                &TTSConfig {
+                    speech_rate: rate,
+                    ..cfg.clone()
+                },
+                trimmed,
+            );
+            match Self::request_audio_bytes(&client, &url, Some(&cfg.manbo_api_key)).await {
+                Ok(bytes) => {
+                    self.mark_active_engine(TTSEngineType::Manbo);
+                    crate::log_info!(
+                        "[TTS] 试听走 Manbo 引擎（音量 {} 由本地播放端增益应用）",
+                        volume
+                    );
+                    return AudioQueue::global().play_tts_bytes(bytes, volume);
+                }
+                Err(e) => {
+                    self.mark_engine_degraded(TTSEngineType::Manbo);
+                    crate::log_warn!("[TTS] 试听 Manbo 请求失败({}),降级本地 SAPI", e);
+                }
+            }
+        }
+
+        self.mark_active_engine(TTSEngineType::Sapi);
+        crate::log_info!(
+            "[TTS] 试听走本地 SAPI: volume={}, rate={}, pitch={}（SAPI 档位 {}）",
+            volume,
+            rate,
+            pitch,
+            volume.clamp(0, 100)
+        );
+        AudioQueue::global().speak_sapi(
+            trimmed.to_string(),
+            SapiParams { rate, volume, pitch },
+        )
+    }
 }
 
 /// URL 百分比编码辅助函数 (RFC 3986)
@@ -1240,8 +1343,138 @@ pub fn url_encode(val: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rodio::Decoder;
+    use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// 手动校准工具（cargo test --release test_manbo_peiqi_loudness_calibration -- --ignored --nocapture）：
+    /// 实测 Manbo「佩奇猪」音色原始输出与 Windows SAPI 满档（$s.Volume=100）的 RMS 差，
+    /// 据此回填 [`MANBO_LOUDNESS_GAIN`]，使相同音量设置下两个引擎听感响度一致。
+    /// 需要网络（Manbo API）与 PowerShell 环境；日常 CI 不跑（#[ignore]）。
+    /// 注意：同一文本多次合成的波动约 ±0.5 dB，回填系数时以多次结果的中位数为准。
+    #[test]
+    #[ignore = "手动校准工具：需要网络，日常 CI 不跑"]
+    fn test_manbo_peiqi_loudness_calibration() {
+        const TEXT: &str = "你好，这是一条响度校准测试语音，用来对齐云端与本地引擎的音量。";
+
+        // 1) Manbo「佩奇猪」（AIvoice 端点，无 key 参数）下载并解码
+        let url = format!(
+            "https://api.milorapart.top/apis/AIvoice?speaker={}&text={}",
+            url_encode("佩奇猪"),
+            url_encode(TEXT)
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bytes = rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(TTSManager::REQUEST_TIMEOUT)
+                .build()
+                .unwrap();
+            let resp = client.get(&url).send().await.unwrap();
+            let json: serde_json::Value = resp.json().await.unwrap();
+            let audio_url = json
+                .get("url")
+                .and_then(|u| u.as_str())
+                .expect("Manbo 响应应含 url 字段")
+                .to_string();
+            let audio = client.get(audio_url).send().await.unwrap();
+            let bytes = audio.bytes().await.unwrap().to_vec();
+            println!("[校准] Manbo 音频大小: {} 字节", bytes.len());
+            bytes
+        });
+
+        // 解码为 f32 采样（symphonia 解 mp3），统计 RMS 与峰值
+        let manbo_samples = decode_all_mp3(bytes).expect("Manbo mp3 应可解码");
+        let (manbo_rms, manbo_peak) = rms_peak(&manbo_samples);
+        println!(
+            "[校准] Manbo 佩奇猪: 采样={} rms={:.5} peak={:.5}",
+            manbo_samples.len(),
+            manbo_rms,
+            manbo_peak
+        );
+
+        // 2) SAPI 满档基准：与 run_local_speech 同构（Huihui，Volume=100）渲染 WAV
+        let dir = std::env::temp_dir().join("mh_sapi_calibration");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let escaped = TEXT
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let ps = format!(
+            "Add-Type -AssemblyName System.Speech; \
+             $r = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
+             $r.Volume = 100; \
+             $r.SetOutputToWaveFile('{}'); \
+             $r.SpeakSsml('<speak version=\"1.0\" xml:lang=\"zh-CN\"><prosody pitch=\"+0st\">{}</prosody></speak>'); \
+             $r.SetOutputToWaveFile($null); $r.Dispose()",
+            dir.join("sapi_ref.wav").display(),
+            escaped
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .status()
+            .expect("应能启动 PowerShell");
+        assert!(status.success(), "SAPI 渲染失败");
+        let wav = std::fs::read(dir.join("sapi_ref.wav")).unwrap();
+        let sapi_samples = read_wav_pcm16(&wav).expect("WAV 应为 16-bit PCM");
+        let (sapi_rms, sapi_peak) = rms_peak(&sapi_samples);
+        println!(
+            "[校准] SAPI 满档: 采样={} rms={:.5} peak={:.5}",
+            sapi_samples.len(),
+            sapi_rms,
+            sapi_peak
+        );
+
+        // 3) 校准系数：使 Manbo 在 gain=校准系数时与 SAPI 满档 RMS 对齐
+        let gain = sapi_rms / manbo_rms;
+        let gain_db = 20.0 * gain.log10();
+        let clipped_peak = manbo_peak * gain;
+        println!(
+            "[校准] 建议系数 = {:.3} ({:+.1} dB)；应用后 Manbo 峰值 = {:.3}（>1.0 有削波风险）",
+            gain, gain_db, clipped_peak
+        );
+        println!("[PASS] test_manbo_peiqi_loudness_calibration passed");
+    }
+
+    /// 解码 mp3 全部采样（rodio 0.19 symphonia 后端输出 i16），归一化为 f32（-1.0..1.0）
+    fn decode_all_mp3(bytes: Vec<u8>) -> Option<Vec<f32>> {
+        let decoder = Decoder::new_mp3(Cursor::new(bytes)).ok()?;
+        let mut out = Vec::new();
+        for s in decoder {
+            out.push(s as f32 / 32768.0);
+        }
+        Some(out)
+    }
+
+    /// 采样序列的 RMS 与峰值
+    fn rms_peak(samples: &[f32]) -> (f32, f32) {
+        let sum_sq: f64 = samples.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+        let rms = (sum_sq / samples.len().max(1) as f64).sqrt() as f32;
+        let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        (rms, peak)
+    }
+
+    /// 解析 16-bit PCM WAV 为 f32 采样（按 RIFF 块结构定位 data 块）
+    fn read_wav_pcm16(bytes: &[u8]) -> Option<Vec<f32>> {
+        let mut i = 12usize;
+        while i + 8 <= bytes.len() {
+            let id = &bytes[i..i + 4];
+            let size =
+                u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
+                    as usize;
+            if id == b"data" {
+                let data = &bytes[i + 8..(i + 8 + size).min(bytes.len())];
+                return Some(
+                    data.chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                        .collect(),
+                );
+            }
+            i += 8 + size + (size % 2);
+        }
+        None
+    }
 
     #[test]
     fn test_auto_engine_cascade_and_current_engine_name() {
@@ -1347,15 +1580,25 @@ mod tests {
 
     #[test]
     fn test_volume_gain_mapping() {
-        // 原工程 MCI 音量 = speechVolume × 5（0~1000），故 200 → 满量程、100 → 半量程、0 → 静音
-        assert_eq!(volume_gain(200), 1.0);
-        assert_eq!(volume_gain(100), 0.5);
+        // 新刻度 0~200：100 = 旧刻度满量（1.0 增益）、200 = 旧刻度 400（2.0 增益）、0 = 静音
+        assert_eq!(volume_gain(100), 1.0);
+        assert_eq!(volume_gain(200), 2.0);
+        assert_eq!(volume_gain(50), 0.5);
         assert_eq!(volume_gain(0), 0.0);
-        assert_eq!(volume_gain(50), 0.25);
-        // 越界钳制（对齐 AudioPlayer::SetVolume 的 0~200）
+        // 越界钳制（0~200 之外收口到 0.0~2.0）
         assert_eq!(volume_gain(-10), 0.0);
-        assert_eq!(volume_gain(999), 1.0);
+        assert_eq!(volume_gain(999), 2.0);
         println!("[PASS] test_volume_gain_mapping passed");
+    }
+
+    #[test]
+    fn test_tts_stream_gain_applies_calibration() {
+        // 云端 TTS 流增益 = 用户刻度增益 × 响度校准系数（0.74）
+        assert!((tts_stream_gain(100) - 0.74).abs() < 1e-6);
+        assert!((tts_stream_gain(50) - 0.37).abs() < 1e-6);
+        // 本地音效路径不做校准：同刻度下相差恰为校准系数
+        assert!((volume_gain(100) / tts_stream_gain(100) - 1.0 / MANBO_LOUDNESS_GAIN).abs() < 1e-6);
+        println!("[PASS] test_tts_stream_gain_applies_calibration passed");
     }
 
     #[test]
@@ -1557,7 +1800,7 @@ mod tests {
         let ssml_neg = build_sapi_ssml("测试", -3);
         assert!(ssml_neg.contains("pitch=\"-3st\""), "ssml: {}", ssml_neg);
 
-        // 命令包含中文音色选择、rate 直传、volume 减半
+        // 命令包含中文音色选择、rate 直传、volume 直传（新刻度 100 即 SAPI 满档）
         let cmd = build_sapi_command(
             "你好",
             &SapiParams {
@@ -1567,31 +1810,39 @@ mod tests {
             },
         );
         assert!(cmd.contains("$s.Rate=2"), "cmd: {}", cmd);
-        assert!(cmd.contains("$s.Volume=50"), "cmd: {}", cmd);
+        assert!(cmd.contains("$s.Volume=100"), "cmd: {}", cmd);
         assert!(cmd.contains("SelectVoice"), "cmd: {}", cmd);
         assert!(cmd.contains("SpeakSsml"), "cmd: {}", cmd);
 
-        // rate 越界钳制到 SAPI 允许范围
+        // rate 越界钳制到 SAPI 允许范围；volume 超满档钳到 100（新 200 = 旧 400，SAPI 无增益空间）
         let cmd2 = build_sapi_command(
             "x",
             &SapiParams {
                 rate: 99,
-                volume: 0,
+                volume: 200,
                 pitch: 0,
             },
         );
         assert!(cmd2.contains("$s.Rate=10"), "cmd2: {}", cmd2);
-        assert!(cmd2.contains("$s.Volume=0"), "cmd2: {}", cmd2);
+        assert!(cmd2.contains("$s.Volume=100"), "cmd2: {}", cmd2);
+
+        // rodio 增益换算：新刻度 100 = 1.0（原满量）、200 = 2.0（2 倍放大）、越界钳制
+        assert_eq!(volume_gain(100), 1.0);
+        assert_eq!(volume_gain(200), 2.0);
+        assert_eq!(volume_gain(0), 0.0);
+        assert_eq!(volume_gain(50), 0.5);
+        assert_eq!(volume_gain(300), 2.0);
+        assert_eq!(volume_gain(-1), 0.0);
         println!("[PASS] test_sapi_ssml_and_command passed");
     }
 
     /// macOS `say` 兜底路径的参数映射（跨平台可测：不依赖 macOS 运行时）
     #[test]
     fn test_say_args_mapping() {
-        // 默认档位 rate=0 → 系统基准 175 wpm
-        assert_eq!(say_params_from(0, 100), (175, 0.5));
-        // 正负档位线性折算
-        assert_eq!(say_params_from(2, 200), (205, 1.0));
+        // 默认档位 rate=0 → 系统基准 175 wpm；新刻度 100 = 原满量 → volm 1.0
+        assert_eq!(say_params_from(0, 100), (175, 1.0));
+        // 正负档位线性折算；新刻度 50 = 旧 100 半量 → 0.5
+        assert_eq!(say_params_from(2, 50), (205, 0.5));
         assert_eq!(say_params_from(-3, 0), (130, 0.0));
         // 越界钳制：rate 档位先钳到 -10~10（对应 25~325 wpm），再过 80~400 安全区间；volume 钳到 0~1
         assert_eq!(say_params_from(99, 999), (325, 1.0));
@@ -1600,12 +1851,12 @@ mod tests {
         // 参数表：无音色时不带 -v；有音色时插入 -v <voice>
         let params = SapiParams { rate: 0, volume: 100, pitch: 5 };
         let args = build_say_args("你好", &params, None);
-        assert_eq!(args, vec!["-r", "175", "[[volm 0.50]]你好"]);
+        assert_eq!(args, vec!["-r", "175", "[[volm 1.00]]你好"]);
 
         let args_zh = build_say_args("你好", &params, Some("Tingting"));
         assert_eq!(
             args_zh,
-            vec!["-r", "175", "-v", "Tingting", "[[volm 0.50]]你好"]
+            vec!["-r", "175", "-v", "Tingting", "[[volm 1.00]]你好"]
         );
         println!("[PASS] test_say_args_mapping passed");
     }
