@@ -1157,6 +1157,23 @@ impl TTSManager {
         )
     }
 
+    /// 进程级共享 HTTP 客户端（对齐原工程 `Network.cpp` 的 `GetSharedSession` 共享
+    /// WinHTTP 会话：会话级连接缓存使后续请求复用已建立的 TCP/TLS 连接）。
+    /// reqwest Client 内置连接池，逐条播报重建会随消息丢弃池，导致每跳都重新握手。
+    /// 超时口径不变：[`Self::REQUEST_TIMEOUT`] 作用于每个请求（两跳各 3s）。
+    /// 构建失败（仅 TLS 后端初始化异常，几乎不会发生）返回 `None`，调用方降级本地 SAPI。
+    fn shared_http_client() -> Option<&'static reqwest::Client> {
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        if let Some(c) = CLIENT.get() {
+            return Some(c);
+        }
+        let built = reqwest::Client::builder()
+            .timeout(Self::REQUEST_TIMEOUT)
+            .build()
+            .ok()?;
+        Some(CLIENT.get_or_init(|| built))
+    }
+
     /// 请求 TTS 并下载音频字节；`auth` 为可选 Bearer 令牌
     async fn request_audio_bytes(
         client: &reqwest::Client,
@@ -1226,36 +1243,34 @@ impl TTSManager {
             return Ok(());
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Self::REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        // 2. 特殊用户专属引擎（失败后回落通用链，不直接跳 SAPI）
-        if !user_id.is_empty() && user_id == crate::bilibili::SPECIAL_OPEN_ID && self.special_engine_available()
-        {
-            let url = Self::build_special_manbo_url(trimmed);
-            match Self::request_audio_bytes(&client, &url, None).await {
-                Ok(bytes) => {
-                    self.special_mark_success();
-                    return self.play_audio_bytes(&bytes, checkin_username);
-                }
-                Err(_) => {
-                    self.special_mark_failure();
+        // 共享 HTTP 客户端（构建失败几乎不会发生；此时跳过 2/3 段，直接落第 4 段 SAPI 兜底）
+        if let Some(client) = Self::shared_http_client() {
+            // 2. 特殊用户专属引擎（失败后回落通用链，不直接跳 SAPI）
+            if !user_id.is_empty() && user_id == crate::bilibili::SPECIAL_OPEN_ID && self.special_engine_available()
+            {
+                let url = Self::build_special_manbo_url(trimmed);
+                match Self::request_audio_bytes(client, &url, None).await {
+                    Ok(bytes) => {
+                        self.special_mark_success();
+                        return self.play_audio_bytes(&bytes, checkin_username);
+                    }
+                    Err(_) => {
+                        self.special_mark_failure();
+                    }
                 }
             }
-        }
 
-        // 3. 选择当前最优健康引擎并尝试（Manbo 失败即降级，落到本地 SAPI 兜底）
-        if self.select_active_engine() == TTSEngineType::Manbo {
-            let url = Self::build_manbo_url(&cfg, trimmed);
-            match Self::request_audio_bytes(&client, &url, Some(&cfg.manbo_api_key)).await {
-                Ok(bytes) => {
-                    self.mark_active_engine(TTSEngineType::Manbo);
-                    return self.play_audio_bytes(&bytes, checkin_username);
-                }
-                Err(_) => {
-                    self.mark_engine_degraded(TTSEngineType::Manbo);
+            // 3. 选择当前最优健康引擎并尝试（Manbo 失败即降级，落到本地 SAPI 兜底）
+            if self.select_active_engine() == TTSEngineType::Manbo {
+                let url = Self::build_manbo_url(&cfg, trimmed);
+                match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
+                    Ok(bytes) => {
+                        self.mark_active_engine(TTSEngineType::Manbo);
+                        return self.play_audio_bytes(&bytes, checkin_username);
+                    }
+                    Err(_) => {
+                        self.mark_engine_degraded(TTSEngineType::Manbo);
+                    }
                 }
             }
         }
@@ -1286,10 +1301,6 @@ impl TTSManager {
             return Ok(());
         }
         let cfg = self.config.lock().unwrap().clone();
-        let client = reqwest::Client::builder()
-            .timeout(Self::REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
 
         let preferred = self.select_active_engine();
         crate::log_info!(
@@ -1302,28 +1313,32 @@ impl TTSManager {
         );
 
         if preferred == TTSEngineType::Manbo {
-            // 曼波默认音色的 speed 参数按试听即时语速覆盖（其余音色无此参数，
-            // 音调/音量对 Manbo 云端无效，音量在本地播放端应用）
-            let url = Self::build_manbo_url(
-                &TTSConfig {
-                    speech_rate: rate,
-                    ..cfg.clone()
-                },
-                trimmed,
-            );
-            match Self::request_audio_bytes(&client, &url, Some(&cfg.manbo_api_key)).await {
-                Ok(bytes) => {
-                    self.mark_active_engine(TTSEngineType::Manbo);
-                    crate::log_info!(
-                        "[TTS] 试听走 Manbo 引擎（音量 {} 由本地播放端增益应用）",
-                        volume
-                    );
-                    return AudioQueue::global().play_tts_bytes(bytes, volume);
+            if let Some(client) = Self::shared_http_client() {
+                // 曼波默认音色的 speed 参数按试听即时语速覆盖（其余音色无此参数，
+                // 音调/音量对 Manbo 云端无效，音量在本地播放端应用）
+                let url = Self::build_manbo_url(
+                    &TTSConfig {
+                        speech_rate: rate,
+                        ..cfg.clone()
+                    },
+                    trimmed,
+                );
+                match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
+                    Ok(bytes) => {
+                        self.mark_active_engine(TTSEngineType::Manbo);
+                        crate::log_info!(
+                            "[TTS] 试听走 Manbo 引擎（音量 {} 由本地播放端增益应用）",
+                            volume
+                        );
+                        return AudioQueue::global().play_tts_bytes(bytes, volume);
+                    }
+                    Err(e) => {
+                        self.mark_engine_degraded(TTSEngineType::Manbo);
+                        crate::log_warn!("[TTS] 试听 Manbo 请求失败({}),降级本地 SAPI", e);
+                    }
                 }
-                Err(e) => {
-                    self.mark_engine_degraded(TTSEngineType::Manbo);
-                    crate::log_warn!("[TTS] 试听 Manbo 请求失败({}),降级本地 SAPI", e);
-                }
+            } else {
+                crate::log_warn!("[TTS] 共享 HTTP 客户端不可用，试听降级本地 SAPI");
             }
         }
 
@@ -1644,6 +1659,16 @@ mod tests {
         assert_eq!(TTSManager::match_special_sound("ohyeah"), None);
         assert_eq!(TTSManager::match_special_sound("tongkuai"), None);
         println!("[PASS] test_special_sound_keys_match_legacy_voice_map passed");
+    }
+
+    #[test]
+    fn test_shared_http_client_is_process_wide_singleton() {
+        // 对齐原工程 GetSharedSession 共享 WinHTTP 会话：进程级单例，
+        // 跨播报复用同一连接池（TCP/TLS 握手只发生一次，不再随消息丢弃）
+        let a = TTSManager::shared_http_client().expect("共享 HTTP 客户端应构建成功");
+        let b = TTSManager::shared_http_client().expect("共享 HTTP 客户端应构建成功");
+        assert!(std::ptr::eq(a, b), "两次获取应命中同一实例");
+        println!("[PASS] test_shared_http_client_is_process_wide_singleton passed");
     }
 
     #[test]
