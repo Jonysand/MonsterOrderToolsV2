@@ -22,10 +22,10 @@ pub struct AppConfig {
     pub tts_engine: String,
     pub enable_voice: bool,
     pub speech_rate: i32,
-    /// 语音音量（新刻度 0~200：100 = 旧刻度满量 200，200 = 旧刻度 400 的 2 倍增益）。
-    /// 旧刻度（V0.1.9 及以前，100 = 半量）由 [`AppConfig::normalize_volume_scale`] 一次性减半迁移
+    /// 语音音量（刻度 0~100 直通：100 = SAPI 满档 / rodio 满量增益 1.0）。
+    /// 旧刻度（V0.1.9 及以前，增益 = 值/200）由 [`AppConfig::normalize_volume_scale`] 一次性减半迁移
     pub speech_volume: i32,
-    /// 音量刻度版本：2 = 新刻度。磁盘/前端回传中缺省或非 2 视为旧刻度，读入时减半换算
+    /// 音量刻度版本：2 = 现刻度（增益 = 值/100）。磁盘/前端回传中缺省或非 2 视为旧刻度，读入时减半换算
     #[serde(default)]
     pub volume_scale: i32,
     pub speech_pitch: i32,
@@ -69,7 +69,8 @@ impl Default for AppConfig {
             tts_engine: "auto".into(),
             enable_voice: false,
             speech_rate: 0,
-            // 新刻度 50 = 旧刻度 100（原工程默认）的等效响度，升级用户听感不变
+            // 新刻度 50 = 旧刻度 100（原工程默认）的等效响度：增益路径（Manbo/音效）听感不变；
+            // SAPI 侧因反补偿有意重定标（默认档实际输出 0.237 → 0.50，约 +6.5 dB）
             speech_volume: 50,
             volume_scale: 2,
             speech_pitch: 0,
@@ -291,15 +292,20 @@ impl AppConfig {
         cfg
     }
 
-    /// 音量刻度一次性迁移：未标记新刻度（volume_scale != 2）的配置视为旧刻度
-    /// （V0.1.9 及以前，100 = 原满量 200 的一半），统一减半换算并打标。
+    /// 音量刻度一次性迁移：未标记现刻度（volume_scale != 2）的配置视为旧刻度
+    /// （V0.1.9 及以前，增益 = 值/200），减半换算为现刻度（增益 = 值/100）并打标；
+    /// 已标记配置仅做 0~100 范围防御性钳制（2 倍刻度短暂存在过，存量值可能 >100）。
     /// load（磁盘/原工程迁移）与 save_app_config（前端回传防御）共用，
-    /// 保证「任何进入内存/存储的旧口径值只被换算一次」，升级用户听感不变。
+    /// 保证「任何进入内存/存储的旧口径值只被换算一次」；减半换算本身使增益路径
+    /// （Manbo/音效）听感不变，SAPI 侧则经 tts::sapi_volume_from 反补偿有意重定标
+    /// （0.1.9 减半口径与 0.1.10 直传口径的默认档同为 0.237，新版拉直为 0.50，约 +6.5 dB）。
     pub fn normalize_volume_scale(&mut self) {
         const VOLUME_SCALE_V2: i32 = 2;
         if self.volume_scale != VOLUME_SCALE_V2 {
-            self.speech_volume = (self.speech_volume / 2).clamp(0, 200);
+            self.speech_volume = (self.speech_volume / 2).clamp(0, 100);
             self.volume_scale = VOLUME_SCALE_V2;
+        } else {
+            self.speech_volume = self.speech_volume.clamp(0, 100);
         }
     }
 
@@ -573,10 +579,11 @@ mod tests {
     }
 
     /// 音量刻度迁移:解析层按「是否显式写 speech_volume」标记旧刻度,
-    /// normalize_volume_scale(load/save 出口调用)对未标记配置一次性减半
+    /// normalize_volume_scale(load/save 出口调用)对未标记配置一次性减半,
+    /// 已标记配置钳回 0~100(2 倍刻度短暂存在过,存量值可能 >100)
     #[test]
     fn test_volume_scale_migration() {
-        // 旧版 V2 配置:speech_volume=100(旧刻度半量)→ 减半为新刻度 50,并打标 2
+        // 旧版 V2 配置:speech_volume=100(旧刻度半量)→ 减半为现刻度 50,并打标 2
         let old = r#"{ "speech_volume": 100, "enable_voice": true }"#;
         let mut cfg = AppConfig::parse_content(old, None);
         assert_eq!(cfg.speech_volume, 100, "解析层保留旧口径原值");
@@ -588,26 +595,33 @@ mod tests {
         cfg.normalize_volume_scale();
         assert_eq!(cfg.speech_volume, 50);
 
-        // 新刻度配置:volume_scale=2,speech_volume=100(=原满量)原样保留
+        // 现刻度配置:volume_scale=2,speech_volume=100(满档)原样保留
         let new_scale = r#"{ "speech_volume": 100, "volume_scale": 2 }"#;
         let cfg2 = AppConfig::parse_content(new_scale, None);
         assert_eq!(cfg2.speech_volume, 100);
         assert_eq!(cfg2.volume_scale, 2);
         let mut cfg2n = cfg2.clone();
         cfg2n.normalize_volume_scale();
-        assert_eq!(cfg2n.speech_volume, 100, "新刻度不得被减半");
+        assert_eq!(cfg2n.speech_volume, 100, "现刻度不得被减半");
 
-        // 部分配置(未写 speech_volume):值来自默认(新刻度 50),不得误减半
+        // 2 倍刻度存量(volume_scale=2 且值 >100):钳回新上限 100,不得误减半
+        let legacy_scaled = r#"{ "speech_volume": 150, "volume_scale": 2 }"#;
+        let mut cfg2b = AppConfig::parse_content(legacy_scaled, None);
+        cfg2b.normalize_volume_scale();
+        assert_eq!(cfg2b.speech_volume, 100, "超上限值钳到 100");
+        assert_eq!(cfg2b.volume_scale, 2);
+
+        // 部分配置(未写 speech_volume):值来自默认(现刻度 50),不得误减半
         let partial = r#"{ "opacity": 80 }"#;
         let cfg3 = AppConfig::parse_content(partial, None);
         assert_eq!(cfg3.speech_volume, AppConfig::default().speech_volume);
         assert_eq!(cfg3.volume_scale, 2);
 
-        // 越界钳制:旧口径 500 减半后 clamp 到 200
+        // 越界钳制:旧口径 500 减半后 clamp 到 100
         let oversized = r#"{ "speech_volume": 500 }"#;
         let mut cfg4 = AppConfig::parse_content(oversized, None);
         cfg4.normalize_volume_scale();
-        assert_eq!(cfg4.speech_volume, 200);
+        assert_eq!(cfg4.speech_volume, 100);
         println!("[PASS] test_volume_scale_migration passed");
     }
 

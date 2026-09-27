@@ -1588,7 +1588,7 @@ export const MainWindow: React.FC = () => {
                     <input
                       type="range"
                       min="0"
-                      max="200"
+                      max="100"
                       step="1"
                       value={config.speech_volume}
                       onChange={(e) => applyConfigPatch({ speech_volume: Number(e.target.value) })}

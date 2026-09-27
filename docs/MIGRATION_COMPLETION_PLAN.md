@@ -410,7 +410,7 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **当前实际引擎实时显示**：`TTSManager.active_engine` 在每次播报成功路径记录；命令 `get_current_tts_engine` 返回 `manbo/xiaomi/sapi`（对齐 `TTSManager_GetCurrentProviderName` 命名），前端每 2.5s 刷新并映射为 `Manbo / 小米MiMo / Windows SAPI / 未知`。
 - **Manbo API Key**：密码框 + `save_manbo_api_key` 命令（**仅写注册表，不落 JSON、不回传明文**；空值不覆盖）；占位文案随凭据状态切换。
 - **184 音色下拉**：`get_manbo_voice_list`（185 项）驱动，保留历史配置中不在列表内的音色。
-- **语速/音量/音高**：语音音量范围由 `0~100` 修正为 **`0~200`**（对齐原工程 `VoiceVolumeSlider`，SAPI 侧 `Volume 减半` 后仍在 0~100）；音高、语速 ±10。
+- **语速/音量/音高**：语音音量终案 **`0~100` 直通**（100 = SAPI 满档 / rodio 满量增益；SAPI 侧经 `sapi_volume_from` 对数曲线反补偿，与 Manbo 任意档位响度对齐。历史沿革：原工程为 0~200 滑块 + SAPI `Volume 减半`，V2 曾短暂改回 0~200 两倍刻度随 0.1.10 发布，后收口为 0~100 并对旧值减半迁移）；音高、语速 ±10。
 - **MiMo 角色/风格**：`mimo_voice`（默认/中文/英文）、`mimo_style`（默认 + 5 种）下拉，与原工程 `MimoVoiceComboBox / MimoStyleComboBox` 选项逐项一致。
 - **缓存天数 / 过滤开关 / 总开关**：`tts_cache_days_to_keep`（1~365 钳制）、`enable_voice` 总开关、`only_speek_wearing_medal`、`only_speek_paid_gift`、`only_speek_guard_level`（所有人/舰长/提督/总督）、舰长打卡 AI 开关与触发词。
 - **验收**：`test_auto_engine_cascade_and_current_engine_name`（Auto 级联 + 引擎名映射）、`test_parse_tts_engine_mapping`。

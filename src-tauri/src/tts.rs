@@ -65,7 +65,7 @@ impl Default for TTSConfig {
             engine: TTSEngineType::Manbo,
             enable_voice: true,
             speech_rate: 0,
-            // 新刻度 50 = 旧刻度 100（原工程默认）的等效响度
+            // 50 = 原工程默认 100（旧满量 200 的一半）的等效响度
             speech_volume: 50,
             speech_pitch: 0,
             manbo_api_key: String::new(),
@@ -90,7 +90,8 @@ enum AudioJob {
     Sapi { text: String, params: SapiParams },
 }
 
-/// SAPI 播报参数（对齐原工程 `SetupSapiVoiceParams`：rate 直传、音量减半、pitch 走 SSML）
+/// SAPI 播报参数（rate 直传、pitch 走 SSML；volume 为用户线性刻度 0~100，
+/// 构建命令时经 [`sapi_volume_from`] 反补偿——与原工程 `SetVolume(speechVolume/2)` 的减半口径不同）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SapiParams {
     pub rate: i32,
@@ -191,10 +192,10 @@ impl AudioQueue {
     }
 }
 
-/// 配置音量换算为 rodio 增益：新刻度 0~200（100 = 旧刻度满量 200 即 1.0 增益，
-/// 200 = 2.0 增益，对应用户要求的「新 200 = 旧 400」），增益可大于 1.0（rodio 支持放大）
+/// 配置音量换算为 rodio 增益：刻度 0~100 直通（100 = 1.0 满量增益），
+/// 与 SAPI 满档（Volume=100）共用同一刻度端点，超界防御性收口
 pub fn volume_gain(speech_volume: i32) -> f32 {
-    (speech_volume.clamp(0, 200) as f32) / 100.0
+    (speech_volume.clamp(0, 100) as f32) / 100.0
 }
 
 /// Manbo 云端语音响度校准增益：实测「佩奇猪」音色原始输出 RMS 与
@@ -252,12 +253,33 @@ pub fn build_sapi_ssml(text: &str, pitch: i32) -> String {
     )
 }
 
+/// 用户音量刻度（线性振幅 0~100）→ SAPI Volume 档位反补偿。
+/// System.Speech 的 Volume 曲线为**两段式**（实测：同文本逐档渲染 WAV 测 RMS，2026-09-27）：
+/// V=1..9 为线性段（amp ≈ 0.0075·V），V≥10 为对数段（amp = 10^((V-100)/80)，每 4 档约 1 dB、
+/// 对数段 V=10~100 实际跨度约 22.5 dB），两段恰在 V=10 相交。分段反解使 SAPI 实际输出与 rodio 数字增益同刻度线性
+/// （与 Manbo 校准对齐在任意档位成立，而非仅满档）：
+/// 线性段 V = v/0.0075、对数段 V = 100 + 80·log10(v/100)（50 → 76、25 → 52、10 → 20）；
+/// 满档 100 与静音 0 不变；v≥1 但反解值 <1 时饱和到 1（避免低段跳变为完全静音）。
+pub fn sapi_volume_from(volume: i32) -> i32 {
+    if volume <= 0 {
+        return 0;
+    }
+    let v = volume.clamp(0, 100) as f64 / 100.0;
+    let v_linear = v / 0.0075;
+    let raw = if v_linear < 10.0 {
+        v_linear
+    } else {
+        100.0 + 80.0 * v.log10()
+    };
+    raw.round().clamp(1.0, 100.0) as i32
+}
+
 /// 构建 PowerShell SAPI 播报命令（选择中文音色 + rate/volume/pitch 全参数）
 pub fn build_sapi_command(text: &str, params: &SapiParams) -> String {
     let ssml = build_sapi_ssml(text, params.pitch).replace('\'', "''");
     let rate = params.rate.clamp(-10, 10);
-    // SAPI 档位 0~100：新刻度 100 即满档（等价旧刻度 200），200 起钳制到满档
-    let volume = params.volume.clamp(0, 100);
+    // 音量先经两段式曲线反补偿（详见 sapi_volume_from），使 SAPI 实际输出为线性刻度
+    let volume = sapi_volume_from(params.volume);
     format!(
         "Add-Type -AssemblyName System.Speech; \
 $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; \
@@ -316,11 +338,11 @@ fn run_local_speech(text: &str, params: &SapiParams) -> bool {
 
 /// SAPI 档位参数 → `say` 参数映射（纯函数，便于单测）。
 /// - `rate`：SAPI 为 -10~10 档位，`say -r` 为词/分钟（系统默认约 175），按 15 wpm/档折算
-/// - `volume`：新刻度 0~200（100 = 原满量），映射为 `say` 内嵌音量命令的 0.0~1.0（上限 1.0）
+/// - `volume`：刻度 0~100 直通映射为 `say` 内嵌音量命令的 0.0~1.0（100 = 满量 1.0）
 pub fn say_params_from(rate: i32, volume: i32) -> (i32, f64) {
     (
         (175 + rate.clamp(-10, 10) * 15).clamp(80, 400),
-        ((volume.clamp(0, 200) as f64) / 100.0).min(1.0),
+        (volume.clamp(0, 100) as f64) / 100.0,
     )
 }
 
@@ -1073,9 +1095,9 @@ impl TTSManager {
         }
     }
 
-    /// 当前配置的播报音量（0~200），用于非 SAPI 播放路径
+    /// 当前配置的播报音量（0~100），用于非 SAPI 播放路径
     fn current_volume(&self) -> i32 {
-        // 锁中毒兜底 50 = 旧口径 100（原工程默认）的等效响度
+        // 锁中毒兜底 50 = 原工程默认 100（旧满量 200 的一半）的等效响度
         self.config.lock().map(|c| c.speech_volume).unwrap_or(50)
     }
 
@@ -1307,11 +1329,11 @@ impl TTSManager {
 
         self.mark_active_engine(TTSEngineType::Sapi);
         crate::log_info!(
-            "[TTS] 试听走本地 SAPI: volume={}, rate={}, pitch={}（SAPI 档位 {}）",
+            "[TTS] 试听走本地 SAPI: volume={}, rate={}, pitch={}（SAPI 档位 {}，经音量曲线反补偿）",
             volume,
             rate,
             pitch,
-            volume.clamp(0, 100)
+            sapi_volume_from(volume)
         );
         AudioQueue::global().speak_sapi(
             trimmed.to_string(),
@@ -1580,14 +1602,14 @@ mod tests {
 
     #[test]
     fn test_volume_gain_mapping() {
-        // 新刻度 0~200：100 = 旧刻度满量（1.0 增益）、200 = 旧刻度 400（2.0 增益）、0 = 静音
+        // 刻度 0~100 直通：100 = 满量（1.0 增益）、0 = 静音
         assert_eq!(volume_gain(100), 1.0);
-        assert_eq!(volume_gain(200), 2.0);
         assert_eq!(volume_gain(50), 0.5);
         assert_eq!(volume_gain(0), 0.0);
-        // 越界钳制（0~200 之外收口到 0.0~2.0）
+        // 越界防御性收口到 0.0~1.0
         assert_eq!(volume_gain(-10), 0.0);
-        assert_eq!(volume_gain(999), 2.0);
+        assert_eq!(volume_gain(150), 1.0);
+        assert_eq!(volume_gain(999), 1.0);
         println!("[PASS] test_volume_gain_mapping passed");
     }
 
@@ -1800,7 +1822,7 @@ mod tests {
         let ssml_neg = build_sapi_ssml("测试", -3);
         assert!(ssml_neg.contains("pitch=\"-3st\""), "ssml: {}", ssml_neg);
 
-        // 命令包含中文音色选择、rate 直传、volume 直传（新刻度 100 即 SAPI 满档）
+        // 命令包含中文音色选择、rate 直传、volume 经反补偿（100 恒等满档）
         let cmd = build_sapi_command(
             "你好",
             &SapiParams {
@@ -1814,7 +1836,7 @@ mod tests {
         assert!(cmd.contains("SelectVoice"), "cmd: {}", cmd);
         assert!(cmd.contains("SpeakSsml"), "cmd: {}", cmd);
 
-        // rate 越界钳制到 SAPI 允许范围；volume 超满档钳到 100（新 200 = 旧 400，SAPI 无增益空间）
+        // rate 越界钳制到 SAPI 允许范围；volume 越界钳到满档 100（反补偿下 100 恒等满档）
         let cmd2 = build_sapi_command(
             "x",
             &SapiParams {
@@ -1826,12 +1848,23 @@ mod tests {
         assert!(cmd2.contains("$s.Rate=10"), "cmd2: {}", cmd2);
         assert!(cmd2.contains("$s.Volume=100"), "cmd2: {}", cmd2);
 
-        // rodio 增益换算：新刻度 100 = 1.0（原满量）、200 = 2.0（2 倍放大）、越界钳制
+        // 音量经对数曲线反补偿：用户 50 → SAPI 档位 76（实际输出回到线性 0.5，与 Manbo 对齐）
+        let cmd_mid = build_sapi_command(
+            "x",
+            &SapiParams {
+                rate: 0,
+                volume: 50,
+                pitch: 0,
+            },
+        );
+        assert!(cmd_mid.contains("$s.Volume=76"), "cmd_mid: {}", cmd_mid);
+
+        // rodio 增益换算：100 = 1.0 满量、0 = 静音、越界防御性收口
         assert_eq!(volume_gain(100), 1.0);
-        assert_eq!(volume_gain(200), 2.0);
+        assert_eq!(volume_gain(200), 1.0);
         assert_eq!(volume_gain(0), 0.0);
         assert_eq!(volume_gain(50), 0.5);
-        assert_eq!(volume_gain(300), 2.0);
+        assert_eq!(volume_gain(300), 1.0);
         assert_eq!(volume_gain(-1), 0.0);
         println!("[PASS] test_sapi_ssml_and_command passed");
     }
@@ -1839,12 +1872,12 @@ mod tests {
     /// macOS `say` 兜底路径的参数映射（跨平台可测：不依赖 macOS 运行时）
     #[test]
     fn test_say_args_mapping() {
-        // 默认档位 rate=0 → 系统基准 175 wpm；新刻度 100 = 原满量 → volm 1.0
+        // 默认档位 rate=0 → 系统基准 175 wpm；刻度 100 = 满量 → volm 1.0
         assert_eq!(say_params_from(0, 100), (175, 1.0));
-        // 正负档位线性折算；新刻度 50 = 旧 100 半量 → 0.5
+        // 正负档位线性折算；刻度 50 = 半量 → 0.5
         assert_eq!(say_params_from(2, 50), (205, 0.5));
         assert_eq!(say_params_from(-3, 0), (130, 0.0));
-        // 越界钳制：rate 档位先钳到 -10~10（对应 25~325 wpm），再过 80~400 安全区间；volume 钳到 0~1
+        // 越界钳制：rate 档位先钳到 -10~10（对应 25~325 wpm），再过 80~400 安全区间；volume 钳到 0~100 → 0~1
         assert_eq!(say_params_from(99, 999), (325, 1.0));
         assert_eq!(say_params_from(-99, -5), (80, 0.0));
 
@@ -1859,6 +1892,72 @@ mod tests {
             vec!["-r", "175", "-v", "Tingting", "[[volm 1.00]]你好"]
         );
         println!("[PASS] test_say_args_mapping passed");
+    }
+
+    /// SAPI Volume 档位反补偿：实测 System.Speech 曲线两段式——
+    /// V=1..9 线性段 amp≈0.0075·V、V≥10 对数段 10^((V-100)/80)（每 4 档约 1 dB），
+    /// 两段在 V=10 相交。分段反解使实际输出线性化，与 rodio 数字增益（Manbo/音效）同刻度，
+    /// 任意档位保持响度对齐
+    #[test]
+    fn test_sapi_volume_compensation() {
+        // 对数段锚点：满档不变、50 → 76、25 → 52、10 → 20
+        assert_eq!(sapi_volume_from(100), 100);
+        assert_eq!(sapi_volume_from(75), 90);
+        assert_eq!(sapi_volume_from(50), 76);
+        assert_eq!(sapi_volume_from(25), 52);
+        assert_eq!(sapi_volume_from(10), 20);
+        // 线性段锚点（V=1..9 反解 V=v/0.0075）；v=8 起线性反解越过 V=10 交点，回落对数段
+        assert_eq!(sapi_volume_from(1), 1);
+        assert_eq!(sapi_volume_from(2), 3);
+        assert_eq!(sapi_volume_from(3), 4);
+        assert_eq!(sapi_volume_from(4), 5);
+        assert_eq!(sapi_volume_from(5), 7);
+        assert_eq!(sapi_volume_from(6), 8);
+        assert_eq!(sapi_volume_from(7), 9);
+        assert_eq!(sapi_volume_from(8), 12);
+        assert_eq!(sapi_volume_from(9), 16);
+        // 静音与越界防御
+        assert_eq!(sapi_volume_from(0), 0);
+        assert_eq!(sapi_volume_from(-5), 0);
+        assert_eq!(sapi_volume_from(150), 100);
+        // 补偿闭环：实测分段前向模型（与探针一致）下，输出对齐线性目标。
+        // 对数段（v≥10）误差 ≤ 半档（0.125 dB）；线性段（v=2..9）受档位量化台阶限制
+        // 误差 ≤ 1.1 dB；v=1 的最近档即档位 1，为 2.5 dB 量化极限（仅保证非静音）
+        let amp_at = |v_sapi: f64| -> f64 {
+            if v_sapi < 10.0 {
+                0.0075 * v_sapi
+            } else {
+                10f64.powf((v_sapi - 100.0) / 80.0)
+            }
+        };
+        for (v, max_err_db) in [(1, 2.6), (2, 1.1), (3, 1.1), (4, 1.1), (5, 1.1), (6, 1.1), (7, 1.1), (8, 1.1), (9, 1.1)] {
+            let v_sapi = sapi_volume_from(v) as f64;
+            let err_db = 20.0 * (amp_at(v_sapi) / (v as f64 / 100.0)).abs().log10();
+            assert!(
+                err_db <= max_err_db,
+                "v={} → 档位 {} 误差 {:.2} dB（阈值 {}）",
+                v,
+                v_sapi,
+                err_db,
+                max_err_db
+            );
+        }
+        for v in [10, 20, 33, 50, 66, 80, 95, 100] {
+            let v_sapi = sapi_volume_from(v) as f64;
+            let actual = 10f64.powf((v_sapi - 100.0) / 80.0);
+            let target = v as f64 / 100.0;
+            let err_db = 20.0 * (actual / target).abs().log10();
+            assert!(
+                err_db <= 0.125,
+                "v={} → 档位 {} 实际输出 {} 目标 {} 误差 {:.3} dB",
+                v,
+                v_sapi,
+                actual,
+                target,
+                err_db
+            );
+        }
+        println!("[PASS] test_sapi_volume_compensation passed");
     }
 
     /// `say -v ?` 中文音色解析：必须保住含空格/括号的音色名，
