@@ -1474,6 +1474,192 @@ mod tests {
         println!("[PASS] test_manbo_peiqi_loudness_calibration passed");
     }
 
+    /// 手动基准工具（cargo test test_manbo_consecutive_latency_benchmark -- --ignored --nocapture）：
+    /// 用真实 Manbo 请求交替模拟「逐条重建 Client（迁移后旧行为）」与「共享 Client（现行为）」
+    /// 的连续多条播报，逐阶段计时：客户端构建 / 一跳（API+合成）/ 二跳（音频下载），
+    /// 另以「GET / 无合成探测」单独分离 DNS+TCP+TLS 握手开销。
+    /// 两轮同字数文本逐条交替以抵消服务端波动；文本逐条唯一以排除服务端缓存干扰；
+    /// 超时放宽为 10s（生产 3s）以完整观测服务端耗时。需要网络；日常 CI 不跑（#[ignore]）。
+    #[test]
+    #[ignore = "手动基准工具：需要网络，日常 CI 不跑"]
+    fn test_manbo_consecutive_latency_benchmark() {
+        const ROUNDS: usize = 5;
+        const BENCH_TIMEOUT: Duration = Duration::from_secs(10);
+        const API_ROOT: &str = "https://api.milorapart.top/";
+
+        /// 单条播报两跳计时（与生产 request_audio_bytes 同构）：(一跳ms, 二跳ms, 下载主机, 失败原因)
+        async fn one_message(
+            client: &reqwest::Client,
+            text: &str,
+        ) -> (u128, u128, String, Option<String>) {
+            let url = format!(
+                "https://api.milorapart.top/apis/AIvoice?speaker={}&text={}",
+                url_encode("佩奇猪"),
+                url_encode(text)
+            );
+            let t1 = Instant::now();
+            let json: serde_json::Value = match client.get(&url).send().await {
+                Ok(resp) => match resp.json().await {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return (t1.elapsed().as_millis(), 0, String::new(), Some(format!("JSON 解析失败: {e}")))
+                    }
+                },
+                Err(e) => return (t1.elapsed().as_millis(), 0, String::new(), Some(e.to_string())),
+            };
+            let hop1 = t1.elapsed().as_millis();
+            let Some(audio_url) = json.get("url").and_then(|u| u.as_str()).map(str::to_string) else {
+                return (hop1, 0, String::new(), Some("响应缺少 url 字段".into()));
+            };
+            let host = audio_url
+                .split("://")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or("")
+                .to_string();
+            let t2 = Instant::now();
+            let err = match client.get(&audio_url).send().await {
+                Ok(r) => match r.bytes().await {
+                    Ok(b) if !b.is_empty() => None,
+                    _ => Some("音频下载为空".into()),
+                },
+                Err(e) => Some(e.to_string()),
+            };
+            (hop1, t2.elapsed().as_millis(), host, err)
+        }
+
+        fn median(v: &mut Vec<u128>) -> u128 {
+            if v.is_empty() {
+                return 0;
+            }
+            v.sort_unstable();
+            v[v.len() / 2]
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // 1) 连接开销分离探测：GET / 不触发合成，冷连接（DNS+TCP+TLS+HTTP）vs 热连接（纯 HTTP 往返）
+            for i in 0..3 {
+                let cold = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
+                let t = Instant::now();
+                let _ = cold.get(API_ROOT).send().await;
+                println!(
+                    "[探测] 冷连接 GET / #{}: {} ms（含 DNS（可能命中系统缓存）+TCP+TLS）",
+                    i + 1,
+                    t.elapsed().as_millis()
+                );
+            }
+            let warm = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
+            let _ = warm.get(API_ROOT).send().await; // 预热建连（不计入计时）
+            for i in 0..3 {
+                let t = Instant::now();
+                let _ = warm.get(API_ROOT).send().await;
+                println!("[探测] 热连接 GET / #{}: {} ms", i + 1, t.elapsed().as_millis());
+            }
+
+            // 2) 连续播报 A/B 交替：A=旧行为（逐条重建 Client），B=现行为（共享 Client）
+            let shared = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
+            let (mut a_build, mut a_h1, mut a_h2, mut a_total) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut b_h1, mut b_h2, mut b_total) = (Vec::new(), Vec::new(), Vec::new());
+            let mut b_first_total = 0u128;
+            let mut failures = 0usize;
+            for i in 0..ROUNDS {
+                // A：每条新建 Client（构建耗时计入本条，与迁移后旧行为一致）
+                let text = format!("延迟基准第{}号样本甲", i + 1);
+                let tb = Instant::now();
+                let per_msg = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
+                let build_ms = tb.elapsed().as_millis();
+                let (h1, h2, host, err) = one_message(&per_msg, &text).await;
+                match err {
+                    None => a_build.push(build_ms),
+                    Some(e) => {
+                        failures += 1;
+                        println!("[旧#{}] 失败: {}", i + 1, e);
+                    }
+                }
+                let total = build_ms + h1 + h2;
+                a_h1.push(h1);
+                a_h2.push(h2);
+                a_total.push(total);
+                println!(
+                    "[旧#{}] build={}ms 一跳(API)={}ms 二跳(下载)={}ms 合计={}ms 下载主机={}",
+                    i + 1, build_ms, h1, h2, total, host
+                );
+
+                // B：共享 Client（首条含冷握手，等价生产启动后的第一条）
+                let text = format!("延迟基准第{}号样本乙", i + 1);
+                let (h1, h2, host, err) = one_message(&shared, &text).await;
+                let total = h1 + h2;
+                if i == 0 {
+                    b_first_total = total;
+                }
+                match err {
+                    None => b_h1.push(h1),
+                    Some(e) => {
+                        failures += 1;
+                        println!("[新#{}] 失败: {}", i + 1, e);
+                    }
+                }
+                b_h2.push(h2);
+                b_total.push(total);
+                println!(
+                    "[新#{}] build=0(共享) 一跳(API)={}ms 二跳(下载)={}ms 合计={}ms 下载主机={}",
+                    i + 1, h1, h2, total, host
+                );
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            // 3) 汇总（均值/中位只统计成功轮次）
+            let mean = |v: &[u128]| -> u128 {
+                if v.is_empty() {
+                    0
+                } else {
+                    v.iter().sum::<u128>() / v.len() as u128
+                }
+            };
+            let (a_ok, b_ok) = (a_build.len(), b_h1.len());
+            println!("---- 汇总（成功 旧={} 新={}，失败={}）----", a_ok, b_ok, failures);
+            if a_ok > 0 {
+                println!(
+                    "[旧行为] 合计均值={}ms 中位={}ms（build均值={} 一跳均值={} 二跳均值={}）",
+                    mean(&a_total),
+                    median(&mut a_total),
+                    mean(&a_build),
+                    mean(&a_h1),
+                    mean(&a_h2)
+                );
+            }
+            if b_ok > 0 {
+                println!(
+                    "[新行为] 合计均值={}ms 中位={}ms（含首条冷握手；一跳均值={} 二跳均值={}）",
+                    mean(&b_total),
+                    median(&mut b_total),
+                    mean(&b_h1),
+                    mean(&b_h2)
+                );
+            }
+            if b_ok > 1 {
+                println!(
+                    "[新行为] 稳态热连接（去首条）合计均值={}ms；首条（含冷握手）合计={}ms",
+                    mean(&b_total[1..]),
+                    b_first_total
+                );
+            }
+            if a_ok > 0 && b_ok > 1 {
+                let delta = mean(&a_total) as i128 - mean(&b_total[1..]) as i128;
+                println!("[结论] 稳态下共享 Client 每条节省 ≈ {} ms（旧均值 - 新稳态均值）", delta);
+            }
+            assert!(
+                a_ok >= 3 && b_ok >= 3,
+                "成功轮次不足（旧={} 新={}），网络或 API 异常，结果不可信",
+                a_ok,
+                b_ok
+            );
+            println!("[PASS] test_manbo_consecutive_latency_benchmark passed");
+        });
+    }
+
     /// 解码 mp3 全部采样（rodio 0.19 symphonia 后端输出 i16），归一化为 f32（-1.0..1.0）
     fn decode_all_mp3(bytes: Vec<u8>) -> Option<Vec<f32>> {
         let decoder = Decoder::new_mp3(Cursor::new(bytes)).ok()?;
