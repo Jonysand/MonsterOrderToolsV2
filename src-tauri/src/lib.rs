@@ -1156,6 +1156,67 @@ fn emit_checkin_reply(
     }
 }
 
+/// AI 调用结果 → 回复定稿，并完成留档与广播。
+///
+/// 抽成同步函数有两个目的：
+/// 1. **修复留档缺失**：异步分支原先在自己的 `spawn` 里直接 `emit`，绕过了
+///    [`emit_checkin_reply`] 的留档入口，导致「舰长 + 已配置 Key」——也就是生产主配置下
+///    **每一条**打卡回复都不写 `History/YYYY.M.D.txt`（注释所称「留档的唯一时机」形同虚设）。
+///    收敛到本函数后，成功（AI 文案）与失败（兜底文案）都恰好留档一次；
+/// 2. **可测**：把「AI 调用结果」作为入参，单测可直接喂 `Ok`/`Err` 两种结果断言留档，
+///    无需真实网络与异步等待（`logging` 的测试留档探针是线程局部的，塞在 `spawn` 里
+///    的留档在测试线程上观测不到）。
+///
+/// 返回 `(定稿文案, 是否为 AI 文案)`，供调用方继续投递 TTS。
+fn finalize_checkin_reply(
+    app_handle: Option<&AppHandle>,
+    user_id: &str,
+    user_name: &str,
+    result: Result<(String, String), String>,
+    fallback: String,
+) -> (String, bool) {
+    let (text, is_ai) = match result {
+        Ok((answer, _reasoning)) => (answer, true),
+        Err(err) => {
+            crate::log_warn!("[CheckinAI] AI 回复失败，使用兜底文案: {}", err);
+            (fallback, false)
+        }
+    };
+    emit_checkin_reply(app_handle, user_id, user_name, &text, is_ai);
+    (text, is_ai)
+}
+
+/// AI 打卡回复的后台任务体：调用模型 → 定稿（留档 + 广播）→ 投递语音。
+///
+/// 抽成独立的 async 函数，使**生产（`spawn`）与单测执行同一份代码**：
+/// 单测可用 `block_on` 直接驱动它（`call_api` 在 Key 为空时立即返回 `Err`，
+/// 不产生网络请求），从而在测试线程上观测留档——若把留档留在 `spawn` 的闭包里，
+/// `logging` 的线程局部探针在测试线程上永远看不到，AI 分支的留档行为就没人守护。
+fn spawn_checkin_ai_reply(
+    provider: Arc<DeepSeekAIChatProvider>,
+    prompt: String,
+    app_handle: Option<AppHandle>,
+    user_id: String,
+    user_name: String,
+    fallback: String,
+    enable_voice: bool,
+    tts: Arc<TTSManager>,
+) -> impl std::future::Future<Output = ()> + Send {
+    async move {
+        let result = provider
+            .call_api(&prompt, Some(ai::SYSTEM_PROMPT_CHECKIN))
+            .await;
+        // 定稿即留档（唯一入口），随后才投递 TTS：
+        // 留档不依赖语音开关，队满/合成失败也不会回头删掉这条留档
+        let (text, _is_ai) =
+            finalize_checkin_reply(app_handle.as_ref(), &user_id, &user_name, result, fallback);
+        if enable_voice {
+            // 签到/补签播报：音频按 `打卡_{用户名}_{ts}.mp3` 留档（对齐原工程仅留档签到 TTS）
+            tts.enqueue_checkin_speak(&text, &user_id, &user_name);
+        }
+    }
+}
+
 /// 首次打卡回复：舰长且已配置 AI Key 时异步生成个性化回复（失败/未配置回退兜底文案），
 /// 其余情况直接使用兜底文案；回复入高优先播报队列
 /// （对齐原工程 GenerateCheckinAnswerAsync → g_aiReplyCallback / PlayCheckinTTS）
@@ -1210,33 +1271,16 @@ fn schedule_checkin_reply(
     let user_id = danmu.user_id.clone();
     let user_name = danmu.user_name.clone();
 
-    tauri::async_runtime::spawn(async move {
-        let (text, is_ai) = match provider
-            .call_api(&prompt, Some(ai::SYSTEM_PROMPT_CHECKIN))
-            .await
-        {
-            Ok((answer, _reasoning)) => (answer, true),
-            Err(err) => {
-                crate::log_warn!("[CheckinAI] AI 回复失败，使用兜底文案: {}", err);
-                (fallback, false)
-            }
-        };
-        if let Some(h) = &handle {
-            let _ = h.emit(
-                "checkin-reply",
-                &serde_json::json!({
-                    "user_id": user_id,
-                    "user_name": user_name,
-                    "reply": &text,
-                    "is_ai": is_ai,
-                }),
-            );
-        }
-        if enable_voice {
-            // 签到/补签播报：音频按 `打卡_{用户名}_{ts}.mp3` 留档（对齐原工程仅留档签到 TTS）
-            tts.enqueue_checkin_speak(&text, &user_id, &user_name);
-        }
-    });
+    tauri::async_runtime::spawn(spawn_checkin_ai_reply(
+        provider,
+        prompt,
+        handle,
+        user_id,
+        user_name,
+        fallback,
+        enable_voice,
+        tts,
+    ));
 }
 
 /// 解析打卡触发词：按英文/中文逗号分割并去除首尾空白
@@ -4290,6 +4334,87 @@ mod tests {
             "[PASS] test_history_recorded_even_when_voice_disabled passed ({} 条留档)",
             sink.len()
         );
+    }
+
+    /// AI 分支的打卡回复必须留档：成功用 AI 文案、失败用兜底文案，且各自恰好一次。
+    ///
+    /// 回归背景：异步分支原先在自己的 `spawn` 里直接 `emit`，绕过 [`emit_checkin_reply`]
+    /// 的留档入口，于是「舰长 + 已配置 Key」这一生产主配置下**每一条**打卡回复都不写 History。
+    /// 既有 `test_history_recorded_even_when_voice_disabled` 覆盖不到该分支——
+    /// `AppState::new_test()` 的 AI Key 为空，打卡恒定走同步兜底路径。
+    ///
+    /// 覆盖面（两段合起来锁住「定稿必留档」）：
+    /// ① [`finalize_checkin_reply`] 的 `Ok`/`Err` 两个分支（同步、可喂入参）；
+    /// ② [`spawn_checkin_ai_reply`] 真实函数体（与生产 `spawn` 同一份代码）——用空 Key 的
+    ///    provider 驱动，`call_api` 立即返回 `Err` 而不发网络请求。
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_ai_checkin_reply_is_archived_once() {
+        let _ = logging::take_history_sink(); // 清空探针
+
+        // ① AI 成功：留档 AI 文案，绝不留档思维链
+        let (text, is_ai) = finalize_checkin_reply(
+            None,
+            "ai_hist_cap",
+            "留档舰长",
+            Ok(("恭喜留档舰长，今天这卡打得漂亮！".into(), "英文思维链 CoT".into())),
+            "留档舰长连续第3天打卡！累计9天".into(),
+        );
+        assert_eq!(text, "恭喜留档舰长，今天这卡打得漂亮！");
+        assert!(is_ai, "AI 成功必须标记 is_ai=true");
+
+        let after_ok = logging::take_history_sink();
+        assert_eq!(after_ok.len(), 1, "AI 成功必须恰好留档一次: {:?}", after_ok);
+        assert_eq!(after_ok[0], "恭喜留档舰长，今天这卡打得漂亮！");
+        assert!(
+            !after_ok.iter().any(|s| s.contains("思维链")),
+            "留档不得混入思维链: {:?}",
+            after_ok
+        );
+
+        // ② AI 失败：必须留档兜底文案（用户实际看到/听到的就是它）
+        let (text2, is_ai2) = finalize_checkin_reply(
+            None,
+            "ai_hist_cap",
+            "留档舰长",
+            Err("HTTP request error: timeout".into()),
+            "留档舰长连续第3天打卡！累计9天".into(),
+        );
+        assert_eq!(text2, "留档舰长连续第3天打卡！累计9天");
+        assert!(!is_ai2, "失败回退必须标记 is_ai=false");
+
+        let after_err = logging::take_history_sink();
+        assert_eq!(after_err.len(), 1, "失败回退同样恰好留档一次: {:?}", after_err);
+        assert_eq!(after_err[0], "留档舰长连续第3天打卡！累计9天");
+
+        // ③ 真实任务体：空 Key ⇒ call_api 立即 Err（无网络）⇒ 仍必须留档兜底文案一次
+        let state = AppState::new_test();
+        assert!(!state.ai_provider.is_configured(), "测试态不应配置 Key");
+        let rt = tokio::runtime::Runtime::new().expect("创建 tokio 运行时失败");
+        rt.block_on(spawn_checkin_ai_reply(
+            state.ai_provider.clone(),
+            "【资料】昵称：留档舰长".into(),
+            None,
+            "ai_hist_cap".into(),
+            "留档舰长".into(),
+            "留档舰长连续第3天打卡！累计9天".into(),
+            false, // 关语音：留档不得依赖语音开关
+            state.tts_mgr.clone(),
+        ));
+
+        let after_body = logging::take_history_sink();
+        assert_eq!(
+            after_body.len(),
+            1,
+            "AI 任务体在调用失败时也必须恰好留档一次: {:?}",
+            after_body
+        );
+        assert_eq!(
+            after_body[0], "留档舰长连续第3天打卡！累计9天",
+            "关语音时兜底文案仍须留档: {:?}",
+            after_body
+        );
+        println!("[PASS] test_ai_checkin_reply_is_archived_once passed");
     }
 
     /// 字段不齐的畸形弹幕不得留档成「 说：」
