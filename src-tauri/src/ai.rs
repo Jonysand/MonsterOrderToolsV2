@@ -1,14 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
-
-/// AI 交互请求参数
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AIChatRequest {
-    pub prompt: String,
-    pub username: String,
-    #[serde(default)]
-    pub system_prompt: Option<String>,
-}
+﻿use std::sync::Mutex;
 
 /// 打卡回复系统提示词：任务框架 + 硬性规则 + 播报形式 + 资料/指令边界（**无角色设定**）。
 ///
