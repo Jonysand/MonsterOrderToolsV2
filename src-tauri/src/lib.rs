@@ -3322,6 +3322,8 @@ mod tests {
     /// 直接本地入队（测试构建播放线程为静音桩）。Manbo 路径需真实网络，不在单测覆盖
     #[test]
     fn test_speech_volume_test_sample_guard_and_enqueue() {
+        // 本测试要断言自己那条试听日志落进环里，独占内存环以免被并行测试清掉
+        let _ring = logging::exclusive_recent_for_test();
         let state = AppState::new_test();
         let guard = ensure_not_lite(&state, "TTS语音模块");
         if IS_LITE {
@@ -4856,7 +4858,9 @@ mod tests {
         const SECRET: &str = "LEAKPROBE_SECRET_7f3a";
         const FORGED: &str = "LEAKPROBE_FORGED_7f3a";
 
-        logging::clear_recent();
+        // 内存环是进程级共享状态：本测试要驱动真实调用点后扫描整环，
+        // 必须独占，避免并行测试的写入/clear_recent() 影响扫描结果
+        let _ring = logging::exclusive_recent_for_test();
         let state = AppState::new_test();
         let now_ts = chrono::Utc::now().timestamp();
 

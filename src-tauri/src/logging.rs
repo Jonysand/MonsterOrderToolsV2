@@ -240,6 +240,42 @@ pub fn clear_recent() {
     st.recent.clear();
 }
 
+/// 测试专用：独占并隔离进程级内存环。
+///
+/// 内存环是**进程级共享**状态（`static LOGGER`），而 `cargo test` 默认在同一进程内
+/// 并行执行测试：只要有一个测试灌入超过 [`MAX_RECENT_ENTRIES`] 条、或调用
+/// [`clear_recent`]，其他测试刚写入的条目就会被挤掉或抹掉。
+///
+/// 实测（`--test-threads=24`）`test_ring_and_file_keep_same_order_under_concurrency`
+/// 4/25 随机失败，内存环只剩 0/13/20 条而期望 40 条。
+///
+/// 因此**凡是断言内存环内容、或清空内存环的测试**都必须在开头取得本守卫：
+/// 进入时独占并清空，`Drop` 时再清空并释放，使各测试的初始状态与断言都确定。
+///
+/// 仅顺带写入几条日志的测试（驱动业务调用点间接写环）无需取用：它们挤不掉
+/// 守卫测试的条目——除本文件的 `test_recent_ring_buffer_and_level_filter`
+/// 会写入超过上限的条数外，没有别的测试会写满整个环。
+#[cfg(test)]
+pub fn exclusive_recent_for_test() -> RecentRingTestGuard {
+    static RING_TEST_LOCK: Mutex<()> = Mutex::new(());
+    let lock = RING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_recent();
+    RecentRingTestGuard { _lock: lock }
+}
+
+/// [`exclusive_recent_for_test`] 的守卫：`Drop` 时清空内存环，随后才释放独占锁
+#[cfg(test)]
+pub struct RecentRingTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for RecentRingTestGuard {
+    fn drop(&mut self) {
+        clear_recent();
+    }
+}
+
 #[macro_export]
 macro_rules! log_error {
     ($($arg:tt)*) => {
@@ -571,9 +607,12 @@ mod tests {
     /// 内存环与落盘文件必须**同序**：两线程交替写入后，两边顺序完全一致
     #[test]
     fn test_ring_and_file_keep_same_order_under_concurrency() {
+        // 本题断言「环里恰好有自己写的 40 条」，而环是进程级共享的：先独占，
+        // 避免并行测试的超量写入挤掉这 40 条、或 clear_recent() 把它们抹掉。
+        // 进入/退出时的清空由守卫负责（见 exclusive_recent_for_test）。
+        let _ring = exclusive_recent_for_test();
         let dir = std::env::temp_dir().join("mh_test_log_order");
         let _ = fs::remove_dir_all(&dir);
-        clear_recent();
 
         let marker = format!("order-{}", std::process::id());
         let mut handles = Vec::new();
@@ -628,12 +667,13 @@ mod tests {
         assert_eq!(ring, file_lines, "内存环与文件的先后顺序必须完全一致");
 
         let _ = fs::remove_dir_all(&dir);
-        clear_recent();
         println!("[PASS] test_ring_and_file_keep_same_order_under_concurrency passed");
     }
 
     #[test]
     fn test_recent_ring_buffer_and_level_filter() {
+        // 本题要灌满整个环（写入量超过上限）并断言清空语义：必须独占内存环
+        let _ring = exclusive_recent_for_test();
         let marker = format!("ring-{}", std::process::id());
         for i in 0..(MAX_RECENT_ENTRIES + 20) {
             log(LogLevel::Debug, format!("{}#{}", marker, i));
