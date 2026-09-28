@@ -238,14 +238,22 @@ mod platform {
         STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn store_path() -> PathBuf {
-        // 测试构建用独立存储文件（带进程号），避免污染真实数据目录的 registry.dat
-        let name = if cfg!(test) {
-            format!("registry_test_{}.dat", std::process::id())
-        } else {
-            STORE_FILE.to_string()
-        };
-        crate::paths::config_dir().join(name)
+    /// 存储文件路径。
+    ///
+    /// 测试构建写入**系统临时目录**，而不是 `config_dir()/registry_test_<pid>.dat`。
+    /// 后者看似「独立文件、不污染 registry.dat」，实则污染了更不该动的地方：
+    /// `config_dir()` 在 `cargo test` 下会沿 `cwd/..` 回退到**仓库根的
+    /// `MonsterOrderWilds_configs/`**（见 `paths.rs::config_dir` 的候选顺序），
+    /// 于是每跑一次测试进程就在**被 git 跟踪的资源目录**里留下一个加密封信文件——
+    /// 既污染 `git status`，也让测试产物与真实资源混在同一目录。
+    ///
+    /// 文件名保留进程号：同一进程内的多个测试共享一份存储（读-改-写受 `STORE_LOCK`
+    /// 保护），并行测试进程之间互不干扰。
+    pub(super) fn store_path() -> PathBuf {
+        if cfg!(test) {
+            return std::env::temp_dir().join(format!("mh_registry_test_{}.dat", std::process::id()));
+        }
+        crate::paths::config_dir().join(STORE_FILE)
     }
 
     fn value_key(subkey: &str, value_name: &str) -> String {
@@ -393,6 +401,28 @@ mod tests {
     use super::*;
     #[cfg(not(windows))]
     use base64::prelude::*;
+
+    /// 回归护栏：测试存储必须落在系统临时目录，不得写进被 git 跟踪的 `config_dir()`。
+    ///
+    /// 原先写入 `config_dir()/registry_test_<pid>.dat`，导致每次 `cargo test` 都在
+    /// 仓库根的 `MonsterOrderWilds_configs/` 里留下一个加密封信文件（实测一次 lib
+    /// 测试精确产生一个），污染 `git status`。本断言防止该行为回归。
+    #[cfg(not(windows))]
+    #[test]
+    fn test_store_path_isolated_from_config_dir() {
+        let path = super::platform::store_path();
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "测试存储应位于系统临时目录: {:?}",
+            path
+        );
+        assert!(
+            !path.starts_with(crate::paths::config_dir()),
+            "测试存储不得写入 config_dir（会污染 git status）: {:?}",
+            path
+        );
+        println!("[PASS] test_store_path_isolated_from_config_dir passed");
+    }
 
     #[test]
     fn test_registry_id_code_roundtrip() {

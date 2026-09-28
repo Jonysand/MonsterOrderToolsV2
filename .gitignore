@@ -18,6 +18,9 @@ MonsterOrderWilds_configs/MainConfig.cfg
 # 非 Windows 平台的注册表等价物（加密键值存储，含身份码与 ManboApiKey）
 MonsterOrderWilds_configs/registry.dat
 MonsterOrderWilds_configs/registry.dat.tmp
+# 测试进程遗留的注册表等价物：测试已改用系统临时目录（registry.rs::store_path），
+# 此行用于挡住历史残留与意外回归，避免测试产物混进被跟踪的资源目录
+MonsterOrderWilds_configs/registry_test_*.dat
 # 通配覆盖各类快照/备份（如 captain_profiles.snapshot_*.db、captain_profiles_bak.db）
 MonsterOrderWilds_configs/*.db
 MonsterOrderWilds_configs/*.db-shm
