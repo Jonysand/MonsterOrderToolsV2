@@ -2391,6 +2391,18 @@ body {
   filter: brightness(1.06);
 }
 
+/* 禁用态（未选怪物 / 提交中）：灰化提示「还不可入队」，与选中后的琥珀色主按钮形成状态差 */
+.ml-scope .op-confirm .go:disabled {
+  background: linear-gradient(180deg, #35322c, #292620);
+  border-color: #3d3931;
+  color: var(--w-ink-4);
+  cursor: not-allowed;
+}
+
+.ml-scope .op-confirm .go:disabled:hover {
+  filter: none;
+}
+
 .ml-scope .op-foot {
   flex: 0 0 auto;
   padding: 7px 10px;

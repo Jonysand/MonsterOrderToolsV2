@@ -87,8 +87,13 @@ export const MonsterPickerPanel: React.FC<Props> = ({ dict, roster, submitting, 
   const handleGo = () => {
     const picked = currentSelection();
     if (!picked) {
-      setFootMsg("当前选择已失效（被筛选掉或已禁点），请在列表中点选一个怪物");
-      setSelected(null);
+      // 无选中与选中失效分开提示：前者是「还没点过怪」，后者才是「选择被作废」
+      setFootMsg(
+        selected
+          ? "当前选择已失效（被筛选掉或已禁点），请在列表中点选一个怪物"
+          : "尚未选择怪物 —— 请先在上方点选一个怪物图标，再点「加入排队」"
+      );
+      if (selected) setSelected(null);
       return;
     }
     onSubmit({
@@ -233,7 +238,12 @@ export const MonsterPickerPanel: React.FC<Props> = ({ dict, roster, submitting, 
             />
             优先插队
           </label>
-          <button className="go" disabled={submitting} onClick={handleGo}>
+          <button
+            className="go"
+            disabled={submitting || !selectedEntry}
+            title={selectedEntry ? undefined : "请先在上方点选一个怪物图标"}
+            onClick={handleGo}
+          >
             {submitting ? "入队中…" : "加入排队"}
           </button>
         </div>
