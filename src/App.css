@@ -91,6 +91,11 @@
   --g99: #34d399;
 
   --stamp: #e0472f;
+  /* 受理金印色阶（ORDER IN，docs/design/overlay_order_accepted_stamp.html 方案B）：
+     与 --stamp 同策略不随主题切换 —— 完成 / 受理语义全局唯一 */
+  --gold-hi: #fff3c4;
+  --gold-main: #f0d47a;
+  --gold-deep: #b8863b;
   --danger: #c0392b;
 }
 
@@ -773,6 +778,163 @@ body {
   animation:
     queueRowOut 0.42s 0.56s ease forwards,
     queueStampHit 0.26s 0.24s ease-in-out;
+}
+
+/* =============================================================================
+   受理特效（ORDER IN 金印光耀）：点怪成功时在对应行上浮现金渐变衬线大字，
+   与完成朱印钤印成对（朱印 = 讨伐完，金印 = 受理入列）。
+   方案与节奏见 docs/design/overlay_order_accepted_stamp.html（方案B 定稿）：
+   行入场 0.3s 后金印浮现落定，余韵 0.4s，1.22s 起收印（淡出上浮），1.55s 全收；
+   层叠与 .queue-clear-fx 同为 z60 面板根，渲染顺序在其后 —— 同 z 时后来者居上
+   ============================================================================= */
+.queue-order-fx {
+  position: absolute;
+  z-index: 60;
+  pointer-events: none;
+}
+
+/* 金字主体：DM Serif 金渐变裁字（与完成印面同字体工艺）。
+   关键帧内的 drop-shadow 与基础 filter 保持一致 —— filter 在关键帧间插值时会
+   整表替换基础值，落定后（42% 起）若不带上光晕会被 blur(0) 整个抹掉 */
+.order-glow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  font-family: var(--font-num);
+  font-size: 34px;
+  line-height: 1.3;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+  background: linear-gradient(178deg, var(--gold-hi) 8%, var(--gold-main) 46%, var(--gold-deep) 88%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 1px rgba(60, 40, 8, 0.9)) drop-shadow(0 0 16px rgba(240, 212, 122, 0.35));
+  transform: translate(-50%, -50%) rotate(-4deg) scale(1.8);
+  opacity: 0;
+}
+
+.queue-order-fx .order-glow {
+  animation:
+    orderGlowIn 0.56s cubic-bezier(0.2, 1.4, 0.4, 1) 0.3s forwards,
+    orderGlowRest 0.3s ease-in 1.22s forwards;
+}
+
+/* 模糊收实 + 缩放落定（光耀浮现，与完成钤印的缩砸急停互为姊妹节奏） */
+@keyframes orderGlowIn {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) rotate(-4deg) scale(1.8);
+    filter: blur(8px) drop-shadow(0 0 1px rgba(60, 40, 8, 0.9))
+      drop-shadow(0 0 16px rgba(240, 212, 122, 0.35));
+  }
+  42% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(-4deg) scale(0.97);
+    filter: blur(0) drop-shadow(0 0 1px rgba(60, 40, 8, 0.9))
+      drop-shadow(0 0 16px rgba(240, 212, 122, 0.35));
+  }
+  62% {
+    transform: translate(-50%, -50%) rotate(-4deg) scale(1.015);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(-4deg) scale(1);
+  }
+}
+
+/* 收印余韵：行保留、印自己收走（与完成「印随行走」反向），淡出并上浮 3px */
+@keyframes orderGlowRest {
+  0% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(-4deg) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, calc(-50% - 3px)) rotate(-4deg) scale(1);
+  }
+}
+
+/* 放射光束：金字背后铺开再收（repeating-conic + 径向遮罩） */
+.order-rays {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 340px;
+  height: 240px;
+  transform: translate(-50%, -50%) scale(0.5);
+  opacity: 0;
+  background: repeating-conic-gradient(
+    from 0deg,
+    rgba(240, 212, 122, 0.2) 0deg 5deg,
+    transparent 5deg 13deg
+  );
+  -webkit-mask: radial-gradient(closest-side, #000 18%, transparent 74%);
+  mask: radial-gradient(closest-side, #000 18%, transparent 74%);
+}
+
+.queue-order-fx .order-rays {
+  animation: orderRays 0.66s 0.3s ease-out forwards;
+}
+
+@keyframes orderRays {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.5);
+  }
+  38% {
+    opacity: 0.85;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1.06);
+  }
+}
+
+/* 冲击环：金环扩散（完成朱环同规格） */
+.order-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 3px solid rgba(240, 212, 122, 0.85);
+  transform: translate(-50%, -50%) scale(0.4);
+  opacity: 0;
+}
+
+.queue-order-fx .order-ring {
+  animation: orderRingOut 0.55s 0.32s ease-out forwards;
+}
+
+@keyframes orderRingOut {
+  0% {
+    opacity: 0.9;
+    transform: translate(-50%, -50%) scale(0.4);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(11);
+  }
+}
+
+/* 受理行内容让位压暗：金印成为唯一主角；播完由 TSX 摘类，transition 恢复常态。
+   transition 只挂在压暗态上 —— 摘类瞬间回弹发生在收印（1.22s 起）覆盖下，不可感知 */
+.queue-row.ordering > * {
+  opacity: 0.38;
+  filter: saturate(0.55);
+  transition: opacity 0.3s 0.12s, filter 0.3s 0.12s;
+}
+
+/* 受理跑马灯金字辉光：order-placed 消息滚动期间的一次性亮度脉冲（配色在 TSX 内联） */
+@keyframes orderMarqueeFlash {
+  0% {
+    filter: brightness(1.8) drop-shadow(0 0 7px rgba(240, 212, 122, 0.95));
+  }
+  100% {
+    filter: brightness(1);
+  }
 }
 
 /* 装饰动效：默认关闭，设置开启后挂载（data-decor="on"） */

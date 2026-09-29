@@ -1,0 +1,894 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>点怪成功提示升级 · ORDER IN 金印受理方案</title>
+<style>
+/* =============================================================================
+   点怪成功提示升级设计方案（仅设计评审用，不代表已落地）
+   目标：点怪成功（观众下单入队）的提示强度拉到接近 QUEST CLEAR 钤印，
+   但不越过它 —— 「金印受理 / 朱印讨伐」成对语义。
+   悬浮窗结构、尺寸、变量名均对齐 src/App.css 与 src/views/OverlayWindow.tsx
+   ============================================================================= */
+
+:root {
+  /* 现有荒野主题变量（App.css 原值） */
+  --panel-a: 34 27 15;
+  --panel-b: 25 19 8;
+  --line: #5c4a15;
+  --line-soft: rgba(146, 120, 40, 0.34);
+  --ink: #f2ead4;
+  --ink-dim: #b8ae93;
+  --ink-faint: #7d7460;
+  --cream: #fcf5de;
+  --hl: #ddc94a;
+  --hl2: #ff7200;
+  --row-bg: rgba(0, 0, 0, 0.34);
+  --row-bg-hover: rgba(0, 0, 0, 0.52);
+
+  /* 稀有度 / 大航海（主题无关，全方案不动） */
+  --r-normal: #c7c0ab;
+  --r-tempered: #a78bfa;
+  --r-arch: #ffa02e;
+  --r-priority: #ffd66b;
+  --g1: #fed100;
+  --g2: #b48cf2;
+  --g3: #76dcff;
+  --stamp: #e0472f;
+  --danger: #c0392b;
+
+  /* QUEST CLEAR 金印色阶（沿用 overlay_quest_clear_stamp.html 定义，两案共用） */
+  --gold-hi: #fff3c4;
+  --gold-main: #f0d47a;
+  --gold-deep: #b8863b;
+  --gold-line: #d9b558;
+
+  /* 本案新增：优先档金白高亮（比 gold-main 更亮半档，用于 PRIORITY 印面） */
+  --gold-prio: #ffe9a8;
+
+  /* 模拟页字体（实际运行用随包思源宋 / DM Serif，见字体小节） */
+  --f-serif: "Noto Serif SC", "Source Han Serif SC", "SimSun", serif;
+  --f-sans: "Microsoft YaHei", "Noto Sans SC", "PingFang SC", sans-serif;
+  --f-num: Georgia, "Times New Roman", serif;
+}
+
+[data-theme="asc"] {
+  --panel-a: 13 33 56;
+  --panel-b: 8 25 44;
+  --line: #2f6d94;
+  --line-soft: rgba(118, 220, 255, 0.26);
+  --ink: #eef6fb;
+  --ink-dim: #9dc4dd;
+  --ink-faint: #5f7f96;
+  --hl: #76dcff;
+  --hl2: #8891f3;
+  --row-bg-lift: rgba(9, 24, 40, 0.97);
+  /* 朱印与金印均不随主题切换：完成 / 受理语义全局唯一（同 --stamp 全局策略） */
+  --stamp: #e0472f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 28px 20px 60px;
+  background: #0e1013;
+  color: #d8dde3;
+  font-family: var(--f-sans);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.page { max-width: 1180px; margin: 0 auto; }
+
+/* ---------------- 页头 ---------------- */
+
+.page-head h1 {
+  margin: 0 0 6px;
+  font-family: var(--f-serif);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  background: linear-gradient(94deg, #f0d47a, #fcf5de 44%, #e0472f 82%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.page-head p { margin: 0 0 4px; color: #9aa3ad; }
+
+.doc-tag {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 10px;
+  border: 1px solid #3a4048;
+  border-radius: 3px;
+  color: #8a929c;
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+}
+
+/* ---------------- 章节标题 ---------------- */
+
+h2 {
+  margin: 44px 0 4px;
+  font-family: var(--f-serif);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  color: #ecdfb8;
+  border-left: 4px solid var(--gold-line);
+  padding-left: 10px;
+}
+h2 .sub { font-size: 12px; color: #8a929c; font-weight: 400; margin-left: 10px; letter-spacing: 0.04em; }
+h3 { margin: 24px 0 8px; font-size: 14px; color: #d9c98f; letter-spacing: 0.04em; }
+
+.note {
+  margin: 10px 0 0;
+  padding: 10px 14px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+  border-radius: 4px;
+  color: #aeb6bf;
+}
+.note b { color: #ecdfb8; }
+.note .warn { color: #e8a15c; }
+
+/* ---------------- 设计要点三卡 ---------------- */
+
+.ref-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 12px;
+  margin-top: 14px;
+}
+.ref-card {
+  padding: 14px 16px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+  border-top: 3px solid var(--gold-line);
+  border-radius: 4px;
+}
+.ref-card h4 { margin: 0 0 6px; font-size: 13px; color: #ecdfb8; letter-spacing: 0.05em; }
+.ref-card p { margin: 0; color: #a2aab3; font-size: 12.5px; line-height: 1.7; }
+.ref-card .kw {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 1px 8px;
+  border: 1px solid #3a4048;
+  border-radius: 2px;
+  color: #8a929c;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+
+/* ---------------- 规格表 ---------------- */
+
+table.spec {
+  margin-top: 12px;
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 920px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+}
+table.spec th, table.spec td {
+  border: 1px solid #262b32;
+  padding: 7px 12px;
+  text-align: left;
+  font-size: 12.5px;
+}
+table.spec th { background: #1c2128; color: #d9c98f; font-weight: 600; letter-spacing: 0.04em; }
+table.spec td.num { font-family: var(--f-num); color: #e8e2cf; }
+table.spec td.old { color: #8a929c; }
+table.spec td.new { color: #f0d47a; }
+table.spec td b { color: #ecdfb8; }
+
+/* ---------------- 演示面板（对齐悬浮窗 440×360） ---------------- */
+
+.demo-grid {
+  display: grid;
+  grid-template-columns: 460px 460px;
+  gap: 22px;
+  margin-top: 16px;
+  align-items: start;
+}
+.demo-cell h3 { margin: 0 0 8px; }
+
+.demo-panel {
+  width: 440px;
+  height: 360px;
+  border: 1px solid #3a4048;
+  border-radius: 6px;
+  background: linear-gradient(155deg, rgb(var(--panel-a) / 0.92), rgb(var(--panel-b) / 0.96));
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+[data-theme="wilds"] .demo-panel { border-color: #4a3d14; }
+
+/* 顶栏：连接点 + 标题 + 计数 + 跑马灯（对齐 OverlayWindow.tsx 951–1005 一行式顶栏） */
+.panel-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 6px;
+}
+.conn-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: #59d98a; box-shadow: 0 0 6px #59d98a; }
+.panel-title {
+  flex: none;
+  font-family: var(--f-serif);
+  font-size: 13.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: var(--hl);
+}
+.panel-count {
+  flex: none;
+  font-family: var(--f-num);
+  font-size: 12px;
+  color: var(--ink-faint);
+  letter-spacing: 0.04em;
+}
+.panel-marquee {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 6px;
+  overflow: hidden; white-space: nowrap;
+  padding-top: 1px;
+}
+.panel-marquee svg { flex: none; width: 12px; height: 12px; color: var(--hl); }
+.marquee-text { font-size: 12.5px; color: var(--ink-dim); overflow: hidden; text-overflow: ellipsis; }
+.marquee-text.order-live {
+  color: var(--gold-main);
+  font-weight: 700;
+  animation: orderMarqueeFlash 0.55s ease-out;
+}
+@keyframes orderMarqueeFlash {
+  0% { filter: brightness(1.8) drop-shadow(0 0 7px rgba(240, 212, 122, 0.95)); }
+  100% { filter: brightness(1); }
+}
+
+.rows { flex: 1; min-height: 0; padding: 4px 10px 0; position: relative; overflow: hidden; }
+
+/* ---------------- 队列行（1:1 对齐 App.css） ---------------- */
+
+.queue-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 56px;
+  margin-bottom: 4px;
+  padding: 0 10px 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 3px;
+  background: var(--row-bg);
+  overflow: hidden;
+  --rc: var(--r-normal);
+}
+.queue-row[data-rarity="1"] { --rc: var(--r-tempered); }
+.queue-row[data-rarity="2"] { --rc: var(--r-arch); }
+.queue-row[data-priority="1"] { --rc: var(--r-priority); }
+
+.queue-spine { position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--rc); }
+.queue-spine::after {
+  content: ""; position: absolute; inset: 0; background: var(--rc); filter: blur(6px); opacity: 0.55;
+}
+.queue-corner { position: absolute; width: 10px; height: 10px; border: 1.5px solid var(--rc); opacity: 0.5; pointer-events: none; }
+.queue-corner.tl { left: 5px; top: 5px; border-right: 0; border-bottom: 0; }
+.queue-corner.br { right: 5px; bottom: 5px; border-left: 0; border-top: 0; }
+
+.queue-handle { flex: none; width: 40px; display: flex; align-items: center; gap: 6px; }
+.queue-grip { flex: none; width: 14px; display: flex; align-items: center; justify-content: center; color: var(--ink-faint); opacity: 0.55; }
+.queue-seq {
+  flex: none; width: 20px; text-align: center;
+  font-family: var(--f-num); font-size: 14px; font-weight: 600; letter-spacing: -0.02em; color: var(--ink-dim);
+}
+.queue-nick { flex: none; width: 140px; font-size: 19px; font-weight: 700; color: var(--ink-dim); }
+
+.queue-iconcard {
+  position: relative; flex: none; width: 38px; height: 38px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1.5px solid var(--rc); border-radius: 2px;
+  background: radial-gradient(circle at 50% 35%, rgba(255, 255, 255, 0.1), rgba(0, 0, 0, 0.5));
+  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.6);
+}
+.queue-iconcard::before, .queue-iconcard::after {
+  content: ""; position: absolute; left: 50%; width: 5px; height: 5px;
+  background: var(--rc); transform: translateX(-50%) rotate(45deg); opacity: 0.8;
+}
+.queue-iconcard::before { top: -3.5px; }
+.queue-iconcard::after { bottom: -3.5px; }
+.queue-iconcard svg { width: 30px; height: 30px; opacity: 0.85; }
+
+.queue-mon {
+  flex: 1; min-width: 0;
+  font-family: var(--f-serif);
+  font-size: 21.5px; font-weight: 750; letter-spacing: 0.03em;
+  color: var(--cream);
+  filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.85));
+  white-space: nowrap; overflow: hidden;
+}
+.queue-badges { flex: none; display: flex; align-items: center; gap: 5px; margin-left: auto; }
+.queue-chip {
+  font-size: 11px; padding: 2px 6px; border-radius: 1px; border: 1px solid currentColor;
+  letter-spacing: 0.06em; display: inline-flex; align-items: center; gap: 3px; line-height: 1.5; white-space: nowrap;
+}
+.queue-chip.g2 { color: var(--g2); }
+.queue-chip.prio { color: var(--r-priority); }
+
+/* 入场：侧移归位（现状已有，App.css .queue-row-enter 原样） */
+.queue-row-enter { animation: queueRowIn 0.42s cubic-bezier(0.2, 0.9, 0.25, 1); }
+@keyframes queueRowIn {
+  from { opacity: 0; transform: translateX(34px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+/* =============================================================================
+   受理动效 · 本方案新增（落地时新增 App.css 段落，完成动效段不动）
+   ============================================================================= */
+
+/* 受理行内容压暗：印面成为唯一主角；1.2s 后由 JS 摘类，transition 0.3s 恢复 */
+.queue-row.ordering > :not(.queue-order-fx) {
+  opacity: 0.38;
+  filter: saturate(0.55);
+  transition: opacity 0.3s 0.12s, filter 0.3s 0.12s;
+}
+.queue-row.ordering { z-index: 5; }
+
+/* 特效层：与完成 .queue-clear-fx 同机制，挂面板根（虚拟列表裁切行内上溢），
+   absolute 定位随窗口整体移动，z 压过顶栏/气泡 */
+.queue-order-fx {
+  position: absolute;
+  z-index: 60;
+  pointer-events: none;
+}
+
+/* 印面主体：30px 金字 + 金框（外粗内细双线，对齐 QUEST CLEAR 印章工艺）。
+   受理比完成（34px）收一档 —— 「受理次强、完成最强」的梯度不倒挂 */
+.order-stamp {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  font-family: var(--f-num);
+  font-weight: 400;
+  font-size: 30px;
+  line-height: 1.42;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+  color: var(--gold-main);
+  border: 3px solid var(--gold-line);
+  border-radius: 5px;
+  padding: 2px 18px;
+  background: rgba(16, 12, 3, 0.46);
+  transform: translate(-50%, -50%) rotate(-6deg) scale(3.2);
+  opacity: 0;
+  text-shadow: 0 0 14px rgba(240, 212, 122, 0.45);
+}
+/* 内衬细线：外粗内细双线框 */
+.order-stamp::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border: 1px solid rgba(217, 181, 88, 0.5);
+  border-radius: 2px;
+}
+/* 油墨斑驳：径向明暗让金墨略不匀 */
+.order-stamp::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  background:
+    radial-gradient(circle at 38% 32%, rgba(240, 212, 122, 0.14), transparent 52%),
+    radial-gradient(circle at 72% 74%, rgba(0, 0, 0, 0.32), transparent 46%);
+}
+
+/* 缩砸急停 + 落定回弹（0.30s 延迟：行归位前 0.12s 砸下，衔接更紧），
+   收印余韵：保持 0.4s 后淡出上浮 3px（行保留，印收走 —— 与完成「印随行走」反向） */
+.queue-order-fx .order-stamp {
+  animation:
+    orderStampIn 0.52s cubic-bezier(0.2, 1.5, 0.4, 1) 0.3s forwards,
+    orderStampRest 0.3s ease-in 1.22s forwards;
+}
+@keyframes orderStampIn {
+  0% { opacity: 0; transform: translate(-50%, -50%) rotate(-6deg) scale(3.2); filter: blur(6px); }
+  30% { opacity: 1; }
+  46% { transform: translate(-50%, -50%) rotate(-6deg) scale(0.95); filter: blur(0); }
+  62% { transform: translate(-50%, -50%) rotate(-6deg) scale(1.02); }
+  76% { transform: translate(-50%, -50%) rotate(-6deg) scale(0.99); }
+  100% { opacity: 1; transform: translate(-50%, -50%) rotate(-6deg) scale(1); }
+}
+@keyframes orderStampRest {
+  0% { opacity: 1; transform: translate(-50%, -50%) rotate(-6deg) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, calc(-50% - 3px)) rotate(-6deg) scale(1); }
+}
+
+/* 冲击环：金环 ×11 扩散 */
+.order-ring {
+  position: absolute; left: 50%; top: 50%;
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 3px solid rgba(240, 212, 122, 0.85);
+  transform: translate(-50%, -50%) scale(0.4);
+  opacity: 0;
+}
+.queue-order-fx .order-ring { animation: orderRingOut 0.55s 0.32s ease-out forwards; }
+@keyframes orderRingOut {
+  0% { opacity: 0.9; transform: translate(-50%, -50%) scale(0.4); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(11); }
+}
+/* 优先档第二环：延迟 0.14s 双环追赶 */
+.queue-order-fx .order-ring.ring2 { animation-delay: 0.46s; }
+
+/* 冲击十字光：与完成特效同规格共用语法 */
+.order-flare { position: absolute; left: 50%; top: 50%; width: 3px; height: 3px; opacity: 0; }
+.order-flare i { position: absolute; left: 50%; top: 50%; background: rgba(255, 236, 200, 0.9); }
+.order-flare i:nth-child(1), .order-flare i:nth-child(2) { width: 150px; height: 2px; transform: translate(-50%, -50%); }
+.order-flare i:nth-child(3), .order-flare i:nth-child(4) { width: 2px; height: 150px; transform: translate(-50%, -50%); }
+.queue-order-fx .order-flare { animation: orderFlareOut 0.34s 0.32s ease-out forwards; }
+@keyframes orderFlareOut {
+  0% { opacity: 0.95; transform: translate(-50%, -50%) scale(0.25) rotate(0deg); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.15) rotate(24deg); }
+}
+
+/* 优先档放射光束：PRIORITY 印面字后短促铺开再收 */
+.order-rays {
+  position: absolute; left: 50%; top: 50%;
+  width: 340px; height: 240px;
+  transform: translate(-50%, -50%) scale(0.5);
+  opacity: 0;
+  background: repeating-conic-gradient(from 0deg,
+    rgba(240, 212, 122, 0.2) 0deg 5deg, transparent 5deg 13deg);
+  -webkit-mask: radial-gradient(closest-side, #000 18%, transparent 74%);
+  mask: radial-gradient(closest-side, #000 18%, transparent 74%);
+}
+.queue-order-fx .order-rays { animation: orderRays 0.66s 0.3s ease-out forwards; }
+@keyframes orderRays {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+  38% { opacity: 0.85; }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.06); }
+}
+
+/* 优先档印面：金白高亮，字号与普通一致（ rays 负责加强度，不动字号梯度） */
+.order-stamp.prio { color: var(--gold-prio); border-color: var(--gold-prio); text-shadow: 0 0 16px rgba(255, 233, 168, 0.55); }
+
+/* ---------------- 方案B：光耀金字（World / Wilds 风，无框） ---------------- */
+
+.order-glow {
+  position: absolute; left: 50%; top: 50%;
+  font-family: var(--f-num);
+  font-size: 34px;
+  line-height: 1.3;
+  letter-spacing: 0.1em;
+  font-weight: 400;
+  white-space: nowrap;
+  transform: translate(-50%, -50%) rotate(-4deg) scale(1.8);
+  opacity: 0;
+  background: linear-gradient(178deg, var(--gold-hi) 8%, var(--gold-main) 46%, var(--gold-deep) 88%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 1px rgba(60, 40, 8, 0.9)) drop-shadow(0 0 16px rgba(240, 212, 122, 0.35));
+}
+.queue-order-fx.glowfx .order-glow { animation: orderGlowIn 0.56s cubic-bezier(0.2, 1.4, 0.4, 1) 0.3s forwards; }
+@keyframes orderGlowIn {
+  0% { opacity: 0; transform: translate(-50%, -50%) rotate(-4deg) scale(1.8); filter: blur(8px); }
+  42% { opacity: 1; transform: translate(-50%, -50%) rotate(-4deg) scale(0.97); filter: blur(0); }
+  62% { transform: translate(-50%, -50%) rotate(-4deg) scale(1.015); }
+  100% { opacity: 1; transform: translate(-50%, -50%) rotate(-4deg) scale(1); }
+}
+.queue-order-fx.glowfx .order-glow { animation:
+  orderGlowIn 0.56s cubic-bezier(0.2, 1.4, 0.4, 1) 0.3s forwards,
+  orderStampRest 0.3s ease-in 1.22s forwards; }
+
+/* ---------------- 文案选项小样 ---------------- */
+
+.copy-grid { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 14px; }
+.copy-cell {
+  width: 240px;
+  padding: 14px;
+  background: #16191e;
+  border: 1px solid #2a2f36;
+  border-radius: 4px;
+  text-align: center;
+}
+.copy-cell .stamp-sample {
+  display: inline-block;
+  margin: 6px 0 16px;
+  font-family: var(--f-num);
+  font-size: 24px;
+  line-height: 1.42;
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  color: var(--gold-main);
+  border: 3px solid var(--gold-line);
+  border-radius: 5px;
+  padding: 2px 14px;
+  background: rgba(16, 12, 3, 0.46);
+  transform: rotate(-6deg);
+  position: relative;
+  white-space: nowrap;
+}
+.copy-cell .stamp-sample::before {
+  content: ""; position: absolute; inset: 2px;
+  border: 1px solid rgba(217, 181, 88, 0.5); border-radius: 2px;
+}
+.copy-cell .stamp-sample.cjk { font-family: var(--f-serif); font-weight: 800; letter-spacing: 0.14em; }
+.copy-cell p { margin: 10px 0 0; font-size: 12px; color: #a2aab3; text-align: left; }
+.copy-cell .rec { color: #9fd98a; }
+
+/* ---------------- 落地清单 / 演示按钮 ---------------- */
+
+ol.todo { margin: 10px 0 0; padding-left: 22px; color: #aeb6bf; max-width: 920px; }
+ol.todo li { margin: 6px 0; }
+ol.todo code, .note code {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: #e8d5a8;
+  background: #1d2128;
+  padding: 1px 5px;
+  border-radius: 2px;
+}
+.ok { color: #9fd98a; }
+
+.replay-tip { margin-top: 8px; font-size: 12px; color: #6b7480; max-width: 920px; }
+.replay-btn {
+  margin: 10px 8px 0 0;
+  padding: 6px 16px;
+  background: #22262d;
+  color: #d9c98f;
+  border: 1px solid #3a4048;
+  border-radius: 3px;
+  cursor: pointer;
+  font-family: var(--f-sans);
+  font-size: 12.5px;
+  letter-spacing: 0.08em;
+}
+.replay-btn:hover { border-color: var(--gold-line); color: #ecdfb8; }
+.replay-btn.ghost-btn { color: #9aa3ad; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="page-head">
+    <h1>点怪成功提示升级 · ORDER IN 金印受理方案</h1>
+    <p>悬浮窗「狩猎点单队列」点怪成功提示：现状仅 12.5px 跑马灯文字，强度与完成钤印（QUEST CLEAR）严重倒挂；本方案为其配一枚同构金印，构成「金印受理 / 朱印讨伐」成对语义</p>
+    <p>对照组件：跑马灯（OverlayWindow.tsx 310–319 order-placed）· 新行入场 <code style="color:#e8d5a8">.queue-row-enter</code>（applyQueue 187–193 enteringIds）· 完成特效 <code style="color:#e8d5a8">.queue-clear-fx</code>（复用其 ghost 层定位机制）</p>
+    <span class="doc-tag">设计评审稿 · 2026-09-29 · 仅评审用不代表已落地</span>
+  </div>
+
+  <!-- ============================ 现状与差距 ============================ -->
+  <h2>一、现状与强度差距 <span class="sub">观众高光时刻只有一条 12.5px 小字</span></h2>
+
+  <p>点怪成功是观众与直播间互动的<b style="color:#ecdfb8">核心高光时刻</b>（发弹幕 → 上榜 → 看到自己入队），但现状提示只有两处：<b style="color:#ecdfb8">① 顶栏跑马灯 12.5px 单次滚动文字</b>（10 秒，`--hl2` 橙色小字）；<b style="color:#ecdfb8">② 新行 0.42s 侧移入场</b>。而队列完成时有 34px 朱印缩砸 + 冲击环 + 十字光的 QUEST CLEAR 大特效 —— 提示强度恰好倒挂：观众加入（高频、高光）无声无息，队列离开（主播操作）反而全场最强。</p>
+
+  <table class="spec">
+    <tr><th>提示时机</th><th>现状表现</th><th>视觉强度</th><th>问题</th></tr>
+    <tr>
+      <td><b>点怪成功</b>（观众下单）</td>
+      <td class="old">跑马灯 12.5px 文字滚动 + 行侧移入场</td>
+      <td class="old">★☆☆☆☆</td>
+      <td>直播缩放后几乎不可见；观众弹幕说「上了」但画面无反馈</td>
+    </tr>
+    <tr>
+      <td>禁点拦截</td>
+      <td class="old">同上（灰字文案）</td>
+      <td class="old">★☆☆☆☆</td>
+      <td>可接受（负反馈不强调）</td>
+    </tr>
+    <tr>
+      <td>队列完成（主播点击）</td>
+      <td class="old">34px 朱印 QUEST CLEAR 缩砸 + 冲击环 + 十字光，980ms</td>
+      <td class="old">★★★★★</td>
+      <td>—（本方案的强度基准）</td>
+    </tr>
+  </table>
+
+  <h3>现状对照演示</h3>
+  <div class="demo-grid" style="grid-template-columns: 460px;">
+    <div class="demo-cell">
+      <div class="demo-panel" data-theme="wilds" id="panel-now">
+        <div class="panel-head">
+          <span class="conn-dot"></span>
+          <span class="panel-title">狩猎点单队列</span>
+          <span class="panel-count">04</span>
+          <div class="panel-marquee">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 010 7M19 5a9 9 0 010 14"/></svg>
+            <span class="marquee-text" id="now-marquee">发送'点怪 xxx'进行点怪</span>
+          </div>
+        </div>
+        <div class="rows" id="now-rows"></div>
+      </div>
+      <p class="replay-tip">点击按钮：现状 = 新行侧移入场 + 顶栏小字滚动，画面再无其他反馈。</p>
+      <button class="replay-btn ghost-btn" onclick="playNow()">模拟现状点怪</button>
+    </div>
+  </div>
+
+  <!-- ============================ 设计语言 ============================ -->
+  <h2>二、设计语言：金印受理 / 朱印讨伐 <span class="sub">与 QUEST CLEAR 成对，不另起炉灶</span></h2>
+
+  <div class="ref-grid">
+    <div class="ref-card">
+      <h4>成对语义：金印受理 ↔ 朱印讨伐</h4>
+      <p>复用完成钤印的全部动画语法（<b style="color:#ecdfb8">缩砸急停 + 落定回弹 + 冲击环 + 十字光 + 内容压暗</b>），只换印面与色阶：朱红 = 讨伐完成（QUEST CLEAR），金色 = 点单受理（ORDER IN）。观众看一眼就知道「谁加入了、谁打完了」。</p>
+      <span class="kw">同构不同色 · 语义成对 · 风格零漂移</span>
+    </div>
+    <div class="ref-card">
+      <h4>节奏反向：印收行留</h4>
+      <p>完成是「印落 → 行随印走」（印随行离场）；受理是「行入场 → 印落 → <b style="color:#ecdfb8">印自己收走、行留下</b>」—— 受理印在行上保留约 0.4s 后淡出上浮，行内容随之从压暗恢复。同一套钤印语言，一收一留两种结局。</p>
+      <span class="kw">印落行留 · 压暗恢复 · 1.55s 全收</span>
+    </div>
+    <div class="ref-card">
+      <h4>强度梯度：受理次强，完成最强</h4>
+      <p>印面 30px（完成的 0.88×）、倾角 -6°、缩砸 0.52s（完成 0.56s）—— 每项收小半档，保证 QUEST CLEAR 仍是全场唯一最强语义。优先插队（打乱排队秩序的大事）用金白高亮印面 + 放射光束 + 双冲击环，在受理档内封顶。</p>
+      <span class="kw">30px &lt; 34px · 优先档金白+rays</span>
+    </div>
+  </div>
+
+  <!-- ============================ 方案A ============================ -->
+  <h2>三、方案A（推荐）：金印受理钤印 <span class="sub">与完成朱印同构，换色换印面</span></h2>
+
+  <p>点怪成功链路：弹幕命中 → <code>order-placed</code> 事件（带 <code>user_id / is_priority</code>）→ 跑马灯文案（保留，信息层）→ 队列快照新行侧移入场（保留，空间层）→ <b style="color:#ecdfb8">新增：金印在新行归位瞬间砸下</b>（0.30s 起），冲击环与十字光同步炸开，行内容压暗让印；约 1.2s 后印面淡出上浮收走，行内容 0.3s 恢复。跑马灯同步增强：业务消息滚动期间文字转金色并带一次辉光脉冲。</p>
+
+  <table class="spec">
+    <tr><th>Token</th><th>完成（QUEST CLEAR 现状）</th><th>受理（本方案）</th><th>说明</th></tr>
+    <tr><td>字号 font-size</td><td class="num old">34px</td><td class="num new">30px（0.88×）</td><td>受理收半档，完成保持最强语义</td></tr>
+    <tr><td>印面文案</td><td class="num old">QUEST CLEAR</td><td class="num new">ORDER IN（优先档 PRIORITY）</td><td>拉丁衬线，与 QUEST CLEAR 同工艺</td></tr>
+    <tr><td>印色</td><td class="num old">朱红 --stamp（全局）</td><td class="num new">金 --gold-main / 优先 --gold-prio（全局）</td><td>两印色均不随主题切换，语义全局唯一</td></tr>
+    <tr><td>印框</td><td class="num old">3px + 内衬 1px 双线</td><td class="num new">3px + 内衬 1px 双线（金）</td><td>同构</td></tr>
+    <tr><td>倾角 rotate</td><td class="num old">-8°</td><td class="num new">-6°</td><td>与完成略区分，避免同帧错认</td></tr>
+    <tr><td>缩砸曲线</td><td class="num old">3.2×→0.94→1.03→1，560ms</td><td class="num new">3.2×→0.95→1.02→1，520ms</td><td>同构略快半拍（受理轻快、完成沉重）</td></tr>
+    <tr><td>冲击环 / 十字光</td><td class="num old">×11 / 150px</td><td class="num new">×11 / 150px（优先档双环 + rays）</td><td>语法共用，规格一致</td></tr>
+    <tr><td>行内容</td><td class="num old">压暗 38% 后随行离场</td><td class="num new">压暗 38%，1.2s 后 0.3s 恢复</td><td>行保留，压暗可逆</td></tr>
+    <tr><td>结局</td><td class="num old">印随行走（980ms）</td><td class="num new">印收行留（1.55s 全收）</td><td>受理印 1.22s 起淡出上浮 3px</td></tr>
+    <tr><td>跑马灯</td><td class="num old">—</td><td class="num new">消息文字转金 + 辉光脉冲 0.55s</td><td>信息层同步强化（文案不变）</td></tr>
+    <tr><td>特效层</td><td class="num old">.queue-clear-fx（面板根 ghost）</td><td class="num new">.queue-order-fx（同机制复用）</td><td>量 rect 定位逻辑照搬 rowRectInPanel</td></tr>
+  </table>
+
+  <div class="demo-grid">
+    <div class="demo-cell">
+      <h3>荒野主题（默认）</h3>
+      <div class="demo-panel" data-theme="wilds" id="panel-wilds">
+        <div class="panel-head">
+          <span class="conn-dot"></span>
+          <span class="panel-title">狩猎点单队列</span>
+          <span class="panel-count" id="wilds-count">04</span>
+          <div class="panel-marquee">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 010 7M19 5a9 9 0 010 14"/></svg>
+            <span class="marquee-text" id="wilds-marquee">发送'点怪 xxx'进行点怪</span>
+          </div>
+        </div>
+        <div class="rows" id="wilds-rows"></div>
+      </div>
+      <button class="replay-btn" onclick="playOrder('wilds', false)">模拟普通点怪</button>
+      <button class="replay-btn" onclick="playOrder('wilds', true)" style="border-color:#6b5a2a">模拟优先插队</button>
+    </div>
+
+    <div class="demo-cell">
+      <h3>凌越主题（asc）</h3>
+      <div class="demo-panel" data-theme="asc" id="panel-asc">
+        <div class="panel-head">
+          <span class="conn-dot"></span>
+          <span class="panel-title">狩猎点单队列</span>
+          <span class="panel-count" id="asc-count">04</span>
+          <div class="panel-marquee">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 010 7M19 5a9 9 0 010 14"/></svg>
+            <span class="marquee-text" id="asc-marquee">发送'点怪 xxx'进行点怪</span>
+          </div>
+        </div>
+        <div class="rows" id="asc-rows"></div>
+      </div>
+      <button class="replay-btn" onclick="playOrder('asc', false)">模拟普通点怪</button>
+      <button class="replay-btn" onclick="playOrder('asc', true)" style="border-color:#6b5a2a">模拟优先插队</button>
+    </div>
+  </div>
+
+  <p class="replay-tip">普通点怪：金印 ORDER IN 砸在新行上，1.55s 后印收行留。优先插队：金白 PRIORITY + 放射光束 + 双冲击环，插到队首。</p>
+  <button class="replay-btn" onclick="autoDemo()">▶ 自动演示一轮（普通 → 优先）</button>
+
+  <!-- ============================ 方案B ============================ -->
+  <h2>四、方案B（备选）：光耀金字 <span class="sub">World / Wilds 现代表现，无框</span></h2>
+
+  <p>印面改用金渐变衬线大字（无方框）+ 落定浮现，强度与方案A相当但少了「盖章受理」的动作隐喻 —— 受理的本质是「点单被接下」，盖印比浮字更贴合；且与完成朱印的成对感弱于方框印。作备选保留。</p>
+
+  <div class="demo-grid" style="grid-template-columns: 460px;">
+    <div class="demo-cell">
+      <div class="demo-panel" data-theme="wilds" id="panel-glow">
+        <div class="panel-head">
+          <span class="conn-dot"></span>
+          <span class="panel-title">狩猎点单队列</span>
+          <span class="panel-count" id="glow-count">04</span>
+          <div class="panel-marquee">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 010 7M19 5a9 9 0 010 14"/></svg>
+            <span class="marquee-text" id="glow-marquee">发送'点怪 xxx'进行点怪</span>
+          </div>
+        </div>
+        <div class="rows" id="glow-rows"></div>
+      </div>
+      <button class="replay-btn" onclick="playOrder('glow', false)">模拟普通点怪（光耀版）</button>
+    </div>
+  </div>
+
+  <!-- ============================ 文案选项 ============================ -->
+  <h2>五、印面文案 <span class="sub">三选一，默认建议 ORDER IN</span></h2>
+
+  <div class="copy-grid">
+    <div class="copy-cell">
+      <span class="stamp-sample">ORDER IN</span>
+      <p><b class="rec">推荐</b>——拉丁衬线大写，与 QUEST CLEAR 印面同工艺成对（CLEAR = 讨伐完，IN = 受理入列）；随包 DM Serif 只需确认 O/D/R/N/I 六字符在子集内。</p>
+    </div>
+    <div class="copy-cell">
+      <span class="stamp-sample cjk">受注</span>
+      <p>怪猎任务受理台原词（受注），两字大印最有系列味；但部分观众不识日文汉字，语义传达打折。</p>
+    </div>
+    <div class="copy-cell">
+      <span class="stamp-sample cjk">点怪受理</span>
+      <p>中文直白零门槛；四字宋体大印略平，且与跑马灯文案「点怪 xx 成功」重复信息。</p>
+    </div>
+  </div>
+
+  <div class="note">
+    <b>优先档印面</b>：插队单印面用 <b>PRIORITY</b>（金白高亮 + 放射光束 + 双冲击环），与普通档同字号 —— 插队是「打乱排队秩序」的大事，值得在受理档内单独封顶；但不再放大字号，避免越过完成印。
+  </div>
+
+  <!-- ============================ 落地清单 ============================ -->
+  <h2>六、工程落地清单 <span class="sub">评审通过后执行</span></h2>
+
+  <ol class="todo">
+    <li><b>App.css 新增受理特效段落</b>（不动完成动效段）：<code>.queue-order-fx / .order-stamp / .order-ring / .order-flare / .order-rays</code> 与 <code>.queue-row.ordering</code> 压暗规则，规格按第三节规格表；金色 token 复用 <code>--gold-*</code>（若评审稿未落地则一并新增）。</li>
+    <li><b>OverlayWindow.tsx 联动</b>：<code>order-placed</code> 监听里暂存 <code>{user_id, is_priority}</code> 到 <code>pendingOrderRef</code>；<code>applyQueue</code> 的 fresh 检测（187–193 行）命中 <code>user_id</code> 时量 rect（复用 <code>rowRectInPanel</code>）建 fx 层，1550ms 后移除；行加 <code>ordering</code> 类、1.2s 后摘类恢复。</li>
+    <li><b>跑马灯同步增强</b>：order 消息播放期间 marquee span 加金色 + <code>orderMarqueeFlash</code> 辉光（文案逻辑不变，只加样式分支）。</li>
+    <li><b>字体子集确认</b>：印面定 ORDER IN / PRIORITY 后核对随包 DM Serif 子集含 O/R/D/E/I/N/P/Y（QUEST CLEAR 子集已含 E/R，需补 O/D/I/N/P/Y），缺则更新 <code>scripts/fonts/subset_fonts.py</code> 字表重新子集化。</li>
+    <li><b>冲突处理</b>：受理印播放中（1.55s 内）主播点击该行完成时，完成特效照常叠加播放（两层各自定位不冲突）；若评审要求互斥，在完成触发时强制摘除该行受理层。</li>
+    <li><b>Lite 形态</b>：点怪队列是 Lite 唯一保留的核心功能，受理印随本体一并生效，无需 <code>ensure_not_lite</code> 守卫、不涉及 <code>IS_LITE</code> 分支。<span class="ok">✓ 无额外工作</span></li>
+    <li><b>验证</b>：纯 CSS/TSX 前端变更 —— 跑 <code>npm run build</code>；人工核对两主题 × 普通/优先两档 × 队首插入/队尾插入，以及受理后立即完成、连续多单快速进入两个冲突场景。</li>
+  </ol>
+
+  <div class="note">
+    <b>风险备注</b>：① 队列很长时普通点怪新行可能在可视区外（虚拟列表），fx 层 rect 量出来在窗口外则特效自然不可见 —— 跑马灯仍是兜底提示；可选增强：可视区外时改在列表底缘打一枚小号印。② 连续多单快速进入时多个 fx 层并存，各盖各行互不遮挡，冲击环允许交叠（节日感）；若嫌吵可加 300ms 播放间隔队列。③ 印面 1.55s 期间行若被拖拽浮起，fx 层不跟手（完成特效同样不跟手，行为一致）。
+  </div>
+
+</div>
+
+<script>
+/* ================= 演示脚本 =================
+   与真实组件行为一致：
+   - 新行带 queue-row-enter（侧移入场）+ ordering（内容压暗）
+   - fx 层挂 rows 容器（对齐面板根 ghost 机制），量新行 rect 定位
+   - 1.55s 后摘 fx 层与 ordering 类（印收行留） */
+
+const NICKS = ["艾露猫店长", "此方_ing", "锁刃龙好吃", "观察团梅娅", "猫饭永远的神", "风漂龙骑士", "大团长法比安", "白色的波衣"];
+const MONS = ["黑蚀龙", "煌雷龙", "锁刃龙", "护龙·波衣龙", "刺花蜘蛛", "泡狐龙", "赫猿兽", "缠蛙"];
+const GUARDS = [0, 1, 2, 3, 99];
+const GUARD_NAME = { 1: "总督", 2: "提督", 3: "舰长", 99: "舰长" };
+const MON_FILL = { "黑蚀龙": "#a78bfa", "煌雷龙": "#c7c0ab", "锁刃龙": "#ffa02e", "护龙·波衣龙": "#c7c0ab", "刺花蜘蛛": "#c7c0ab", "泡狐龙": "#c7c0ab", "赫猿兽": "#a78bfa", "缠蛙": "#c7c0ab" };
+
+let demoSeq = 0;
+const nickPick = () => NICKS[demoSeq++ % NICKS.length];
+const monPick = () => MONS[demoSeq % MONS.length];
+
+function rowHTML(seq, nick, mon, rarity, guard, prio) {
+  const chip = guard ? `<span class="queue-chip g${Math.min(guard, 3)}">${GUARD_NAME[guard]}</span>` : "";
+  const prioChip = prio ? `<span class="queue-chip prio">优先</span>` : "";
+  return `<span class="queue-spine"></span><span class="queue-corner tl"></span><span class="queue-corner br"></span>
+    <span class="queue-handle"><span class="queue-grip"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></span><span class="queue-seq">${String(seq).padStart(2, "0")}</span></span>
+    <span class="queue-nick">${nick}</span>
+    <span class="queue-iconcard"><svg viewBox="0 0 24 24" fill="${MON_FILL[mon] || "#c7c0ab"}"><circle cx="8.2" cy="7.5" r="2.1"/><circle cx="12" cy="6.2" r="2.1"/><circle cx="15.8" cy="7.5" r="2.1"/><ellipse cx="12" cy="14.5" rx="5.4" ry="4.6"/><ellipse cx="12" cy="19.4" rx="3" ry="2.1"/></svg></span>
+    <span class="queue-mon">${mon}</span>
+    <span class="queue-badges">${chip}${prioChip}</span>`;
+}
+
+/* 初始 4 行 */
+function seedRows(rowsEl, count) {
+  rowsEl.innerHTML = "";
+  for (let i = 0; i < count; i++) {
+    const row = document.createElement("div");
+    row.className = "queue-row";
+    row.dataset.rarity = i === 0 ? 1 : i === 2 ? 2 : 0;
+    row.innerHTML = rowHTML(i + 1, nickPick(), monPick(), 0, GUARDS[i % GUARDS.length], false);
+    rowsEl.appendChild(row);
+  }
+}
+seedRows(document.getElementById("now-rows"), 4);
+seedRows(document.getElementById("wilds-rows"), 4);
+seedRows(document.getElementById("asc-rows"), 4);
+seedRows(document.getElementById("glow-rows"), 4);
+
+/* fx 层骨架 */
+function fxHTML(priority, glow) {
+  if (glow) {
+    return `<span class="order-rays"></span><span class="order-ring"></span><span class="order-glow">ORDER IN</span>`;
+  }
+  const stamp = priority ? "PRIORITY" : "ORDER IN";
+  return `<span class="order-rays"></span><span class="order-ring"></span>${priority ? '<span class="order-ring ring2"></span>' : ""}<span class="order-flare"><i></i><i></i><i></i><i></i></span><span class="order-stamp${priority ? " prio" : ""}">${stamp}</span>`;
+}
+
+/* 受理播放：priority 插队首，普通插队尾；glow 走方案B */
+function playOrder(theme, priority) {
+  const panel = document.getElementById("panel-" + theme);
+  const rowsEl = document.getElementById(theme + "-rows");
+  const marquee = document.getElementById(theme + "-marquee");
+  const countEl = document.getElementById(theme + "-count");
+  if (panel.dataset.playing) return; /* 面板级重入锁（对齐真实播放锁） */
+  panel.dataset.playing = "1";
+  const glow = theme === "glow";
+
+  const nick = nickPick(), mon = monPick();
+  const prio = priority;
+  const guard = GUARDS[demoSeq % GUARDS.length];
+
+  /* ① 新行入场：优先插队首，普通插队尾（对齐两段式置前 / 排队尾语义） */
+  const row = document.createElement("div");
+  row.className = "queue-row queue-row-enter ordering";
+  row.dataset.rarity = demoSeq % 3 === 1 ? 1 : 0;
+  row.dataset.priority = prio ? "1" : "0";
+  row.innerHTML = rowHTML(rowsEl.children.length + 1, nick, mon, 0, guard, prio);
+  if (prio) rowsEl.prepend(row); else rowsEl.appendChild(row);
+  /* 演示面板行区固定高：超过 5 行裁掉最旧（等价真实虚拟列表的可视窗口语义，
+     保证新行与印面始终在演示可视区内；真实组件由列表滚动决定） */
+  if (rowsEl.children.length > 5) {
+    (prio ? rowsEl.lastElementChild : rowsEl.firstElementChild).remove();
+  }
+  [...rowsEl.children].forEach((el, i) => {
+    el.querySelector(".queue-seq").textContent = String(i + 1).padStart(2, "0");
+  });
+  countEl.textContent = String(Math.min(99, rowsEl.children.length)).padStart(2, "0");
+
+  /* ② fx 层挂 rows 容器，量新行 rect（对齐 rowRectInPanel 机制） */
+  requestAnimationFrame(() => {
+    const panelRect = panel.querySelector(".rows").getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    const fx = document.createElement("div");
+    fx.className = "queue-order-fx" + (glow ? " glowfx" : "");
+    fx.style.cssText = `left:${r.left - panelRect.left}px;top:${r.top - panelRect.top}px;width:${r.width}px;height:${r.height}px;`;
+    fx.innerHTML = fxHTML(prio, glow);
+    panel.querySelector(".rows").appendChild(fx);
+
+    /* ③ 印收行留：1.55s 后摘 fx 层与压暗类（压暗经 0.3s transition 恢复） */
+    setTimeout(() => {
+      fx.remove();
+      row.classList.remove("ordering");
+      delete panel.dataset.playing;
+    }, 1550);
+  });
+
+  /* ④ 跑马灯同步：文案切换 + 金辉脉冲（演示 4s 后回默认，真实为 10s 播完即回） */
+  marquee.textContent = prio ? `${nick} 优先 ${mon} 成功，已置前！` : `${nick} 点怪 ${mon} 成功！`;
+  marquee.classList.remove("order-live");
+  void marquee.offsetWidth; /* 重置动画 */
+  marquee.classList.add("order-live");
+  clearTimeout(marquee._t);
+  marquee._t = setTimeout(() => {
+    marquee.textContent = "发送'点怪 xxx'进行点怪";
+    marquee.classList.remove("order-live");
+  }, 4000);
+}
+
+/* 现状对照：只有侧移入场 + 跑马灯小字（无金印） */
+function playNow() {
+  const rowsEl = document.getElementById("now-rows");
+  const marquee = document.getElementById("now-marquee");
+  const row = document.createElement("div");
+  row.className = "queue-row queue-row-enter";
+  row.innerHTML = rowHTML(rowsEl.children.length + 1, nickPick(), monPick(), 0, GUARDS[demoSeq % GUARDS.length], false);
+  rowsEl.appendChild(row);
+  marquee.textContent = `${row.querySelector(".queue-nick").textContent} 点怪 ${row.querySelector(".queue-mon").textContent} 成功！`;
+}
+
+/* 自动演示：普通 → 优先 各一次 */
+function autoDemo() {
+  playOrder("wilds", false);
+  setTimeout(() => playOrder("wilds", true), 1800);
+}
+
+/* 进页 800ms 后自动播一次荒野面板普通点怪，评审打开即有效果参照 */
+window.addEventListener("load", () => {
+  setTimeout(() => playOrder("wilds", false), 800);
+});
+</script>
+</body>
+</html>

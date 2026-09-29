@@ -31,10 +31,17 @@ const BUBBLE_TTL_MS = 15000;
 const QUEUE_ROW_HEIGHT = 60;
 /** 完成动效总时长：钤印 560ms 与离场 420ms（延迟 560ms）重叠 */
 const COMPLETE_ANIM_MS = 980;
+/** 受理动效总时长（ORDER IN 金印）：0.3s 起 + 0.56s 落定 + 余韵，1.22s 起收印，1550ms 全收 */
+const ORDER_FX_MS = 1550;
+/** 受理行内容压暗恢复时刻：金印开始收走时让行回归常态 */
+const ORDER_DIM_MS = 1200;
 /** 撤销垫保留时长 */
 const UNDO_TTL_MS = 5200;
 
 type BubbleTone = "checkin" | "retro" | "like" | "gift" | "system";
+
+/** 跑马灯消息档位：order = 点怪成功（金字 + 辉光脉冲），plain = 其余业务消息（现状橙字） */
+type MarqueeTone = "plain" | "order";
 
 /** 大航海等级名（与原工程一致：1=总督, 2=提督, 3=舰长；V2 新增 99=GM 特殊管理员） */
 const GUARD_NAMES: Record<number, string> = { 1: "总督", 2: "提督", 3: "舰长", 99: "GM" };
@@ -65,6 +72,12 @@ interface GhostRow {
 interface UndoRecord {
   item: QueueItem;
   index: number;
+}
+
+/** 受理特效层（queue-order-fx）：定位矩形 + 递增 key —— 同用户连单由 active 集合去重，不并存 */
+interface OrderGhostFx {
+  key: number;
+  rect: GhostRow["rect"];
 }
 
 /**
@@ -103,13 +116,17 @@ export const OverlayWindow: React.FC = () => {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [ghosts, setGhosts] = useState<GhostRow[]>([]);
   const [enteringIds, setEnteringIds] = useState<Set<string>>(new Set());
+  /** 受理特效：金印层（面板根渲染）与压暗中的行（user_id 维度） */
+  const [orderGhosts, setOrderGhosts] = useState<OrderGhostFx[]>([]);
+  const [orderingIds, setOrderingIds] = useState<Set<string>>(new Set());
   const [undoStack, setUndoStack] = useState<UndoRecord[]>([]);
   const [theme, setTheme] = useState<"wilds" | "asc">("wilds");
   const [decor, setDecor] = useState<boolean>(false);
   const [conn, setConn] = useState<ConnectionStatusPayload | null>(null);
   const [defaultMarquee, setDefaultMarquee] = useState<string>(FALLBACK_MARQUEE);
   const [marqueeText, setMarqueeText] = useState<string>(FALLBACK_MARQUEE);
-  const [marqueeQueue, setMarqueeQueue] = useState<{ id: number; text: string }[]>([]);
+  const [marqueeTone, setMarqueeTone] = useState<MarqueeTone>("plain");
+  const [marqueeQueue, setMarqueeQueue] = useState<{ id: number; text: string; tone: MarqueeTone }[]>([]);
   const [opacity, setOpacity] = useState<number>(95);
   const [penetratingOpacity, setPenetratingOpacity] = useState<number>(50);
   const [locked, setLocked] = useState<boolean>(false);
@@ -147,10 +164,17 @@ export const OverlayWindow: React.FC = () => {
   /** 完成动画定时器（按 user_id），卸载时统一清理 */
   const completeTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 受理特效在播的 user_id：同用户连点不叠印 */
+  const orderFxActiveRef = useRef<Set<string>>(new Set());
+  const orderFxSeqRef = useRef(0);
+  /** 受理特效/压暗/行定位重试的定时器，卸载时统一清理 */
+  const orderFxTimersRef = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
+  const orderingTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const orderProbeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   /** 跑马灯是否正在播放业务消息（false = 显示默认文本循环滚动） */
   const marqueeBusyRef = useRef(false);
   /** 待播消息队列（与 marqueeQueue 同步的 ref，供定时器回调读取） */
-  const marqueeQueueRef = useRef<{ id: number; text: string }[]>([]);
+  const marqueeQueueRef = useRef<{ id: number; text: string; tone: MarqueeTone }[]>([]);
   /** 播放令牌：递增即作废上一条消息的兜底定时器，避免重复推进 */
   const marqueeTokenRef = useRef(0);
   const defaultMarqueeRef = useRef(FALLBACK_MARQUEE);
@@ -224,8 +248,9 @@ export const OverlayWindow: React.FC = () => {
   };
 
   /** 开始播放一条业务消息：切换为非默认文本（单次滚动），并设置兜底定时器 */
-  const startMarqueeMessage = (text: string) => {
+  const startMarqueeMessage = (text: string, tone: MarqueeTone) => {
     setMarqueeText(text);
+    setMarqueeTone(tone);
     const token = ++marqueeTokenRef.current;
     window.setTimeout(() => {
       if (marqueeTokenRef.current === token) {
@@ -241,26 +266,95 @@ export const OverlayWindow: React.FC = () => {
     if (next) {
       marqueeQueueRef.current = [...marqueeQueueRef.current];
       setMarqueeQueue(marqueeQueueRef.current);
-      startMarqueeMessage(next.text);
+      startMarqueeMessage(next.text, next.tone);
     } else {
       marqueeBusyRef.current = false;
       setMarqueeQueue([]);
       setMarqueeText(defaultMarqueeRef.current);
+      setMarqueeTone("plain");
     }
   };
 
   /** 业务消息入队：空闲则立即播放，否则排队（原工程 AddRollingInfo 语义） */
-  const pushMarquee = (text: string) => {
+  const pushMarquee = (text: string, tone: MarqueeTone = "plain") => {
     if (!marqueeBusyRef.current) {
       marqueeBusyRef.current = true;
-      startMarqueeMessage(text);
+      startMarqueeMessage(text, tone);
       return;
     }
     marqueeQueueRef.current = [
       ...marqueeQueueRef.current,
-      { id: ++marqueeSeqRef.current, text },
+      { id: ++marqueeSeqRef.current, text, tone },
     ];
     setMarqueeQueue(marqueeQueueRef.current);
+  };
+
+  /** 行的布局位置（面板坐标）：入场侧移在途时 rect 带平移，按 transform 矩阵扣除 */
+  const rowLayoutRectInPanel = (el: HTMLElement) => {
+    const panel = rootRef.current?.getBoundingClientRect();
+    const rect = el.getBoundingClientRect();
+    let dx = 0;
+    let dy = 0;
+    const m = /matrix\(([^)]+)\)/.exec(getComputedStyle(el).transform);
+    if (m) {
+      const parts = m[1].split(",").map(Number);
+      dx = parts.length >= 6 ? parts[4] : 0;
+      dy = parts.length >= 6 ? parts[5] : 0;
+    }
+    return {
+      left: rect.left - dx - (panel?.left ?? 0),
+      top: rect.top - dy - (panel?.top ?? 0),
+      width: rect.width,
+      height: rect.height,
+    };
+  };
+
+  /**
+   * 受理特效（ORDER IN 金印）：order-placed 触发，在对应行上盖金印。
+   * 后端先广播队列快照、后发本事件 —— 行已随快照提交渲染，按 data-uid 定位；
+   * 行不在可视区（虚拟列表只渲染可视行）则不播，跑马灯仍是兜底提示。
+   * 特效层挂面板根，层叠与渲染位置见 queue-order-fx 渲染处注释。
+   */
+  const playOrderFx = (userId: string) => {
+    if (orderFxActiveRef.current.has(userId)) return; // 同用户连点不叠印
+    const spawn = () => {
+      if (orderFxActiveRef.current.has(userId)) return;
+      // 完成暂留行（同 user_id 复购）与拖拽占位行不能当受理宿主
+      const el = listRef.current?.querySelector<HTMLElement>(
+        `.queue-row[data-uid="${CSS.escape(userId)}"]:not(.queue-row-completing):not(.queue-row-placeholder)`,
+      );
+      if (!el) return;
+      orderFxActiveRef.current.add(userId);
+      const key = ++orderFxSeqRef.current;
+      setOrderGhosts((prev) => [...prev, { key, rect: rowLayoutRectInPanel(el) }]);
+      setOrderingIds((prev) => new Set(prev).add(userId));
+      const fxTimer = window.setTimeout(() => {
+        orderFxTimersRef.current.delete(key);
+        orderFxActiveRef.current.delete(userId);
+        setOrderGhosts((prev) => prev.filter((g) => g.key !== key));
+      }, ORDER_FX_MS);
+      orderFxTimersRef.current.set(key, fxTimer);
+      const dimTimer = window.setTimeout(() => {
+        orderingTimersRef.current.delete(userId);
+        setOrderingIds((prev) => {
+          if (!prev.has(userId)) return prev;
+          const next = new Set(prev);
+          next.delete(userId);
+          return next;
+        });
+      }, ORDER_DIM_MS);
+      orderingTimersRef.current.set(userId, dimTimer);
+    };
+    requestAnimationFrame(() => {
+      spawn();
+      if (orderFxActiveRef.current.has(userId)) return;
+      // 首帧没找到行：虚拟列表晚一拍渲染时补测一次
+      const retry = window.setTimeout(() => {
+        orderProbeTimersRef.current.delete(retry);
+        spawn();
+      }, 150);
+      orderProbeTimersRef.current.add(retry);
+    });
   };
 
   // 气泡入栈：上限 5 条（超出移除最旧），15s 后自动退场（对齐原工程 AIBubbleControl 语义）
@@ -307,15 +401,17 @@ export const OverlayWindow: React.FC = () => {
       setConn(event.payload);
     });
 
-    // D3 跑马灯：点怪成功提示入队（文案对齐原工程 DanmuManager.OnDanmuProcessed）
+    // D3 跑马灯：点怪成功提示入队（文案对齐原工程 DanmuManager.OnDanmuProcessed）；
+    // 受理特效：金印 ORDER IN 盖在对应行上（快照先发、本事件后到，行已随快照渲染）
     const unlistenOrder = listen<OrderPlacedPayload>("order-placed", (event) => {
-      const { user_name, monster_name, is_priority } = event.payload;
+      const { user_id, user_name, monster_name, is_priority } = event.payload;
       const text = is_priority
         ? monster_name
           ? `${user_name} 优先 ${monster_name} 成功，已置前！`
           : `${user_name} 优先插队成功，已置前！`
         : `${user_name} 点怪 ${monster_name} 成功！`;
-      pushMarquee(text);
+      pushMarquee(text, "order");
+      playOrderFx(user_id);
     });
 
     // 禁点名单拦截：命中字典但该怪已在禁点名单内 —— 不入队，跑马灯就地提示原因
@@ -484,6 +580,12 @@ export const OverlayWindow: React.FC = () => {
       completeTimersRef.current.forEach((timer) => clearTimeout(timer));
       completeTimersRef.current.clear();
       if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
+      orderFxTimersRef.current.forEach((timer) => clearTimeout(timer));
+      orderFxTimersRef.current.clear();
+      orderingTimersRef.current.forEach((timer) => clearTimeout(timer));
+      orderingTimersRef.current.clear();
+      orderProbeTimersRef.current.forEach((timer) => clearTimeout(timer));
+      orderProbeTimersRef.current.clear();
     };
   }, []);
 
@@ -497,10 +599,9 @@ export const OverlayWindow: React.FC = () => {
   /** 是否正在显示默认文本（决定循环滚动样式与单次滚动样式） */
   const isDefaultMarquee = marqueeText === defaultMarquee;
 
-  // 默认文本：循环滚动（维持现有 animate-marquee）；业务消息：单次滚动后回默认
-  const marqueeStyle = isDefaultMarquee
-    ? undefined
-    : ({ animation: `marquee ${MARQUEE_SECS}s linear 1` } as React.CSSProperties);
+  // 默认文本：循环滚动（维持现有 animate-marquee）；业务消息：单次滚动后回默认。
+  // order 档（点怪成功）金字并叠一条一次性辉光脉冲 —— onAnimationEnd 只认滚动动画
+  const businessMarqueeAnim = `marquee ${MARQUEE_SECS}s linear 1`;
 
   // 拖拽预览顺序：按预览顺序排rank，队列里新增的条目（拖拽期间入队）保持末位
   const orderedQueue = useMemo<QueueItem[]>(() => {
@@ -888,6 +989,8 @@ export const OverlayWindow: React.FC = () => {
     if (ghost) classNames.push("queue-row-completing");
     else if (placeholder) classNames.push("queue-row-placeholder");
     if (enteringIds.has(item.id)) classNames.push("queue-row-enter");
+    // 受理压暗：金印 ORDER IN 播放期间行内容让位（App.css .queue-row.ordering）
+    if (orderingIds.has(item.user_id)) classNames.push("ordering");
 
     return (
       <div
@@ -976,11 +1079,25 @@ export const OverlayWindow: React.FC = () => {
             <span className="overflow-hidden flex-1">
               <span
                 key={marqueeText}
-                onAnimationEnd={isDefaultMarquee ? undefined : onMarqueeFinished}
+                onAnimationEnd={
+                  isDefaultMarquee
+                    ? undefined
+                    : (e) => {
+                        // order 档还叠了辉光脉冲动画：只让滚动结束推进消息队列
+                        if (e.animationName === "marquee") onMarqueeFinished();
+                      }
+                }
                 style={
                   isDefaultMarquee
                     ? { color: "var(--ink-dim)" }
-                    : { ...marqueeStyle, color: "var(--hl2)", fontWeight: 700 }
+                    : {
+                        animation:
+                          marqueeTone === "order"
+                            ? `${businessMarqueeAnim}, orderMarqueeFlash 0.55s ease-out`
+                            : businessMarqueeAnim,
+                        color: marqueeTone === "order" ? "var(--gold-main)" : "var(--hl2)",
+                        fontWeight: 700,
+                      }
                 }
                 className={isDefaultMarquee ? "animate-marquee text-[12.5px] font-medium" : "inline-block whitespace-nowrap text-[12.5px]"}
               >
@@ -1125,6 +1242,21 @@ export const OverlayWindow: React.FC = () => {
               <i />
             </span>
             <span className="queue-stamp">QUEST CLEAR</span>
+          </div>
+        ))}
+
+        {/* 受理特效层：点怪成功金印（ORDER IN）。层叠与 queue-clear-fx 同为 z60 面板根
+            （顶栏/气泡/拖拽浮起之上），渲染顺序在其后 —— 同 z-index 时后来者居上，
+            受理与完成同帧叠加时金印盖在朱印上，与「先受理后讨伐」的时序一致 */}
+        {orderGhosts.map((g) => (
+          <div
+            key={g.key}
+            className="queue-order-fx"
+            style={{ left: g.rect.left, top: g.rect.top, width: g.rect.width, height: g.rect.height }}
+          >
+            <span className="order-rays" />
+            <span className="order-ring" />
+            <span className="order-glow">ORDER IN</span>
           </div>
         ))}
       </div>
