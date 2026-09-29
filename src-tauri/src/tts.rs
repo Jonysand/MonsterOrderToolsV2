@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 语音引擎类型
@@ -76,6 +76,50 @@ impl Default for TTSConfig {
 }
 
 // ---------------------------------------------------------------------------
+// 播放开始气泡通知（对齐原工程 CheckinTTSPlay 回调：气泡与出声同帧出现）
+// ---------------------------------------------------------------------------
+
+/// 随播报任务携带的前端气泡事件：由音频线程在**真正开始播出**的瞬间投递。
+///
+/// 为什么不在业务定稿时发：TTS 播报队列与串行音频队列都可能积压，
+/// 定稿时发会让气泡先于声音出现、甚至 15s 生命期结束后声音才来
+/// （见 docs/CORE_FLOW_REMEDIATION_PLAN_2026-09-25.md 第 8 节第 3 条的产品决策）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BubbleNotice {
+    /// Tauri 事件名（当前仅 `checkin-reply`）
+    pub event: &'static str,
+    /// 事件载荷（与业务层「立即显示」回退路径的载荷完全一致）
+    pub payload: serde_json::Value,
+}
+
+impl BubbleNotice {
+    pub fn checkin_reply(payload: serde_json::Value) -> Self {
+        Self {
+            event: "checkin-reply",
+            payload,
+        }
+    }
+}
+
+/// 播放开始通知器：App 装配期注入（持有 AppHandle 发事件），单测可替换观测
+type PlayNoticeFn = Arc<dyn Fn(&BubbleNotice) + Send + Sync>;
+static PLAY_NOTICE_NOTIFIER: Mutex<Option<PlayNoticeFn>> = Mutex::new(None);
+
+/// 装配播放开始通知器（App setup 时调用一次；重复调用以最后一次为准）
+pub fn set_play_notice_notifier(f: PlayNoticeFn) {
+    *PLAY_NOTICE_NOTIFIER.lock().unwrap() = Some(f);
+}
+
+/// 音频线程真正开始播出某个 job 的瞬间调用；未装配通知器（单测/Lite）时为 no-op
+pub(crate) fn fire_play_notice(notice: &BubbleNotice) {
+    // 先取出再调用：避免持锁执行回调（回调内可能再入本模块）
+    let f = PLAY_NOTICE_NOTIFIER.lock().unwrap().clone();
+    if let Some(f) = f {
+        f(notice);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 串行音频播放队列（B3 防叠音）
 // ---------------------------------------------------------------------------
 
@@ -85,9 +129,18 @@ enum AudioJob {
     /// 本地音效：增益 = volume_gain（不做语音响度校准）
     Bytes { bytes: Vec<u8>, volume: i32 },
     /// 云端 TTS 语音（Manbo）：增益 = volume_gain × MANBO_LOUDNESS_GAIN（响度与 SAPI 对齐）
-    TtsBytes { bytes: Vec<u8>, volume: i32 },
+    TtsBytes {
+        bytes: Vec<u8>,
+        volume: i32,
+        /// 随行气泡事件：真正出声的瞬间投递（对齐原工程 CheckinTTSPlay 回调时机）
+        notice: Option<BubbleNotice>,
+    },
     File { path: PathBuf, volume: i32 },
-    Sapi { text: String, params: SapiParams },
+    Sapi {
+        text: String,
+        params: SapiParams,
+        notice: Option<BubbleNotice>,
+    },
 }
 
 /// SAPI 播报参数（rate 直传、pitch 走 SSML；volume 为用户线性刻度 0~100，
@@ -137,8 +190,18 @@ impl AudioQueue {
 
     /// 云端 TTS 语音入队：增益额外乘响度校准系数（与本地音效区分）
     pub fn play_tts_bytes(&self, bytes: Vec<u8>, volume: i32) -> Result<(), String> {
+        self.play_tts_bytes_with_notice(bytes, volume, None)
+    }
+
+    /// 云端 TTS 语音入队，可随行气泡事件（真正出声时投递）
+    pub fn play_tts_bytes_with_notice(
+        &self,
+        bytes: Vec<u8>,
+        volume: i32,
+        notice: Option<BubbleNotice>,
+    ) -> Result<(), String> {
         self.tx
-            .send(AudioJob::TtsBytes { bytes, volume })
+            .send(AudioJob::TtsBytes { bytes, volume, notice })
             .map_err(|e| e.to_string())
     }
 
@@ -149,21 +212,49 @@ impl AudioQueue {
     }
 
     pub fn speak_sapi(&self, text: String, params: SapiParams) -> Result<(), String> {
+        self.speak_sapi_with_notice(text, params, None)
+    }
+
+    /// 本地 SAPI 播报入队，可随行气泡事件（真正出声时投递）
+    pub fn speak_sapi_with_notice(
+        &self,
+        text: String,
+        params: SapiParams,
+        notice: Option<BubbleNotice>,
+    ) -> Result<(), String> {
         self.tx
-            .send(AudioJob::Sapi { text, params })
+            .send(AudioJob::Sapi { text, params, notice })
             .map_err(|e| e.to_string())
     }
 
     /// 真实播放实现（阻塞当前播放线程直至结束或超时）
     fn play_job(job: &AudioJob) {
+        // 气泡与出声同帧：播放线程取出该 job 即将播出的一刻投递随行事件。
+        // 此前若还有其他音频 job 在串行等待，气泡会等它们播完才出现——这正是
+        // 「气泡与 TTS 播放时机相同」的关键（在 speak_task 里 emit 会早于真正的出声）
+        match job {
+            AudioJob::TtsBytes {
+                notice: Some(notice),
+                ..
+            }
+            | AudioJob::Sapi {
+                notice: Some(notice),
+                ..
+            } => fire_play_notice(notice),
+            _ => {}
+        }
         // 测试环境不产生真实音频输出（避免 cargo test 中途出声干扰）
         #[cfg(test)]
         {
             let _ = match job {
                 AudioJob::Bytes { bytes, volume } => bytes.len() + *volume as usize,
-                AudioJob::TtsBytes { bytes, volume } => bytes.len() + *volume as usize,
+                AudioJob::TtsBytes { bytes, volume, .. } => {
+                    bytes.len() + *volume as usize
+                }
                 AudioJob::File { path, volume } => path.as_os_str().len() + *volume as usize,
-                AudioJob::Sapi { text, params } => text.len() + params.rate.unsigned_abs() as usize,
+                AudioJob::Sapi { text, params, .. } => {
+                    text.len() + params.rate.unsigned_abs() as usize
+                }
             };
         }
         #[cfg(not(test))]
@@ -173,7 +264,7 @@ impl AudioQueue {
                     play_decoder_sync(decoder, volume_gain(*volume));
                 }
             }
-            AudioJob::TtsBytes { bytes, volume } => {
+            AudioJob::TtsBytes { bytes, volume, .. } => {
                 if let Ok(decoder) = Decoder::new(Cursor::new(bytes.clone())) {
                     play_decoder_sync(decoder, tts_stream_gain(*volume));
                 }
@@ -185,7 +276,7 @@ impl AudioQueue {
                     }
                 }
             }
-            AudioJob::Sapi { text, params } => {
+            AudioJob::Sapi { text, params, .. } => {
                 run_local_speech(text, params);
             }
         }
@@ -795,6 +886,9 @@ pub struct SpeakTask {
     pub checkin_username: String,
     /// 是否来自高优先队列（回滚入队时还原到原队列）
     pub priority: bool,
+    /// 随行气泡事件：随任务走完队列与合成，由音频线程在真正出声时投递；
+    /// 播报失败/语音关闭等「本次必不出声」的路径由消费方回退为立即投递
+    pub bubble: Option<BubbleNotice>,
 }
 
 /// 单队列容量上限（防止异常刷屏导致内存膨胀）
@@ -853,6 +947,7 @@ impl TTSManager {
             is_checkin: false,
             checkin_username: String::new(),
             priority,
+            bubble: None,
         }, priority)
     }
 
@@ -864,6 +959,27 @@ impl TTSManager {
             is_checkin: true,
             checkin_username: username.to_string(),
             priority: true,
+            bubble: None,
+        }, true)
+    }
+
+    /// 入队签到播报并随行气泡：气泡不随定稿立即出现，而是等音频线程真正出声
+    /// （对齐原工程 CheckinTTSPlay 回调）。返回 false（空文本或队满）表示没有随行成功，
+    /// 调用方必须回退为立即广播气泡，不得让回复静默消失。
+    pub fn enqueue_checkin_speak_with_notice(
+        &self,
+        text: &str,
+        user_id: &str,
+        username: &str,
+        notice: BubbleNotice,
+    ) -> bool {
+        self.enqueue_task(SpeakTask {
+            text: text.to_string(),
+            user_id: user_id.to_string(),
+            is_checkin: true,
+            checkin_username: username.to_string(),
+            priority: true,
+            bubble: Some(notice),
         }, true)
     }
 
@@ -1106,13 +1222,14 @@ impl TTSManager {
         &self,
         bytes: &[u8],
         checkin_username: Option<&str>,
+        notice: Option<BubbleNotice>,
     ) -> Result<(), String> {
         if let Some(name) = checkin_username {
             if save_checkin_audio(name, bytes).is_none() {
                 crate::log_warn!("[TTS] 签到音频留档失败（不影响播放）");
             }
         }
-        AudioQueue::global().play_tts_bytes(bytes.to_vec(), self.current_volume())
+        AudioQueue::global().play_tts_bytes_with_notice(bytes.to_vec(), self.current_volume(), notice)
     }
 
     /// 查找并播放本地特殊音效（zip 优先、散装目录回退）
@@ -1214,17 +1331,20 @@ impl TTSManager {
     /// `user_id` 为空表示无用户上下文（如连击结算/模拟通道）；命中特殊用户时走专属引擎。
     /// 注意：本地特殊音效不在本入口拦截（对齐原工程仅在弹幕文本路径 `HandleSpeekDm` 匹配）。
     pub async fn speak_text(&self, text: &str, user_id: &str) -> Result<(), String> {
-        self.speak_text_inner(text, user_id, None).await
+        self.speak_text_inner(text, user_id, None, None).await
     }
 
-    /// 播报队列任务入口：按任务类型决定是否留档签到音频
+    /// 播报队列任务入口：按任务类型决定是否留档签到音频。
+    /// 随行气泡交由本函数托管：真正出声时由音频线程投递；本次必不出声
+    /// （语音开关关闭/空文本）时在此立即回退投递，合成入队失败则由调用方兜底。
     pub async fn speak_task(&self, task: &SpeakTask) -> Result<(), String> {
         let checkin = if task.is_checkin && !task.checkin_username.is_empty() {
             Some(task.checkin_username.as_str())
         } else {
             None
         };
-        self.speak_text_inner(&task.text, &task.user_id, checkin).await
+        self.speak_text_inner(&task.text, &task.user_id, checkin, task.bubble.as_ref())
+            .await
     }
 
     async fn speak_text_inner(
@@ -1232,14 +1352,23 @@ impl TTSManager {
         text: &str,
         user_id: &str,
         checkin_username: Option<&str>,
+        notice: Option<&BubbleNotice>,
     ) -> Result<(), String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            // 空文本必不出声：随行气泡退回立即投递（正常入队已拒绝空文本，防御性兜底）
+            if let Some(n) = notice {
+                fire_play_notice(n);
+            }
             return Ok(());
         }
 
         let cfg = self.config.lock().unwrap().clone();
         if !cfg.enable_voice {
+            // 语音开关已关闭：本次必不出声，随行气泡退回立即投递（关语音仍出气泡）
+            if let Some(n) = notice {
+                fire_play_notice(n);
+            }
             return Ok(());
         }
 
@@ -1252,7 +1381,7 @@ impl TTSManager {
                 match Self::request_audio_bytes(client, &url, None).await {
                     Ok(bytes) => {
                         self.special_mark_success();
-                        return self.play_audio_bytes(&bytes, checkin_username);
+                        return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
                     }
                     Err(_) => {
                         self.special_mark_failure();
@@ -1266,7 +1395,7 @@ impl TTSManager {
                 match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
                     Ok(bytes) => {
                         self.mark_active_engine(TTSEngineType::Manbo);
-                        return self.play_audio_bytes(&bytes, checkin_username);
+                        return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
                     }
                     Err(_) => {
                         self.mark_engine_degraded(TTSEngineType::Manbo);
@@ -1282,7 +1411,14 @@ impl TTSManager {
             volume: cfg.speech_volume,
             pitch: cfg.speech_pitch,
         };
-        AudioQueue::global().speak_sapi(trimmed.to_string(), params)
+        let queued = AudioQueue::global().speak_sapi_with_notice(trimmed.to_string(), params, notice.cloned());
+        if queued.is_err() {
+            // 播放队列送入失败（接收端已不存在）：本次必不出声，气泡退回立即投递
+            if let Some(n) = notice {
+                fire_play_notice(n);
+            }
+        }
+        queued
     }
 
     /// 试听指定参数的测试句（设置面板「试听」按钮）。
@@ -1884,6 +2020,123 @@ mod tests {
         mgr.release_slot();
         assert_eq!(mgr.inflight_count(), 0);
         println!("[PASS] test_speak_queue_capacity_logs_and_requeue passed");
+    }
+
+    /// 通知器是进程级全局：涉及播放通知的测试共用一把锁串行执行，避免互相覆盖
+    static PLAY_NOTICE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_checkin_speak_with_notice_attaches_bubble() {
+        let mgr = TTSManager::new(TTSConfig::default());
+
+        // 随行气泡：入队成功即随任务走完队列，真正出声时才由音频线程投递
+        let notice = BubbleNotice::checkin_reply(serde_json::json!({
+            "user_id": "u1",
+            "user_name": "舰长A",
+            "reply": "回复文本",
+            "is_ai": true,
+        }));
+        assert!(mgr.enqueue_checkin_speak_with_notice("打卡回复", "u1", "舰长A", notice));
+
+        let task = mgr.dequeue_speak().expect("随行气泡任务应入队");
+        assert!(task.is_checkin && task.priority);
+        let bubble = task.bubble.as_ref().expect("随行气泡必须随任务保留");
+        assert_eq!(bubble.event, "checkin-reply");
+        assert_eq!(bubble.payload["user_name"], "舰长A");
+        assert_eq!(bubble.payload["is_ai"], true);
+
+        // 回滚入队（并发名额不足重排）不得丢气泡
+        mgr.requeue_speak(task);
+        assert!(mgr.dequeue_speak().unwrap().bubble.is_some());
+
+        // 普通签到播报（无气泡）：补签等旧路径行为不变
+        assert!(mgr.enqueue_checkin_speak("补签回复", "u2", "舰长B"));
+        assert!(mgr.dequeue_speak().unwrap().bubble.is_none());
+
+        // 队满：入队失败返回 false，由业务层回退立即广播气泡
+        //（随行气泡走高优先队列，须填满的是优先队列）
+        for i in 0..MAX_SPEAK_QUEUE {
+            assert!(mgr.enqueue_speak(&format!("t{}", i), "u", true));
+        }
+        assert!(!mgr.enqueue_checkin_speak_with_notice(
+            "溢出",
+            "u",
+            "舰长",
+            BubbleNotice::checkin_reply(serde_json::json!({})),
+        ));
+        println!("[PASS] test_checkin_speak_with_notice_attaches_bubble passed");
+    }
+
+    #[test]
+    fn test_play_job_fires_notice_at_play_start() {
+        let _guard = PLAY_NOTICE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let fired = Arc::new(Mutex::new(Vec::<String>::new()));
+        {
+            let fired = fired.clone();
+            set_play_notice_notifier(Arc::new(move |n: &BubbleNotice| {
+                fired.lock().unwrap().push(n.event.to_string());
+            }));
+        }
+
+        // 云端语音 job：播放线程取出并开始播出的一刻投递（测试构建不产生真实声音）
+        AudioQueue::play_job(&AudioJob::TtsBytes {
+            bytes: vec![0u8; 8],
+            volume: 50,
+            notice: Some(BubbleNotice::checkin_reply(serde_json::json!({"k": 1}))),
+        });
+        // 本地 SAPI job：同样在出声前投递
+        AudioQueue::play_job(&AudioJob::Sapi {
+            text: "测试".into(),
+            params: SapiParams { rate: 0, volume: 50, pitch: 0 },
+            notice: Some(BubbleNotice::checkin_reply(serde_json::json!({"k": 2}))),
+        });
+        // 无随行气泡的 job（本地音效）不得误触
+        AudioQueue::play_job(&AudioJob::Bytes { bytes: vec![1u8], volume: 50 });
+
+        let events = fired.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["checkin-reply", "checkin-reply"],
+            "有随行气泡的 job 各投递一次、无气泡不触发: {:?}",
+            events
+        );
+        println!("[PASS] test_play_job_fires_notice_at_play_start passed");
+    }
+
+    #[test]
+    fn test_speak_task_fires_notice_when_voice_disabled() {
+        let _guard = PLAY_NOTICE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let fired = Arc::new(Mutex::new(Vec::<BubbleNotice>::new()));
+        {
+            let fired = fired.clone();
+            set_play_notice_notifier(Arc::new(move |n: &BubbleNotice| {
+                fired.lock().unwrap().push(n.clone());
+            }));
+        }
+
+        // 语音关闭：本次必不出声，随行气泡在播报入口立即回退投递（关语音仍出气泡）
+        let mut cfg = TTSConfig::default();
+        cfg.enable_voice = false;
+        let mgr = TTSManager::new(cfg);
+        assert!(mgr.enqueue_checkin_speak_with_notice(
+            "打卡回复",
+            "u1",
+            "舰长A",
+            BubbleNotice::checkin_reply(serde_json::json!({"reply": "打卡回复"})),
+        ));
+        let task = mgr.dequeue_speak().expect("任务应入队");
+
+        let rt = tokio::runtime::Runtime::new().expect("创建 tokio 运行时失败");
+        rt.block_on(async {
+            assert!(mgr.speak_task(&task).await.is_ok(), "关语音按无事发生处理");
+        });
+
+        let events = fired.lock().unwrap();
+        assert_eq!(events.len(), 1, "关语音时随行气泡必须回退立即投递: {:?}", *events);
+        assert_eq!(events[0].payload["reply"], "打卡回复");
+        println!("[PASS] test_speak_task_fires_notice_when_voice_disabled passed");
     }
 
     #[test]

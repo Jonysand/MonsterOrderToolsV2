@@ -87,6 +87,8 @@ interface OverlayBubble {
   username: string;
   content: string;
   tone: BubbleTone;
+  /** 回复正文用大号字（19px/700，对齐点怪用户名 .queue-nick）：打卡 AI 回复气泡 */
+  large?: boolean;
 }
 
 const BUBBLE_TONES: Record<BubbleTone, string> = {
@@ -350,7 +352,8 @@ export const OverlayWindow: React.FC = () => {
           });
         });
 
-    // D4 舰长打卡回复气泡（原工程 CheckinTTSPlay 回调）
+    // D4 舰长打卡回复气泡（气泡事件由后端在 TTS 真正出声的一刻广播，
+    // 对齐原工程 CheckinTTSPlay 回调；关语音/播报失败时后端回退为立即广播）
     const unlistenCheckin = __IS_LITE__
       ? liteNoop
       : listen<CheckinReplyPayload>("checkin-reply", (event) => {
@@ -360,6 +363,7 @@ export const OverlayWindow: React.FC = () => {
             username: user_name,
             content: reply,
             tone: "checkin",
+            large: true,
           });
         });
 
@@ -1049,7 +1053,12 @@ export const OverlayWindow: React.FC = () => {
                     </span>
                   </div>
 
-                  <div className="text-xs text-white font-medium break-words leading-relaxed whitespace-pre-line">
+                  {/* AI 回复正文：19px/700 对齐点怪用户名（.queue-nick），直播画面缩放后仍可读 */}
+                  <div
+                    className={`text-white break-words leading-relaxed whitespace-pre-line ${
+                      bubble.large ? "text-[19px] font-bold" : "text-xs font-medium"
+                    }`}
+                  >
                     {bubble.content}
                   </div>
                 </div>

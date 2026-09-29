@@ -1130,46 +1130,66 @@ fn build_food_order_text(msg: &str, uname: &str) -> Option<String> {
     ))
 }
 
-/// 广播打卡回复事件（供前端气泡展示，D4）
+/// 打卡回复统一投递：留档 + 气泡按 TTS 播放时机显示（D4）
 ///
-/// 同时完成业务留档：回复文案在这里**最终确定**，是留档的唯一时机
-/// （无语音、AI 失败回退、队满都不影响这条留档）。
-fn emit_checkin_reply(
+/// 留档在这里**最终确定**，是留档的唯一时机（无语音、AI 失败回退、队满都不影响这条留档）。
+///
+/// 气泡时机对齐原工程 `CheckinTTSPlay` 回调——**声音开始的一刻才出气泡**：
+/// - 语音开启且播报成功入队 → 气泡随 [`tts::SpeakTask`] 走完播报队列与合成，
+///   由音频线程在真正出声的瞬间广播（TTS 队列积压时气泡同步延后，不再先于声音出现或提前退场）；
+/// - 语音关闭 / 入队失败（空文本或队满）→ 退回立即广播（关语音仍出气泡，回复不得静默消失）。
+///
+/// 返回 `true` 表示气泡已随播报任务挂载；`false` 表示已立即广播。
+fn deliver_checkin_reply(
     app_handle: Option<&AppHandle>,
+    tts: Option<&TTSManager>,
+    enable_voice: bool,
     user_id: &str,
     user_name: &str,
     reply: &str,
     is_ai: bool,
-) {
+) -> bool {
     record_business_history(reply);
     record_business_history_probe(reply);
-    if let Some(handle) = app_handle {
-        let _ = handle.emit(
-            "checkin-reply",
-            &serde_json::json!({
-                "user_id": user_id,
-                "user_name": user_name,
-                "reply": reply,
-                "is_ai": is_ai,
-            }),
-        );
+    let payload = serde_json::json!({
+        "user_id": user_id,
+        "user_name": user_name,
+        "reply": reply,
+        "is_ai": is_ai,
+    });
+    let attached = enable_voice
+        && tts.is_some_and(|t| {
+            t.enqueue_checkin_speak_with_notice(
+                reply,
+                user_id,
+                user_name,
+                tts::BubbleNotice::checkin_reply(payload.clone()),
+            )
+        });
+    if !attached {
+        if let Some(handle) = app_handle {
+            let _ = handle.emit("checkin-reply", &payload);
+        }
     }
+    attached
 }
 
-/// AI 调用结果 → 回复定稿，并完成留档与广播。
+/// AI 调用结果 → 回复定稿，并完成留档与气泡投递。
 ///
 /// 抽成同步函数有两个目的：
 /// 1. **修复留档缺失**：异步分支原先在自己的 `spawn` 里直接 `emit`，绕过了
-///    [`emit_checkin_reply`] 的留档入口，导致「舰长 + 已配置 Key」——也就是生产主配置下
+///    留档入口，导致「舰长 + 已配置 Key」——也就是生产主配置下
 ///    **每一条**打卡回复都不写 `History/YYYY.M.D.txt`（注释所称「留档的唯一时机」形同虚设）。
 ///    收敛到本函数后，成功（AI 文案）与失败（兜底文案）都恰好留档一次；
 /// 2. **可测**：把「AI 调用结果」作为入参，单测可直接喂 `Ok`/`Err` 两种结果断言留档，
 ///    无需真实网络与异步等待（`logging` 的测试留档探针是线程局部的，塞在 `spawn` 里
 ///    的留档在测试线程上观测不到）。
 ///
-/// 返回 `(定稿文案, 是否为 AI 文案)`，供调用方继续投递 TTS。
+/// 返回 `(定稿文案, 是否为 AI 文案)`。
 fn finalize_checkin_reply(
     app_handle: Option<&AppHandle>,
+    tts: Option<&TTSManager>,
+    enable_voice: bool,
     user_id: &str,
     user_name: &str,
     result: Result<(String, String), String>,
@@ -1182,11 +1202,11 @@ fn finalize_checkin_reply(
             (fallback, false)
         }
     };
-    emit_checkin_reply(app_handle, user_id, user_name, &text, is_ai);
+    deliver_checkin_reply(app_handle, tts, enable_voice, user_id, user_name, &text, is_ai);
     (text, is_ai)
 }
 
-/// AI 打卡回复的后台任务体：调用模型 → 定稿（留档 + 广播）→ 投递语音。
+/// AI 打卡回复的后台任务体：调用模型 → 定稿（留档 + 气泡投递）。
 ///
 /// 抽成独立的 async 函数，使**生产（`spawn`）与单测执行同一份代码**：
 /// 单测可用 `block_on` 直接驱动它（`call_api` 在 Key 为空时立即返回 `Err`，
@@ -1206,14 +1226,17 @@ fn spawn_checkin_ai_reply(
         let result = provider
             .call_api(&prompt, Some(ai::SYSTEM_PROMPT_CHECKIN))
             .await;
-        // 定稿即留档（唯一入口），随后才投递 TTS：
-        // 留档不依赖语音开关，队满/合成失败也不会回头删掉这条留档
-        let (text, _is_ai) =
-            finalize_checkin_reply(app_handle.as_ref(), &user_id, &user_name, result, fallback);
-        if enable_voice {
-            // 签到/补签播报：音频按 `打卡_{用户名}_{ts}.mp3` 留档（对齐原工程仅留档签到 TTS）
-            tts.enqueue_checkin_speak(&text, &user_id, &user_name);
-        }
+        // 定稿即留档（唯一入口）；气泡随播报任务走、真正出声才显示，
+        // 留档与气泡都不依赖语音开关的后续状态（队满/合成失败各有回退路径）
+        finalize_checkin_reply(
+            app_handle.as_ref(),
+            Some(&tts),
+            enable_voice,
+            &user_id,
+            &user_name,
+            result,
+            fallback,
+        );
     }
 }
 
@@ -1237,13 +1260,15 @@ fn schedule_checkin_reply(
 
     // AI 仅对舰长生效（原工程 guardLevel > 0 分支），且需已配置 API Key
     if danmu.guard_level <= 0 || !state.ai_provider.is_configured() {
-        emit_checkin_reply(app_handle, &danmu.user_id, &danmu.user_name, &fallback, false);
-        if cfg.enable_voice {
-            // 兜底签到播报同样按“打卡_{用户名}_{ts}.mp3”留档（对齐原工程 isCheckinTTS 守卫）
-            state
-                .tts_mgr
-                .enqueue_checkin_speak(&fallback, &danmu.user_id, &danmu.user_name);
-        }
+        deliver_checkin_reply(
+            app_handle,
+            Some(&state.tts_mgr),
+            cfg.enable_voice,
+            &danmu.user_id,
+            &danmu.user_name,
+            &fallback,
+            false,
+        );
         return;
     }
 
@@ -1436,21 +1461,15 @@ pub fn handle_incoming_danmu(
                                 "{}今日已打卡，连续{}天，累计{}天",
                                 danmu.user_name, profile.continuous_days, profile.cumulative_days
                             );
-                            emit_checkin_reply(
+                            deliver_checkin_reply(
                                 app_handle,
+                                Some(&state.tts_mgr),
+                                cfg.enable_voice,
                                 &danmu.user_id,
                                 &danmu.user_name,
                                 &reply,
                                 false,
                             );
-                            if cfg.enable_voice {
-                                // 重复打卡亦属签到播报：按“打卡_{用户名}_{ts}.mp3”留档
-                                state.tts_mgr.enqueue_checkin_speak(
-                                    &reply,
-                                    &danmu.user_id,
-                                    &danmu.user_name,
-                                );
-                            }
                         } else {
                             schedule_checkin_reply(
                                 app_handle,
@@ -2994,6 +3013,15 @@ pub fn run() {
                 }
             }
 
+            // 播放开始通知器：音频线程在真正出声的瞬间广播随行气泡事件，
+            // 使打卡回复气泡与 TTS 播放时机同步（对齐原工程 CheckinTTSPlay 回调）
+            {
+                let handle = app.handle().clone();
+                tts::set_play_notice_notifier(std::sync::Arc::new(move |notice| {
+                    let _ = handle.emit(notice.event, &notice.payload);
+                }));
+            }
+
             // 播报泵：每 100ms（对齐原工程 TIMER_INTERVAL=100）各出队一条优先/普通任务并结算超时连击；
             // 并发合成上限 MAX_CONCURRENT_TTS=2（对齐原工程 activeRequestCount_ 闸门）
             let state = app.state::<AppState>().inner().clone();
@@ -3032,7 +3060,13 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             // 此处不再写 History：留档改由各业务事件在"文本形成时"完成一次，
                             // 否则语音开关、队满、合成失败都会连带删掉业务留档
-                            let _ = tts.speak_task(&task).await;
+                            if let Err(e) = tts.speak_task(&task).await {
+                                // 播报失败（本次必不出声）：随行气泡退回立即投递，不因播报失败丢失
+                                crate::log_warn!("[TTS] 播报失败: {}", e);
+                                if let Some(notice) = &task.bubble {
+                                    tts::fire_play_notice(notice);
+                                }
+                            }
                             tts.release_slot();
                         });
                     }
@@ -4338,9 +4372,9 @@ mod tests {
 
     /// AI 分支的打卡回复必须留档：成功用 AI 文案、失败用兜底文案，且各自恰好一次。
     ///
-    /// 回归背景：异步分支原先在自己的 `spawn` 里直接 `emit`，绕过 [`emit_checkin_reply`]
-    /// 的留档入口，于是「舰长 + 已配置 Key」这一生产主配置下**每一条**打卡回复都不写 History。
-    /// 既有 `test_history_recorded_even_when_voice_disabled` 覆盖不到该分支——
+    /// 回归背景：异步分支原先在自己的 `spawn` 里直接 `emit`，绕过留档入口
+    /// [`deliver_checkin_reply`]，于是「舰长 + 已配置 Key」这一生产主配置下**每一条**打卡回复
+    /// 都不写 History。既有 `test_history_recorded_even_when_voice_disabled` 覆盖不到该分支——
     /// `AppState::new_test()` 的 AI Key 为空，打卡恒定走同步兜底路径。
     ///
     /// 覆盖面（两段合起来锁住「定稿必留档」）：
@@ -4352,9 +4386,11 @@ mod tests {
     fn test_ai_checkin_reply_is_archived_once() {
         let _ = logging::take_history_sink(); // 清空探针
 
-        // ① AI 成功：留档 AI 文案，绝不留档思维链
+        // ① AI 成功：留档 AI 文案，绝不留档思维链（关语音：气泡退回立即广播路径，不入播报队列）
         let (text, is_ai) = finalize_checkin_reply(
             None,
+            None,
+            false,
             "ai_hist_cap",
             "留档舰长",
             Ok(("恭喜留档舰长，今天这卡打得漂亮！".into(), "英文思维链 CoT".into())),
@@ -4375,6 +4411,8 @@ mod tests {
         // ② AI 失败：必须留档兜底文案（用户实际看到/听到的就是它）
         let (text2, is_ai2) = finalize_checkin_reply(
             None,
+            None,
+            false,
             "ai_hist_cap",
             "留档舰长",
             Err("HTTP request error: timeout".into()),
@@ -4415,6 +4453,85 @@ mod tests {
             after_body
         );
         println!("[PASS] test_ai_checkin_reply_is_archived_once passed");
+    }
+
+    /// 气泡与 TTS 播放时机同步：语音开启时打卡回复气泡随播报任务挂载，
+    /// 由音频线程在真正出声的瞬间投递（对齐原工程 CheckinTTSPlay 回调）；
+    /// 留档仍发生在定稿时机，与气泡投递路径解耦。
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_checkin_reply_bubble_rides_tts_task_when_voice_on() {
+        let state = AppState::new_test();
+        let _ = logging::take_history_sink(); // 清空探针
+
+        let attached = deliver_checkin_reply(
+            None,
+            Some(&state.tts_mgr),
+            true,
+            "u_bubble_on",
+            "气泡舰长",
+            "恭喜气泡舰长打卡！",
+            true,
+        );
+        assert!(attached, "开语音且入队成功时气泡必须随播报任务挂载");
+
+        // 定稿即留档：留档不依赖气泡投递路径（出声时才显示的是气泡，不是留档）
+        let sink = logging::take_history_sink();
+        assert_eq!(sink.len(), 1, "随 TTS 挂载路径必须恰好留档一次: {:?}", sink);
+        assert_eq!(sink[0], "恭喜气泡舰长打卡！");
+
+        let task = state.tts_mgr.dequeue_speak().expect("播报任务应入队");
+        assert_eq!(task.text, "恭喜气泡舰长打卡！");
+        assert!(task.is_checkin && task.checkin_username == "气泡舰长");
+        let bubble = task.bubble.expect("气泡必须随任务走");
+        assert_eq!(bubble.event, "checkin-reply");
+        assert_eq!(bubble.payload["user_id"], "u_bubble_on");
+        assert_eq!(bubble.payload["user_name"], "气泡舰长");
+        assert_eq!(bubble.payload["reply"], "恭喜气泡舰长打卡！");
+        assert_eq!(bubble.payload["is_ai"], true);
+        println!("[PASS] test_checkin_reply_bubble_rides_tts_task_when_voice_on passed");
+    }
+
+    /// 关语音 / 播报队满时气泡退回立即广播：回复不得静默消失（V2：关语音仍出气泡）
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_checkin_reply_bubble_emits_immediately_without_voice_or_queue_full() {
+        let state = AppState::new_test();
+        let _ = logging::take_history_sink();
+
+        // ① 关语音：不入播报队列，走立即广播路径（app_handle=None 时不可观测 emit，
+        //    以返回值 + 队列为空锁定「未随行、已回退」）
+        let attached = deliver_checkin_reply(
+            None,
+            Some(&state.tts_mgr),
+            false,
+            "u_bubble_off",
+            "静音舰长",
+            "静音舰长打卡成功",
+            false,
+        );
+        assert!(!attached, "关语音必须回退为立即广播");
+        assert!(state.tts_mgr.dequeue_speak().is_none(), "关语音不得入播报队列");
+        let sink = logging::take_history_sink();
+        assert_eq!(sink.len(), 1, "回退路径同样必须留档一次: {:?}", sink);
+
+        // ② 播报队满：入队失败同样回退立即广播（随行气泡走高优先队列，须填满优先队列）
+        for i in 0..tts::MAX_SPEAK_QUEUE {
+            assert!(state.tts_mgr.enqueue_speak(&format!("t{}", i), "u", true));
+        }
+        let attached = deliver_checkin_reply(
+            None,
+            Some(&state.tts_mgr),
+            true,
+            "u_bubble_full",
+            "队满舰长",
+            "队满舰长打卡成功",
+            false,
+        );
+        assert!(!attached, "队满必须回退为立即广播");
+        let sink = logging::take_history_sink();
+        assert_eq!(sink.len(), 1, "队满回退路径同样必须留档一次: {:?}", sink);
+        println!("[PASS] test_checkin_reply_bubble_emits_immediately_without_voice_or_queue_full passed");
     }
 
     /// 字段不齐的畸形弹幕不得留档成「 说：」
