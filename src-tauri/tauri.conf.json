@@ -21,7 +21,8 @@
         "minWidth": 800,
         "minHeight": 550,
         "resizable": true,
-        "dragDropEnabled": false
+        "dragDropEnabled": false,
+        "zoomHotkeysEnabled": true
       },
       {
         "label": "overlay",
