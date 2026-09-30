@@ -148,6 +148,10 @@ pub struct AppState {
     pub startup_missing: Arc<Vec<String>>,
     /// 最近一次「打卡不可用」提示的时间戳（用于高频 LIKE 通道的节流）
     pub last_checkin_unavailable_at: Arc<std::sync::atomic::AtomicI64>,
+    /// 打卡 AI 回复失败待重试表：uid → 当日失败上下文（仅内存，重启即清）。
+    /// 首次打卡的 AI 链路失败时登记，当日再次打卡时凭此重试 AI 回复；
+    /// AI 定稿成功即清除。Lite 构建下打卡链路整体停用，该表恒空
+    pub checkin_ai_retry: Arc<Mutex<HashMap<String, CheckinAiRetryContext>>>,
 }
 
 impl Default for AppState {
@@ -261,6 +265,7 @@ impl Default for AppState {
             pending_pos: Arc::new(Mutex::new(None)),
             startup_missing: Arc::new(Vec::new()),
             last_checkin_unavailable_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            checkin_ai_retry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -313,6 +318,27 @@ impl AppState {
             access_key_secret: pick(&snap.creds.access_key_secret, &cfg.access_key_secret),
             id_code: cfg.id_code.clone(),
         }
+    }
+
+    /// AI 打卡回复定稿失败：登记（或覆写）该用户当日待重试上下文，
+    /// 并顺手清掉其他过期日期的条目（跨日失效，防表无限膨胀）
+    fn mark_checkin_ai_failed(&self, uid: &str, ctx: CheckinAiRetryContext) {
+        let mut map = self.checkin_ai_retry.lock().unwrap();
+        map.retain(|_, c| c.checkin_date == ctx.checkin_date);
+        map.insert(uid.to_string(), ctx);
+    }
+
+    /// AI 打卡回复定稿成功：清除该用户的待重试标记（无论哪日遗留）
+    fn clear_checkin_ai_failed(&self, uid: &str) {
+        self.checkin_ai_retry.lock().unwrap().remove(uid);
+    }
+
+    /// 读取当日有效的待重试上下文：标记日期与本次打卡日期一致才有效
+    fn pending_checkin_ai_retry(&self, uid: &str, checkin_date: i32) -> Option<CheckinAiRetryContext> {
+        let map = self.checkin_ai_retry.lock().unwrap();
+        map.get(uid)
+            .filter(|c| c.checkin_date == checkin_date)
+            .cloned()
     }
 }
 
@@ -1191,6 +1217,22 @@ fn build_food_order_text(msg: &str, uname: &str) -> Option<String> {
     ))
 }
 
+/// 打卡 AI 回复失败后的「当日待重试」上下文（仅内存态，重启即清，不落盘）。
+///
+/// 记录**首次打卡当时**的档案快照：重试发生在 `already_checked_in` 分支，
+/// 那时档案的 `last_checkin_date` 已被更新为当日，必须用快照里的落库前值
+/// 才能构造出与首次一致的提示词（「上次打卡」字段不错位）。
+#[derive(Clone, Debug)]
+pub struct CheckinAiRetryContext {
+    /// 失败当日（YYYYMMDD，口径为首次打卡时的弹幕服务器日期）；跨日自动失效——
+    /// 次日打卡本就是新的首次打卡，会重新走 AI 路径，残留条目按过期忽略
+    pub checkin_date: i32,
+    pub continuous_days: i32,
+    pub cumulative_days: i32,
+    /// 首次打卡落库**前**的上次打卡日期
+    pub last_checkin_date_before: i32,
+}
+
 /// 打卡回复统一投递：留档 + 气泡按 TTS 播放时机显示（D4）
 ///
 /// 留档在这里**最终确定**，是留档的唯一时机（无语音、AI 失败回退、队满都不影响这条留档）。
@@ -1267,12 +1309,50 @@ fn finalize_checkin_reply(
     (text, is_ai)
 }
 
+/// AI 打卡回复定稿后的待重试状态维护句柄（随 spawn 任务走）。
+///
+/// `spawn` 路径上 `is_ai=false` 当且仅当 AI 链路失败（Ok 才定稿 AI 文案），
+/// 据此在定稿后登记／清除「当日待重试」：链路失败 → 下一次打卡必须再次尝试 AI 回复。
+/// 但鉴权类失败（Key 失效等持久性配置问题，[`ai::is_auth_error`]）重试无意义：
+/// 不登记并清除已有标记，避免对着无效 Key 反复打 API。
+struct CheckinAiRetryGuard {
+    state: AppState,
+    user_id: String,
+    ctx: CheckinAiRetryContext,
+}
+
+impl CheckinAiRetryGuard {
+    fn new(state: &AppState, user_id: String, ctx: CheckinAiRetryContext) -> Self {
+        Self {
+            state: state.clone(),
+            user_id,
+            ctx,
+        }
+    }
+
+    /// `auth_failure` 仅在 `is_ai=false` 时有意义（Key 失效等持久性错误）
+    fn settle(self, is_ai: bool, auth_failure: bool) {
+        if is_ai {
+            self.state.clear_checkin_ai_failed(&self.user_id);
+        } else if auth_failure {
+            crate::log_info!(
+                "[CheckinAI] AI 鉴权失败（API Key 无效/未配置），本次不登记回复重试: {}",
+                self.user_id
+            );
+            self.state.clear_checkin_ai_failed(&self.user_id);
+        } else {
+            self.state.mark_checkin_ai_failed(&self.user_id, self.ctx);
+        }
+    }
+}
+
 /// AI 打卡回复的后台任务体：调用模型 → 定稿（留档 + 气泡投递）。
 ///
 /// 抽成独立的 async 函数，使**生产（`spawn`）与单测执行同一份代码**：
 /// 单测可用 `block_on` 直接驱动它（`call_api` 在 Key 为空时立即返回 `Err`，
 /// 不产生网络请求），从而在测试线程上观测留档——若把留档留在 `spawn` 的闭包里，
 /// `logging` 的线程局部探针在测试线程上永远看不到，AI 分支的留档行为就没人守护。
+#[allow(clippy::too_many_arguments)]
 fn spawn_checkin_ai_reply(
     provider: Arc<DeepSeekAIChatProvider>,
     prompt: String,
@@ -1282,14 +1362,17 @@ fn spawn_checkin_ai_reply(
     fallback: String,
     enable_voice: bool,
     tts: Arc<TTSManager>,
+    retry: CheckinAiRetryGuard,
 ) -> impl std::future::Future<Output = ()> + Send {
     async move {
         let result = provider
             .call_api(&prompt, Some(ai::SYSTEM_PROMPT_CHECKIN))
             .await;
+        // 鉴权类失败（Key 失效等持久性配置问题）不参与重试登记
+        let auth_failure = result.is_err() && ai::is_auth_error(result.as_ref().unwrap_err());
         // 定稿即留档（唯一入口）；气泡随播报任务走、真正出声才显示，
         // 留档与气泡都不依赖语音开关的后续状态（队满/合成失败各有回退路径）
-        finalize_checkin_reply(
+        let (_, is_ai) = finalize_checkin_reply(
             app_handle.as_ref(),
             Some(&tts),
             enable_voice,
@@ -1298,7 +1381,34 @@ fn spawn_checkin_ai_reply(
             result,
             fallback,
         );
+        // 按定稿结果维护待重试状态：瞬时链路失败登记当日上下文，
+        // 让下一次打卡（含当日重复打卡）必须再次尝试 AI 回复
+        retry.settle(is_ai, auth_failure);
     }
+}
+
+/// 构造打卡 AI 用户消息：学习档案读取属增强信息，不可用时退回空档案，不影响本次回复
+fn build_checkin_ai_prompt(
+    state: &AppState,
+    danmu: &bilibili::DanmuData,
+    continuous_days: i32,
+    cumulative_days: i32,
+    checkin_date: i32,
+    last_checkin_date: i32,
+) -> String {
+    let learning = state
+        .checkin_mgr
+        .as_ref()
+        .map(|m| m.load_learning(&danmu.user_id))
+        .unwrap_or_default();
+    checkin_ai::build_prompt(&checkin_ai::CheckinContext {
+        username: &danmu.user_name,
+        continuous_days,
+        cumulative_days,
+        checkin_date,
+        last_checkin_date,
+        profile: &learning,
+    })
 }
 
 /// 首次打卡回复：舰长且已配置 AI Key 时异步生成个性化回复（失败/未配置回退兜底文案），
@@ -1333,22 +1443,25 @@ fn schedule_checkin_reply(
         return;
     }
 
-    let prompt = {
-        // 学习档案读取属增强信息：不可用时退回空档案，不影响本次打卡回复
-        let learning = state
-            .checkin_mgr
-            .as_ref()
-            .map(|m| m.load_learning(&danmu.user_id))
-            .unwrap_or_default();
-        checkin_ai::build_prompt(&checkin_ai::CheckinContext {
-            username: &danmu.user_name,
+    let checkin_date = checkin::CheckinManager::date_to_int(danmu_date);
+    let prompt = build_checkin_ai_prompt(
+        state,
+        danmu,
+        profile.continuous_days,
+        profile.cumulative_days,
+        checkin_date,
+        last_checkin_date_before,
+    );
+    let retry = CheckinAiRetryGuard::new(
+        state,
+        danmu.user_id.clone(),
+        CheckinAiRetryContext {
+            checkin_date,
             continuous_days: profile.continuous_days,
             cumulative_days: profile.cumulative_days,
-            checkin_date: checkin::CheckinManager::date_to_int(danmu_date),
-            last_checkin_date: last_checkin_date_before,
-            profile: &learning,
-        })
-    };
+            last_checkin_date_before,
+        },
+    );
 
     let provider = state.ai_provider.clone();
     let tts = state.tts_mgr.clone();
@@ -1366,7 +1479,69 @@ fn schedule_checkin_reply(
         fallback,
         enable_voice,
         tts,
+        retry,
     ));
+}
+
+/// 重试上次失败的 AI 打卡回复：首次打卡满足了 AI 回复条件（舰长 + 已配置 Key）
+/// 但整条链路失败时，当日再次打卡必须再次尝试 AI 回复，而不是只回「今日已打卡」。
+///
+/// 提示词的天数与「上次打卡」取首次打卡时的档案快照（重试时档案已落库为当日，
+/// 直接读会错位）；昵称与学习档案用当前值。成功 → AI 文案并清除标记；
+/// 再次失败 → 重复打卡文案兜底（重试是额外机会，事实是「今日已打卡」）并保留标记，
+/// 下一次打卡继续重试。重试门槛与首次一致（舰长 + 已配置 Key），由调用方 gate。
+fn schedule_checkin_ai_retry(
+    app_handle: Option<&AppHandle>,
+    state: &AppState,
+    cfg: &AppConfig,
+    danmu: &bilibili::DanmuData,
+    ctx: CheckinAiRetryContext,
+) {
+    let prompt = build_checkin_ai_prompt(
+        state,
+        danmu,
+        ctx.continuous_days,
+        ctx.cumulative_days,
+        ctx.checkin_date,
+        ctx.last_checkin_date_before,
+    );
+    let fallback = format!(
+        "{}今日已打卡，连续{}天，累计{}天",
+        danmu.user_name, ctx.continuous_days, ctx.cumulative_days
+    );
+    let retry = CheckinAiRetryGuard::new(state, danmu.user_id.clone(), ctx);
+
+    let provider = state.ai_provider.clone();
+    let tts = state.tts_mgr.clone();
+    let enable_voice = cfg.enable_voice;
+    let handle = app_handle.cloned();
+    let user_id = danmu.user_id.clone();
+    let user_name = danmu.user_name.clone();
+
+    tauri::async_runtime::spawn(spawn_checkin_ai_reply(
+        provider,
+        prompt,
+        handle,
+        user_id,
+        user_name,
+        fallback,
+        enable_voice,
+        tts,
+        retry,
+    ));
+}
+
+/// 重复打卡时的 AI 重试判定：门槛与首次打卡一致（舰长 + 已配置 Key），
+/// 且存在**当日**的 AI 链路失败标记（跨日标记自动失效——次日打卡是新的首次打卡）。
+fn resolve_checkin_ai_retry(
+    state: &AppState,
+    danmu: &bilibili::DanmuData,
+    checkin_date: i32,
+) -> Option<CheckinAiRetryContext> {
+    if danmu.guard_level <= 0 || !state.ai_provider.is_configured() {
+        return None;
+    }
+    state.pending_checkin_ai_retry(&danmu.user_id, checkin_date)
 }
 
 /// 解析打卡触发词：按英文/中文逗号分割并去除首尾空白
@@ -1538,20 +1713,35 @@ pub fn handle_incoming_danmu(
                         }
 
                         if outcome.already_checked_in {
-                            // 重复打卡文案（C5，对齐原工程 repeatedAnswer）
-                            let reply = format!(
-                                "{}今日已打卡，连续{}天，累计{}天",
-                                danmu.user_name, profile.continuous_days, profile.cumulative_days
-                            );
-                            deliver_checkin_reply(
-                                app_handle,
-                                Some(&state.tts_mgr),
-                                cfg.enable_voice,
-                                &danmu.user_id,
-                                &danmu.user_name,
-                                &reply,
-                                false,
-                            );
+                            match resolve_checkin_ai_retry(
+                                state,
+                                &danmu,
+                                checkin::CheckinManager::date_to_int(danmu_date),
+                            ) {
+                                Some(ctx) => {
+                                    crate::log_info!(
+                                        "[CheckinAI] 上次打卡 AI 回复失败，本次打卡重试 AI 回复: {}",
+                                        danmu.user_id
+                                    );
+                                    schedule_checkin_ai_retry(app_handle, state, &cfg, &danmu, ctx);
+                                }
+                                None => {
+                                    // 重复打卡文案（C5，对齐原工程 repeatedAnswer）
+                                    let reply = format!(
+                                        "{}今日已打卡，连续{}天，累计{}天",
+                                        danmu.user_name, profile.continuous_days, profile.cumulative_days
+                                    );
+                                    deliver_checkin_reply(
+                                        app_handle,
+                                        Some(&state.tts_mgr),
+                                        cfg.enable_voice,
+                                        &danmu.user_id,
+                                        &danmu.user_name,
+                                        &reply,
+                                        false,
+                                    );
+                                }
+                            }
                         } else {
                             schedule_checkin_reply(
                                 app_handle,
@@ -3368,6 +3558,7 @@ impl AppState {
             pending_pos: Arc::new(Mutex::new(None)),
             startup_missing: Arc::new(Vec::new()),
             last_checkin_unavailable_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            checkin_ai_retry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -4586,6 +4777,16 @@ mod tests {
             "留档舰长连续第3天打卡！累计9天".into(),
             false, // 关语音：留档不得依赖语音开关
             state.tts_mgr.clone(),
+            CheckinAiRetryGuard::new(
+                &state,
+                "ai_hist_cap".into(),
+                CheckinAiRetryContext {
+                    checkin_date: 20260930,
+                    continuous_days: 3,
+                    cumulative_days: 9,
+                    last_checkin_date_before: 0,
+                },
+            ),
         ));
 
         let after_body = logging::take_history_sink();
@@ -4601,6 +4802,297 @@ mod tests {
             after_body
         );
         println!("[PASS] test_ai_checkin_reply_is_archived_once passed");
+    }
+
+    /// 带超时轮询条件（AI 定稿在后台线程完成，测试需等它的可观测结果）
+    #[cfg(not(feature = "lite"))]
+    fn wait_for(cond: impl Fn() -> bool, msg: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("等待超时: {}", msg);
+    }
+
+    /// 带超时轮询 TTS 队列，取出指定文案的播报任务
+    #[cfg(not(feature = "lite"))]
+    fn wait_for_task(mgr: &TTSManager, text: &str) -> tts::SpeakTask {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(task) = mgr.dequeue_speak() {
+                if task.text == text {
+                    return task;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("等待超时: 未见文案「{}」的播报任务", text);
+    }
+
+    /// AI 链路失败待重试状态的生命周期：失败登记、覆写取新、跨日失效、成功清除、
+    /// 登记时顺手清理其他用户的过期条目（防表无限膨胀）
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_checkin_ai_retry_state_lifecycle() {
+        let state = AppState::new_test();
+        let uid = "retry_cap";
+        let ctx_day = CheckinAiRetryContext {
+            checkin_date: 20260930,
+            continuous_days: 3,
+            cumulative_days: 9,
+            last_checkin_date_before: 20260928,
+        };
+
+        // 失败 settle：登记当日上下文（快照字段完整保留，重试提示词靠它不错位）
+        CheckinAiRetryGuard::new(&state, uid.into(), ctx_day.clone()).settle(false, false);
+        let pending = state
+            .pending_checkin_ai_retry(uid, 20260930)
+            .expect("失败后应有当日待重试标记");
+        assert_eq!(pending.continuous_days, 3);
+        assert_eq!(pending.cumulative_days, 9);
+        assert_eq!(pending.last_checkin_date_before, 20260928);
+
+        // 跨日失效：非登记日读取为 None（次日打卡是新的首次打卡，标记无意义）
+        assert!(state.pending_checkin_ai_retry(uid, 20261001).is_none());
+
+        // 再次失败：覆写以最新快照为准
+        let ctx_v2 = CheckinAiRetryContext {
+            cumulative_days: 10,
+            ..ctx_day.clone()
+        };
+        CheckinAiRetryGuard::new(&state, uid.into(), ctx_v2).settle(false, false);
+        assert_eq!(
+            state
+                .pending_checkin_ai_retry(uid, 20260930)
+                .expect("覆写后标记仍在")
+                .cumulative_days,
+            10,
+            "再次失败必须以最新快照覆写"
+        );
+
+        // 鉴权类失败（Key 失效等持久性配置问题）：清除标记而非登记，
+        // 避免对着无效 Key 每次打卡都打一次 API
+        CheckinAiRetryGuard::new(&state, uid.into(), ctx_day.clone()).settle(false, true);
+        assert!(
+            state.pending_checkin_ai_retry(uid, 20260930).is_none(),
+            "鉴权失败必须清除待重试标记，不得登记"
+        );
+
+        // 过期条目清理：登记新条目时，其他用户的过期日期条目一并清除
+        CheckinAiRetryGuard::new(
+            &state,
+            "stale_cap".into(),
+            CheckinAiRetryContext {
+                checkin_date: 20260901,
+                continuous_days: 1,
+                cumulative_days: 1,
+                last_checkin_date_before: 0,
+            },
+        )
+        .settle(false, false);
+        CheckinAiRetryGuard::new(
+            &state,
+            "fresh_cap".into(),
+            CheckinAiRetryContext {
+                checkin_date: 20260930,
+                continuous_days: 1,
+                cumulative_days: 1,
+                last_checkin_date_before: 0,
+            },
+        )
+        .settle(false, false);
+        {
+            let map = state.checkin_ai_retry.lock().unwrap();
+            assert!(!map.contains_key("stale_cap"), "过期日期条目应被清理: {:?}", map.keys());
+            assert!(map.contains_key("fresh_cap"));
+        }
+
+        // 成功 settle：清除该用户标记（无论哪日遗留）
+        CheckinAiRetryGuard::new(&state, uid.into(), ctx_day).settle(true, false);
+        assert!(
+            state.pending_checkin_ai_retry(uid, 20260930).is_none(),
+            "AI 成功必须清除待重试标记"
+        );
+        println!("[PASS] test_checkin_ai_retry_state_lifecycle passed");
+    }
+
+    /// 重试判定门槛：舰长 + 已配置 Key + 当日失败标记，三者缺一不放行
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_checkin_ai_retry_gate_conditions() {
+        let state = AppState::new_test();
+        state.ai_provider.set_api_key("test_key".into());
+        let danmu = bilibili::DanmuData {
+            user_id: "gate_cap".into(),
+            user_name: "门槛舰长".into(),
+            message: "打卡".into(),
+            timestamp: 1000,
+            has_medal: false,
+            medal_level: 0,
+            guard_level: 3,
+            msg_id: "gate_1".into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+        let ctx = CheckinAiRetryContext {
+            checkin_date: 20260930,
+            continuous_days: 2,
+            cumulative_days: 5,
+            last_checkin_date_before: 0,
+        };
+        CheckinAiRetryGuard::new(&state, "gate_cap".into(), ctx.clone()).settle(false, false);
+
+        // 命中：舰长 + Key 配置 + 当日标记
+        let hit = resolve_checkin_ai_retry(&state, &danmu, 20260930).expect("满足条件必须放行重试");
+        assert_eq!(hit.checkin_date, 20260930);
+
+        // 非舰长不放行（普通用户打卡从未走 AI，无重试一说）
+        let mut non_guard = danmu.clone();
+        non_guard.guard_level = 0;
+        assert!(resolve_checkin_ai_retry(&state, &non_guard, 20260930).is_none());
+
+        // Key 未配置不放行
+        let state_nokey = AppState::new_test();
+        CheckinAiRetryGuard::new(&state_nokey, "gate_cap2".into(), ctx).settle(false, false);
+        let mut dm2 = danmu.clone();
+        dm2.user_id = "gate_cap2".into();
+        assert!(resolve_checkin_ai_retry(&state_nokey, &dm2, 20260930).is_none());
+
+        // 标记日期与本次打卡日期不符（跨日）不放行
+        assert!(resolve_checkin_ai_retry(&state, &danmu, 20261001).is_none());
+        println!("[PASS] test_checkin_ai_retry_gate_conditions passed");
+    }
+
+    /// 端到端：舰长首次打卡 AI 链路失败（endpoint 指向必然拒绝连接的回环端口，
+    /// 走完整 HTTP 链路但毫秒级失败，无真实网络）→ 登记当日待重试 →
+    /// 当日再次打卡**必须再次尝试 AI 回复**（重试调度日志为证）→
+    /// 重试再次失败仍兜底重复打卡文案（回复不静默）且保留标记，下一次打卡继续重试
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_checkin_ai_retry_on_repeated_checkin_end_to_end() {
+        let mut state = AppState::new_test();
+        state.ai_provider.set_api_key("test_key".into());
+        // endpoint 指向必然拒绝连接的回环端口：call_api 走完整 HTTP 链路但毫秒级失败，
+        // 无真实网络。测试态 provider 的 Arc 此刻仅被 state 持有，可 get_mut 独占改写
+        Arc::get_mut(&mut state.ai_provider)
+            .expect("测试态 provider 的 Arc 应独占")
+            .endpoint = "http://127.0.0.1:9/chat/completions".into();
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let dm = bilibili::DanmuData {
+            user_id: "e2e_retry_cap".into(),
+            user_name: "重试舰长".into(),
+            message: "打卡".into(),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 15,
+            guard_level: 3,
+            msg_id: "e2e_retry_1".into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        // ① 首次打卡：Key 已配置 → AI 链路失败 → 兜底文案 + 当日待重试登记
+        let _ = handle_incoming_danmu(None, &state, dm.clone());
+        let today = checkin::CheckinManager::date_to_int(
+            bilibili::server_date(now_ts).unwrap_or_else(|| chrono::Local::now().date_naive()),
+        );
+        wait_for(
+            || state.pending_checkin_ai_retry("e2e_retry_cap", today).is_some(),
+            "AI 链路失败后必须登记当日待重试标记",
+        );
+        let first = state.tts_mgr.dequeue_speak().expect("首次失败的兜底文案应入队");
+        assert_eq!(first.text, "重试舰长连续第1天打卡！累计1天");
+        assert!(first.is_checkin);
+
+        // ② 当日再次打卡：必须再次尝试 AI 回复（重试调度日志为证），回复异步产生
+        let dm2 = bilibili::DanmuData {
+            msg_id: "e2e_retry_2".into(),
+            timestamp: now_ts + 10,
+            ..dm.clone()
+        };
+        let _ = handle_incoming_danmu(None, &state, dm2);
+        assert!(
+            logging::recent_entries(500, None)
+                .iter()
+                .any(|e| e.message.contains("本次打卡重试 AI 回复")),
+            "重复打卡必须触发 AI 重试调度"
+        );
+
+        // ③ 重试再次失败：兜底重复打卡文案（回复不静默消失），标记保留供下一次继续重试
+        let retried = wait_for_task(&state.tts_mgr, "重试舰长今日已打卡，连续1天，累计1天");
+        assert!(retried.is_checkin);
+        assert!(
+            state.pending_checkin_ai_retry("e2e_retry_cap", today).is_some(),
+            "重试失败后标记必须保留，下一次打卡继续重试"
+        );
+        println!("[PASS] test_checkin_ai_retry_on_repeated_checkin_end_to_end passed");
+    }
+
+    /// 端到端：API Key 失效（本地 mock 返回 HTTP 401，无真实网络）→
+    /// 兜底文案照发，但**不登记**待重试标记——持久性配置问题重试无意义，
+    /// 避免对着失效 Key 在每次打卡时反复打 API（401/403/Key 未配置同判）
+    #[cfg(not(feature = "lite"))]
+    #[test]
+    fn test_checkin_ai_no_retry_on_auth_failure_end_to_end() {
+        let mut state = AppState::new_test();
+        state.ai_provider.set_api_key("test_key".into());
+
+        // 本地一次性 mock：接受一个连接，读掉请求后回 HTTP 401
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定测试端口失败");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let _ = std::io::Write::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+                );
+                // 立即关闭会先于客户端读响应触发 RST（Windows 实测竞态），
+                // reqwest 将报「error sending request」而非 401——保持连接片刻再关
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        });
+        Arc::get_mut(&mut state.ai_provider)
+            .expect("测试态 provider 的 Arc 应独占")
+            .endpoint = format!("http://127.0.0.1:{}/chat/completions", port);
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let dm = bilibili::DanmuData {
+            user_id: "auth_fail_cap".into(),
+            user_name: "鉴权舰长".into(),
+            message: "打卡".into(),
+            timestamp: now_ts,
+            has_medal: true,
+            medal_level: 15,
+            guard_level: 3,
+            msg_id: "auth_fail_1".into(),
+            is_paid_gift: false,
+            has_history_required_fields: true,
+        };
+
+        // 首次打卡：AI 链路 401 → 兜底文案照发，但不得登记重试标记
+        let _ = handle_incoming_danmu(None, &state, dm);
+        let today = checkin::CheckinManager::date_to_int(
+            bilibili::server_date(now_ts).unwrap_or_else(|| chrono::Local::now().date_naive()),
+        );
+        wait_for_task(&state.tts_mgr, "鉴权舰长连续第1天打卡！累计1天");
+        server.join().expect("mock 服务器线程失败");
+
+        // settle 紧随 deliver（同一任务体内无 await 相隔），留出窗口做负向断言
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                state.pending_checkin_ai_retry("auth_fail_cap", today).is_none(),
+                "鉴权失败不得登记待重试标记"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        println!("[PASS] test_checkin_ai_no_retry_on_auth_failure_end_to_end passed");
     }
 
     /// 气泡与 TTS 播放时机同步：语音开启时打卡回复气泡随播报任务挂载，

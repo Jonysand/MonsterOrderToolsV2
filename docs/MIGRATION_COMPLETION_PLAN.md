@@ -371,6 +371,7 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **移除覆写**：`record_checkin` 不再写 `last_danmu_timestamp`（该列改由学习链路独占写入），INSERT 列集同步收窄。
 - **回读真实值**：返回值改为落库后回读 `user_profiles` 行（`created_at / last_danmu_timestamp` 等以库内既有值为准）。
 - **重复打卡文案**：「{name}今日已打卡，连续X天，累计Y天」（对齐原工程 `repeatedAnswer`），不再重复播报首次文案。
+- **AI 失败重试（有意增强，原工程无）**：首次打卡满足 AI 条件（舰长 + 已配置 Key）但整条链路失败时，登记该用户**当日**待重试上下文（`AppState.checkin_ai_retry`，仅内存不落盘）；当日再次打卡必须**再次尝试 AI 回复**（门槛与首次一致），成功即清除标记，再次失败兜底重复打卡文案并保留标记供继续重试；跨日标记自动失效（次日打卡是新的首次打卡）。**鉴权类失败不重试**（`ai::is_auth_error`：HTTP 401/403、Key 未配置——持久性配置问题重试无意义，不登记且清除已有标记，避免对着失效 Key 反复打 API；402 余额不足充值即恢复，保持重试）。重试提示词的天数与「上次打卡」取首次打卡时的档案快照，避免重复读取落库后的档案导致字段错位。验收：`test_checkin_ai_retry_state_lifecycle`、`test_checkin_ai_retry_gate_conditions`、`test_checkin_ai_retry_on_repeated_checkin_end_to_end`、`test_checkin_ai_no_retry_on_auth_failure_end_to_end`。
 - **打卡日期口径**：改用弹幕服务器时间（原工程 `sendDate` = `localtime(serverTimestamp)`，`bilibili::server_date`），时间戳缺失时回退本机今天；点赞日期同口径。
 - **落库时机**：**保留即时落库**（用户决策）——AI/TTS 失败不丢打卡记录；与原工程「AI/TTS 成功后落库」的差异在本文档标注为有意差异。
 - **验收**：`test_simulate_danmu_checkin_flow`（`last_danmu_timestamp == 0` 断言 + 重复打卡文案）。

@@ -52,6 +52,19 @@ pub const SYSTEM_PROMPT_CHECKIN: &str = concat!(
 /// 若将来放宽超时，需同步评估单次调用可能生成 384K token 的费用风险。
 pub const MAX_TOKENS: u32 = 384_000;
 
+/// 鉴权类失败判定：Key 无效／无权限／未配置等**持久性配置问题**，重试毫无意义，
+/// 调用方据此不登记打卡 AI 的「当日待重试」并清除已有标记
+/// （与连接链路 `classify_start_error` 对鉴权类停止重试的处置同一思想）。
+///
+/// 匹配 [`DeepSeekAIChatProvider::call_api`] 的错误串格式
+/// `DeepSeek API error HTTP {status}: {text}` 与 `DeepSeek API key is empty`：
+/// - 401 未授权 / 403 禁止 → 鉴权失败，不重试；
+/// - 402 余额不足**不算**：充值后立即恢复，保持重试可让当天补上 AI 回复；
+/// - 429 限流、5xx、超时、连接失败、响应解析失败均为瞬时或非配置问题，保持重试。
+pub fn is_auth_error(err: &str) -> bool {
+    err.contains("HTTP 401") || err.contains("HTTP 403") || err.contains("API key is empty")
+}
+
 /// DeepSeek 思考模式客户端（模型 deepseek-flash）
 pub struct DeepSeekAIChatProvider {
     pub api_key: Mutex<String>,
@@ -310,6 +323,37 @@ mod tests {
             SYSTEM_PROMPT_CHECKIN
         );
         println!("[PASS] test_checkin_system_prompt_rule_contract passed");
+    }
+
+    /// 鉴权类失败分类：401/403/Key 未配置为持久性配置问题（不重试），
+    /// 402 余额不足、429 限流、5xx、超时与解析失败均保持重试
+    #[test]
+    fn test_auth_error_classification() {
+        // 鉴权类：不登记重试
+        assert!(is_auth_error(
+            "DeepSeek API error HTTP 401 Unauthorized: {\"error\":{}}"
+        ));
+        assert!(is_auth_error("DeepSeek API error HTTP 403 Forbidden: {}"));
+        assert!(is_auth_error("DeepSeek API key is empty"));
+
+        // 瞬时或非配置失败：保持重试
+        assert!(!is_auth_error("HTTP request error: operation timed out"));
+        assert!(!is_auth_error("HTTP request error: connection refused"));
+        assert!(!is_auth_error(
+            "DeepSeek API error HTTP 402 Payment Required: Insufficient Balance"
+        ));
+        assert!(!is_auth_error(
+            "DeepSeek API error HTTP 429 Too Many Requests: rate limited"
+        ));
+        assert!(!is_auth_error("DeepSeek API error HTTP 500: internal error"));
+        assert!(!is_auth_error("JSON parse error: expected value"));
+        assert!(!is_auth_error(
+            "DeepSeek response not complete: finish_reason=length, content=0 chars, reasoning=1000 chars"
+        ));
+        assert!(!is_auth_error(
+            "Empty content in DeepSeek response (finish_reason=stop, reasoning=10 chars ignored)"
+        ));
+        println!("[PASS] test_auth_error_classification passed");
     }
 
     #[test]
