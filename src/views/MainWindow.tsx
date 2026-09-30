@@ -21,6 +21,7 @@ import {
 import { VirtualList } from "../components/VirtualList";
 import { MarqueeText } from "../components/MarqueeText";
 import { MonsterListTab } from "./MonsterListTab";
+import { RandomDrawTab } from "./RandomDrawTab";
 import { MonsterPickerPanel, PickerOrderPayload } from "../components/MonsterPickerPanel";
 import {
   Shield,
@@ -29,6 +30,7 @@ import {
   Sliders,
   Users,
   CalendarCheck,
+  Dices,
   Download,
   Search,
   Gift,
@@ -64,8 +66,13 @@ const QUEUE_ROW_HEIGHT = 54;
 
 export const MainWindow: React.FC = () => {
   const [activeTab, setActiveTab] = useState<
-    "queue" | "monster" | "bili" | "gm" | "settings"
+    "queue" | "monster" | "draw" | "bili" | "gm" | "settings"
   >("bili");
+  /**
+   * 待点单的怪物（「随机抽选」→「送去点单」）。
+   * 选怪面板消费后立即清空 —— 否则每次切回排队页签都会重新预选同一只。
+   */
+  const [pickerPreset, setPickerPreset] = useState<string | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   // 编译期形态常量（vite --mode lite 注入）：完整版 false / Lite 版 true，运行期不可切换
   const isLite = __IS_LITE__;
@@ -76,6 +83,12 @@ export const MainWindow: React.FC = () => {
   const queueSnapRef = useRef<QueueSnapshot>({ items: [], revision: 0, persistence: "Saved" });
   /** 磁盘落盘异常提示（内存已更新、磁盘待重试），成功后自动收起 */
   const [queueSaveWarning, setQueueSaveWarning] = useState(false);
+
+  /** 「送去点单」：切到排队页签并把抽到的怪预填进选怪面板 */
+  const sendToOrder = (monsterName: string) => {
+    setPickerPreset(monsterName);
+    setActiveTab("queue");
+  };
 
   // 怪物字典与禁点名单（名单内的怪不可被点：弹幕点怪与选怪面板共享同一份约束）
   const [monsterDict, setMonsterDict] = useState<MonsterDict>({});
@@ -833,6 +846,19 @@ export const MainWindow: React.FC = () => {
               </span>
             </button>
 
+            {/* 随机抽选：完整版与 Lite 版均支持（不依赖 TTS / 打卡 / AI，属点怪周边的核心玩法） */}
+            <button
+              onClick={() => setActiveTab("draw")}
+              className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-bold transition ${
+                activeTab === "draw"
+                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                  : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200"
+              }`}
+            >
+              <Dices className="w-4 h-4" />
+              <span>随机抽选</span>
+            </button>
+
             {/* 舰长打卡 & GM：Lite 构建下无此功能，页签入口整体隐藏（无占位、无提示） */}
             {!isLite && (
               <button
@@ -880,6 +906,7 @@ export const MainWindow: React.FC = () => {
             <h1 className="text-sm font-bold text-neutral-200">
               {activeTab === "queue" && "点单排队管理"}
               {activeTab === "monster" && "怪物名单与禁点配置"}
+              {activeTab === "draw" && "随机抽选武器与怪物"}
               {activeTab === "bili" && "B 站开放平台直播间连接与监控"}
               {activeTab === "gm" && !isLite && "舰长周打卡系统与 GM 运维管理"}
               {activeTab === "settings" && "系统全局持久化参数设置"}
@@ -918,6 +945,8 @@ export const MainWindow: React.FC = () => {
                     dict={monsterDict}
                     roster={roster}
                     submitting={orderSubmitting}
+                    presetMonster={pickerPreset}
+                    onPresetConsumed={() => setPickerPreset(null)}
                     onSubmit={handlePickerOrder}
                   />
                 </section>
@@ -1081,7 +1110,17 @@ export const MainWindow: React.FC = () => {
           )}
 
 
-          {/* 3. 直播连接 TAB */}
+          {/* 3. 随机抽选 TAB（完整版与 Lite 版均支持） */}
+          {activeTab === "draw" && (
+            <RandomDrawTab
+              dict={monsterDict}
+              roster={roster}
+              onSendToOrder={sendToOrder}
+              toast={showToast}
+            />
+          )}
+
+          {/* 4. 直播连接 TAB */}
           {activeTab === "bili" && (
             <div className="max-w-3xl space-y-6">
               <div className="bg-neutral-900/70 border border-neutral-800 rounded-xl p-5 space-y-4">
@@ -1178,7 +1217,7 @@ export const MainWindow: React.FC = () => {
             </div>
           )}
 
-          {/* 4. 舰长打卡 & GM 运维 TAB：Lite 构建下无此功能，整页隐藏（导航入口一并隐藏） */}
+          {/* 5. 舰长打卡 & GM 运维 TAB：Lite 构建下无此功能，整页隐藏（导航入口一并隐藏） */}
           {activeTab === "gm" && !isLite && (
             <div className="space-y-6">
               <div className="grid grid-cols-12 gap-6">

@@ -4,6 +4,7 @@ pub mod checkin;
 pub mod checkin_ai;
 pub mod config;
 pub mod credentials;
+pub mod draw;
 pub mod logging;
 pub mod manbo_voices;
 pub mod monster;
@@ -19,6 +20,7 @@ use ai::DeepSeekAIChatProvider;
 use checkin::CheckinManager;
 use config::AppConfig;
 use credentials::{Credentials, CredentialsStatus};
+use draw::{DrawSettings, DrawSettingsManager};
 use monster::MonsterDataManager;
 use queue::{QueueItem, QueueManager, QueuePersistence, QueueSnapshot};
 use roster::{MonsterRoster, RosterData};
@@ -116,6 +118,9 @@ pub struct AppState {
     pub monster_mgr: Arc<MonsterDataManager>,
     /// 点怪禁点名单（名单内的怪物不可被点单；弹幕与选怪面板共享同一份约束）
     pub roster: Arc<MonsterRoster>,
+    /// 随机抽选设置（作品筛选 / 排除名单 / 模式与节奏）。
+    /// 纯前端功能的偏好持久化，不参与点怪链路；与 `roster` 相互独立（语义不同）
+    pub draw_settings: Arc<DrawSettingsManager>,
     pub checkin_mgr: Option<Arc<CheckinManager>>,
     /// 打卡可用性状态：不可用时所有打卡入口据此拒绝写入并给出可见反馈
     pub checkin_status: Arc<CheckinStatus>,
@@ -167,6 +172,9 @@ impl Default for AppState {
 
         // 1.1 初始化点怪可选名单（白名单默认关闭；文件缺失即用默认值）
         let roster = MonsterRoster::load(None);
+
+        // 1.2 初始化随机抽选设置（纯前端偏好，文件缺失即用默认值；两个形态都启用）
+        let draw_settings = DrawSettingsManager::load(None);
 
         // 2. 初始化排队管理器并自动加载持久化列表
         //    读取优先 V2 的 order_list.json，其次原工程 OrderList.list（首次迁移，只读不改写）
@@ -232,6 +240,7 @@ impl Default for AppState {
             queue_persistence_broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             monster_mgr: Arc::new(monster_mgr),
             roster: Arc::new(roster),
+            draw_settings: Arc::new(draw_settings),
             checkin_mgr,
             checkin_status: Arc::new(checkin_status),
             checkin_learner: None,
@@ -852,6 +861,27 @@ fn set_monster_roster(
     state: State<'_, AppState>,
 ) -> Result<roster::RosterSnapshot, String> {
     state.roster.replace_if_revision(data, expected_revision)
+}
+
+/// 读取随机抽选设置（作品筛选 / 排除名单 / 模式与节奏）。
+///
+/// 抽选本身在前端完成，后端只提供偏好持久化 —— 故**无 `ensure_not_lite` 守卫**：
+/// 该功能不依赖 TTS / 打卡 / AI，Lite 形态同样支持（见 `draw.rs` 模块注释）。
+#[tauri::command]
+fn get_draw_settings(state: State<'_, AppState>) -> Result<DrawSettings, String> {
+    Ok(state.draw_settings.snapshot())
+}
+
+/// 整表保存随机抽选设置，返回归一化后的权威值。
+///
+/// 返回权威值（而非 `()`）是刻意的：后端会剔除非法的作品 id、纠正 mode/pace 枚举，
+/// 前端拿回显式结果即可对齐乐观状态，不必自己复制一份归一化规则。
+#[tauri::command]
+fn set_draw_settings(
+    settings: DrawSettings,
+    state: State<'_, AppState>,
+) -> Result<DrawSettings, String> {
+    state.draw_settings.replace(settings)
 }
 
 /// 解析名单 JSON 文本（导入用，纯逻辑便于单测）。
@@ -3201,6 +3231,8 @@ pub fn run() {
             set_monster_roster,
             export_monster_roster,
             import_monster_roster,
+            get_draw_settings,
+            set_draw_settings,
             get_app_config,
             save_app_config,
             update_config_memory,
@@ -3277,6 +3309,16 @@ impl AppState {
                 ))
                 .join(roster::ROSTER_FILE_NAME),
         ));
+        // 抽选设置同理：每个测试实例一份独立临时文件，避免并行测试互相覆盖
+        let draw_settings = DrawSettingsManager::load(Some(
+            &std::env::temp_dir()
+                .join(format!(
+                    "mh_test_appstate_draw_{}_{}",
+                    std::process::id(),
+                    TEST_APPSTATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ))
+                .join(draw::DRAW_SETTINGS_FILE_NAME),
+        ));
 
         Self {
             queue_mgr: Arc::new(Mutex::new(queue_mgr)),
@@ -3284,6 +3326,7 @@ impl AppState {
             queue_persistence_broken: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             monster_mgr: Arc::new(monster_mgr),
             roster: Arc::new(roster),
+            draw_settings: Arc::new(draw_settings),
             checkin_mgr: Some(Arc::new(checkin_mgr)),
             checkin_status: Arc::new(checkin_status),
             checkin_learner: None,
@@ -3377,6 +3420,36 @@ mod tests {
         });
         assert_eq!(q.items.len(), 1);
         println!("[PASS] test_core_queue_works_in_both_build_flavors passed");
+    }
+
+    /// 随机抽选必须是 **Lite 保留**功能（2026-09-30 决策）：
+    /// 它不依赖被摘掉的 TTS / 打卡 / AI，而纯点怪的 Lite 主播恰恰最常用这个玩法。
+    /// 本测试钉死"两种形态下设置读写链路完全一致"，防止后续有人按
+    /// 「非排队功能默认不支持 Lite」的字面口径想当然地给它加上守卫。
+    #[test]
+    fn test_draw_settings_available_in_both_build_flavors() {
+        let state = AppState::new_test();
+        let path = state.draw_settings.path().to_path_buf();
+
+        // 默认值：全部作品、空排除名单
+        assert_eq!(state.draw_settings.snapshot(), DrawSettings::default());
+
+        // 写入在两种形态下都必须成功
+        let saved = state
+            .draw_settings
+            .replace(DrawSettings {
+                games: vec!["MHRS".into()],
+                excluded_monsters: vec!["黑龙".into()],
+                mode: "weapon".into(),
+                ..DrawSettings::default()
+            })
+            .expect("抽选设置在两种构建形态下都必须可写");
+        assert_eq!(saved.games, vec!["MHRS".to_string()]);
+        assert_eq!(saved.mode, "weapon");
+        assert!(path.is_file(), "设置应已落盘: {:?}", path);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        println!("[PASS] test_draw_settings_available_in_both_build_flavors passed");
     }
 
     /// E1：统一 Lite 守卫 —— 按编译形态分门：Lite 构建下非排队模块统一拒绝；

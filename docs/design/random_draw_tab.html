@@ -1,0 +1,1198 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>随机抽选 · 交互设计稿 · MonsterOrderWilds-Ascendance</title>
+<style>
+/* =============================================================================
+   内嵌字体：与打包产物同源的子集化字体（src/assets/fonts）
+   ============================================================================= */
+@font-face{font-family:"MH Sans SC";src:url("../../src/assets/fonts/MH-Sans-SC-Common.woff2") format("woff2");font-weight:100 900;font-display:swap}
+@font-face{font-family:"MH Serif SC";src:url("../../src/assets/fonts/MH-Serif-SC-MonsterNames.woff2") format("woff2");font-weight:100 900;font-display:swap}
+@font-face{font-family:"MH DM Serif";src:url("../../src/assets/fonts/DMSerifDisplay-Regular.woff2") format("woff2");font-weight:400;font-display:swap}
+
+:root{
+  --font-sans:"MH Sans SC","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  --font-serif:"MH Serif SC","MH Sans SC","Noto Serif SC",serif;
+  --font-num:"MH DM Serif","MH Serif SC",serif;
+
+  /* 主窗口（控制台）配色：对齐现网 Tailwind neutral + amber 体系 */
+  --w-bg:#0a0a0a;--w-panel:rgba(23,23,23,.72);--w-panel-solid:#171717;
+  --w-line:#262626;--w-line-2:#333;--w-line-3:#404040;
+  --w-ink:#e5e5e5;--w-ink-2:#a3a3a3;--w-ink-3:#737373;--w-ink-4:#525252;
+  --amber:#f59e0b;--amber-2:#fbbf24;--amber-3:#fcd34d;
+
+  /* 稀有度语义：普通 / 历战（紫） / 历战王（橙），全应用一致 */
+  --r-normal:#c7c0ab;--r-tempered:#a78bfa;--r-arch:#ffa02e;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:
+    radial-gradient(1200px 600px at 50% -10%,rgba(245,158,11,.05),transparent 60%),
+    #050505;
+  color:var(--w-ink);
+  font-family:var(--font-sans);
+  font-size:13px;
+  user-select:none;
+  padding:0 0 60px;
+}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
+::-webkit-scrollbar-track{background:transparent}
+
+/* =============================================================================
+   设计稿外壳：演示控制条
+   ============================================================================= */
+.mock-top{position:sticky;top:0;z-index:99;background:rgba(5,5,5,.88);backdrop-filter:blur(10px);border-bottom:1px solid #1c1c1c}
+.mock-top-in{max-width:1480px;margin:0 auto;padding:11px 22px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.mock-title{font-size:12px;font-weight:700;letter-spacing:.08em;color:var(--amber-3)}
+.mock-sub{font-size:11px;color:var(--w-ink-3)}
+.mock-seg{display:flex;background:#141414;border:1px solid var(--w-line);border-radius:7px;padding:2px;gap:2px}
+.mock-seg button{font:inherit;font-size:11px;font-weight:700;color:var(--w-ink-3);background:transparent;border:0;border-radius:5px;padding:4px 10px;cursor:pointer;transition:.14s}
+.mock-seg button:hover{color:var(--w-ink)}
+.mock-seg button.on{background:rgba(245,158,11,.18);color:var(--amber-3);box-shadow:inset 0 0 0 1px rgba(245,158,11,.3)}
+.mock-lbl{font-size:10px;color:var(--w-ink-4);letter-spacing:.06em}
+.mock-legend{margin-left:auto;font-size:10.5px;color:var(--w-ink-3);line-height:1.5;max-width:520px}
+.mock-legend b{color:var(--amber-3);font-weight:700}
+
+/* 窗口尺寸舞台：把 .app 钉在指定尺寸里，尺寸可切换 */
+.stagewrap{max-width:1480px;margin:22px auto 0;padding:0 22px}
+/* 注意：这里必须是 overflow:clip 而不是 overflow:hidden。
+   hidden 会把 .app 变成「可编程滚动容器」，而抽屉是靠 translateX(102%) 藏到屏外的，
+   于是 .app 的 scrollWidth 被撑到 1528px；任何 scrollIntoView / 焦点滚动（Playwright 点击、
+   Tab 聚焦、锚点跳转）都会把整个应用框横向滚偏，界面看起来像整体错位。
+   clip 不建立滚动容器，屏外内容既不显示也不可能被滚出来。 */
+.app{
+  container-type:size;   /* 供下方 @container 按应用框自身的宽/高降级 */
+  position:relative;width:var(--app-w,1000px);height:var(--app-h,700px);
+  margin:0 auto;display:flex;overflow:clip;border-radius:12px;
+  border:1px solid var(--w-line-2);
+  background:var(--w-bg);
+  box-shadow:0 30px 80px rgba(0,0,0,.65),0 0 0 1px rgba(255,255,255,.03) inset;
+}
+
+/* =============================================================================
+   左侧导航（与现网 MainWindow 一致；「随机抽选」为本功能新增入口）
+   ============================================================================= */
+.rail{width:224px;flex:0 0 224px;background:rgba(23,23,23,.9);border-right:1px solid var(--w-line);display:flex;flex-direction:column;justify-content:space-between;padding:12px}
+.rail-hd{padding:4px 8px 12px}
+.rail-hd .t1{font-size:12px;font-weight:700;letter-spacing:.06em;color:var(--amber-3)}
+.rail-hd .t2{font-size:10px;color:var(--w-ink-3);font-family:var(--font-num)}
+.rail nav{display:flex;flex-direction:column;gap:4px}
+.rail-item{display:flex;align-items:center;gap:9px;padding:8px 11px;border-radius:8px;font-size:12px;font-weight:700;color:var(--w-ink-3);border:1px solid transparent;cursor:default}
+.rail-item svg{width:16px;height:16px;flex:0 0 16px}
+.rail-item .badge{margin-left:auto;font-size:10px;background:#1f1f1f;padding:1px 6px;border-radius:4px;font-family:var(--font-num)}
+.rail-item.on{background:rgba(245,158,11,.2);color:var(--amber-3);border-color:rgba(245,158,11,.3);cursor:pointer}
+.rail-item.on .badge{background:rgba(245,158,11,.2);color:var(--amber-3)}
+.rail-item.new::after{content:"NEW";margin-left:auto;font-size:8.5px;letter-spacing:.08em;color:#0a0a0a;background:var(--amber);border-radius:3px;padding:1px 4px;font-weight:900}
+.rail-ft{border-top:1px solid var(--w-line);padding-top:10px}
+.rail-tip{background:rgba(10,10,10,.7);border:1px solid rgba(38,38,38,.8);border-radius:8px;padding:8px 10px;font-size:10px;line-height:1.45;color:var(--w-ink-4)}
+
+/* =============================================================================
+   右侧主视图区
+   ============================================================================= */
+.main{flex:1;min-width:0;display:flex;flex-direction:column;background:#0a0a0a;overflow:clip}
+.topbar{height:48px;flex:0 0 48px;border-bottom:1px solid var(--w-line);padding:0 18px;display:flex;align-items:center;justify-content:space-between;background:rgba(23,23,23,.4)}
+.topbar h1{margin:0;font-size:14px;font-weight:700;color:var(--w-ink)}
+.ghost-btn{display:flex;align-items:center;gap:6px;font-size:11px;background:#1f1f1f;color:var(--w-ink);border:1px solid rgba(64,64,64,.6);border-radius:8px;padding:6px 12px;cursor:pointer}
+.ghost-btn:hover{background:#262626}
+
+.work{flex:1;min-height:0;display:flex;gap:12px;padding:12px 14px}
+.pane-cfg{width:236px;flex:0 0 236px;display:flex;flex-direction:column;gap:9px;overflow-y:auto;padding-right:2px}
+
+/* ------------------------------ 配置卡 ------------------------------ */
+.card{background:rgba(23,23,23,.72);border:1px solid var(--w-line);border-radius:10px;padding:10px 11px}
+.card-hd{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+.card-hd .t{font-size:11px;font-weight:700;color:var(--w-ink-2);letter-spacing:.04em}
+.card-hd .n{margin-left:auto;font-size:10px;color:var(--w-ink-3);font-family:var(--font-num)}
+.card-hd .mini{font-size:10px;color:var(--amber-2);cursor:pointer;background:none;border:0;padding:0;font-family:inherit}
+.card-hd .mini:hover{color:var(--amber-3);text-decoration:underline}
+.card-hd .drawer-mini{display:none}
+
+.seg3{display:grid;grid-template-columns:1fr 1fr 1fr;background:#121212;border:1px solid var(--w-line);border-radius:8px;padding:2px;gap:2px}
+.seg3 button{font:inherit;font-size:11px;font-weight:700;color:var(--w-ink-3);background:transparent;border:0;border-radius:6px;padding:6px 2px;cursor:pointer;transition:.14s}
+.seg3 button:hover{color:var(--w-ink)}
+.seg3 button.on{background:rgba(245,158,11,.18);color:var(--amber-3);box-shadow:inset 0 0 0 1px rgba(245,158,11,.3)}
+.seg3 button .sub{display:block;font-size:9px;font-weight:400;opacity:.7;margin-top:1px;font-family:var(--font-num)}
+
+.wgrid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.wcell{position:relative;aspect-ratio:1;border-radius:7px;background:#101010;border:1px solid var(--w-line);display:grid;place-items:center;cursor:pointer;transition:.14s;padding:3px}
+.wcell img{width:100%;height:100%;object-fit:contain;opacity:.95}
+.wcell:hover{border-color:var(--w-line-3);background:#161616}
+.wcell.off{background:#0c0c0c;border-color:#1e1e1e}
+.wcell.off img{opacity:.2;filter:grayscale(1)}
+.wcell.off::after{content:"";position:absolute;inset:12%;border-top:1.5px solid rgba(248,113,113,.75);transform:rotate(-45deg)}
+.wcell.on{border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.07)}
+
+.chips{display:flex;flex-wrap:wrap;gap:4px}
+.chip{font:inherit;font-size:10px;font-weight:700;color:var(--w-ink-3);background:#121212;border:1px solid var(--w-line);border-radius:6px;padding:4px 7px;cursor:pointer;transition:.14s;display:flex;align-items:center;gap:4px}
+.chip:hover{color:var(--w-ink);border-color:var(--w-line-3)}
+.chip.on{background:rgba(245,158,11,.16);color:var(--amber-3);border-color:rgba(245,158,11,.34)}
+.chip .c{font-size:9px;opacity:.72;font-family:var(--font-num)}
+
+.poolstat{display:flex;align-items:baseline;gap:6px;margin:8px 0 7px}
+.poolstat .big{font-family:var(--font-num);font-size:20px;color:var(--amber-3);line-height:1}
+.poolstat .of{font-size:10px;color:var(--w-ink-3);font-family:var(--font-num)}
+.poolstat .txt{font-size:10px;color:var(--w-ink-4);margin-left:auto;text-align:right;line-height:1.35}
+
+.wide-btn{width:100%;font:inherit;font-size:11px;font-weight:700;color:var(--w-ink-2);background:#161616;border:1px solid var(--w-line-2);border-radius:8px;padding:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:.14s}
+.wide-btn:hover{background:#1e1e1e;color:var(--w-ink);border-color:var(--w-line-3)}
+.wide-btn svg{width:13px;height:13px}
+
+/* ------------------------------ 舞台 ------------------------------ */
+.pane-stage{flex:1;min-width:0;display:flex;flex-direction:column;gap:9px}
+.stagecard{position:relative;flex:1;min-height:0;border:1px solid var(--w-line);border-radius:12px;background:radial-gradient(120% 90% at 50% 8%,rgba(245,158,11,.045),transparent 55%),#0c0c0c;display:flex;flex-direction:column;overflow:clip}
+.stagecard::before{content:"";position:absolute;inset:0;border-radius:12px;pointer-events:none;box-shadow:inset 0 0 0 1px rgba(245,158,11,0);transition:.3s}
+.stagecard.rolling::before{box-shadow:inset 0 0 0 1px rgba(245,158,11,.22),inset 0 0 60px rgba(245,158,11,.06)}
+
+/* 背景罗盘环：只在滚动期间缓慢旋转（对齐悬浮窗 ringWmSpin 语汇） */
+.compass{position:absolute;left:50%;top:50%;width:520px;height:520px;margin:-260px 0 0 -260px;opacity:0;transition:opacity .5s;pointer-events:none}
+.stagecard.rolling .compass{opacity:.5}
+.compass i{position:absolute;inset:0;border-radius:50%;border:1px solid rgba(245,158,11,.14)}
+.compass i:nth-child(2){inset:38px;border-style:dashed;border-color:rgba(245,158,11,.18)}
+.compass i:nth-child(3){inset:86px;border-color:rgba(245,158,11,.1)}
+.compass .spin{animation:compassSpin 18s linear infinite}
+.compass .spin2{animation:compassSpin 26s linear infinite reverse}
+@keyframes compassSpin{to{transform:rotate(360deg)}}
+
+.brief{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:11px 14px 0}
+.brief .k{font-size:11px;color:var(--w-ink-3)}
+.brief .k b{color:var(--amber-2);font-family:var(--font-num);font-weight:400}
+.phase{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:10px;font-weight:700;color:var(--w-ink-3);background:#111;border:1px solid var(--w-line);border-radius:20px;padding:4px 10px}
+.phase .dot{width:6px;height:6px;border-radius:50%;background:var(--w-ink-4);transition:.2s}
+.phase.roll{color:var(--amber-3);border-color:rgba(245,158,11,.3);background:rgba(245,158,11,.08)}
+.phase.roll .dot{background:var(--amber-2);animation:phasePulse .8s ease-in-out infinite}
+@keyframes phasePulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.72)}}
+
+/* 抽选盘 */
+.reels{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;gap:14px;padding:6px 14px}
+.reel{position:relative;flex:1 1 0;max-width:236px;min-width:0;display:flex;flex-direction:column;align-items:center;gap:7px}
+.reel.off{display:none}
+.reel-frame{position:relative;width:100%;max-width:196px;aspect-ratio:1/1;border-radius:14px;border:1px solid var(--w-line-2);background:linear-gradient(180deg,#141414,#0d0d0d);overflow:hidden;transition:border-color .25s,box-shadow .25s}
+.reel-frame::after{content:"";position:absolute;inset:0;border-radius:14px;pointer-events:none;background:linear-gradient(180deg,rgba(10,10,10,.92) 0%,rgba(10,10,10,0) 20%,rgba(10,10,10,0) 80%,rgba(10,10,10,.92) 100%)}
+.reel-cur,.reel-next{position:absolute;inset:0;display:grid;place-items:center;will-change:transform,opacity,filter}
+/* 怪物图标源图仅 60×60（武器 100×100）：两者分开取显示比例，把放大倍率都压在 ~1.6× 以内，
+   糊感不至于盖掉「白色线稿」本身的锐利轮廓 */
+.reel img{object-fit:contain;user-select:none;-webkit-user-drag:none}
+.reel-w .reel-cur img,.reel-w .reel-next img{width:76%;height:76%}
+.reel-m .reel-cur img,.reel-m .reel-next img{width:50%;height:50%}
+/* 怪物图标底下垫一层暗金光盘：让「小幅放大」读起来是刻意的肖像式排布 */
+.reel-m .reel-frame::before{content:"";position:absolute;left:50%;top:50%;width:74%;aspect-ratio:1;transform:translate(-50%,-50%);border-radius:50%;
+  background:radial-gradient(circle,rgba(245,158,11,.075),rgba(0,0,0,0) 68%);pointer-events:none}
+/* 滚动中：琥珀描边 + 内发光 */
+.reel.rolling .reel-frame{border-color:rgba(245,158,11,.42);box-shadow:inset 0 0 34px rgba(245,158,11,.12),0 0 22px rgba(245,158,11,.08)}
+/* 蓄力：轻微抖动 */
+.reel.charging .reel-frame{animation:drawShiver .26s ease-in-out;border-color:rgba(245,158,11,.5)}
+@keyframes drawShiver{0%,100%{transform:translate3d(0,0,0)}20%{transform:translate3d(-2px,1px,0)}45%{transform:translate3d(2px,-1px,0)}70%{transform:translate3d(-1px,0,0)}}
+/* 锁定：回弹 + 光环扩散 */
+.reel.locked .reel-frame{animation:drawKick .42s cubic-bezier(.2,1.5,.4,1);border-color:var(--amber);box-shadow:0 0 0 1px rgba(245,158,11,.4),0 0 34px rgba(245,158,11,.3)}
+@keyframes drawKick{0%{transform:scale(1.055)}45%{transform:scale(.985)}100%{transform:scale(1)}}
+.reel-ring{position:absolute;inset:0;border-radius:14px;border:2px solid var(--amber);opacity:0;pointer-events:none}
+.reel.locked .reel-ring{animation:reelRingOut .62s cubic-bezier(.16,.84,.3,1)}
+@keyframes reelRingOut{0%{opacity:.95;transform:scale(.9)}100%{opacity:0;transform:scale(1.28)}}
+/* 命中闪光 */
+.reel-flash{position:absolute;inset:0;border-radius:14px;pointer-events:none;opacity:0;background:radial-gradient(60% 60% at 50% 50%,rgba(255,255,255,.75),rgba(252,211,77,.35) 45%,transparent 72%)}
+.reel.locked .reel-flash{animation:reelFlash .5s ease-out}
+@keyframes reelFlash{0%{opacity:0}12%{opacity:.9}100%{opacity:0}}
+
+.reel-cap{font-size:10px;font-weight:700;letter-spacing:.14em;color:var(--w-ink-4)}
+.reel-name{min-height:34px;text-align:center;line-height:1.25}
+.reel-name .cn{font-family:var(--font-serif);font-size:17px;color:var(--w-ink-4);transition:color .3s,text-shadow .3s;letter-spacing:.02em}
+.reel-name .en{font-family:var(--font-num);font-size:10px;color:var(--w-ink-4);opacity:.65;letter-spacing:.04em}
+.reel.hit .reel-name .cn{color:var(--amber-3);text-shadow:0 0 16px rgba(245,158,11,.55)}
+.reel.hit .reel-name .en{color:var(--amber-2);opacity:.9}
+.reel-name .blur .cn{filter:blur(3px);opacity:.5}
+.tl-cap{display:flex;justify-content:space-between;margin-top:5px;font-size:9px;color:var(--w-ink-4)}
+.tl-cap span:last-child{opacity:.75}
+
+.reel-link{align-self:center;flex:0 0 auto;width:30px;height:30px;border-radius:50%;border:1px solid var(--w-line-2);background:#111;display:grid;place-items:center;color:var(--w-ink-3);font-family:var(--font-num);font-size:15px;transition:.3s}
+.reel-link.hot{border-color:rgba(245,158,11,.45);color:var(--amber-3);box-shadow:0 0 16px rgba(245,158,11,.2)}
+
+/* 揭晓爆发 */
+.burst{position:absolute;left:50%;top:50%;width:300px;height:300px;margin:-150px 0 0 -150px;border-radius:50%;pointer-events:none;opacity:0;background:radial-gradient(circle,rgba(252,211,77,.55) 0%,rgba(245,158,11,.28) 34%,transparent 68%)}
+.stagecard.revealed .burst{animation:drawBurst .9s cubic-bezier(.16,.84,.3,1)}
+@keyframes drawBurst{0%{opacity:0;transform:scale(.5)}18%{opacity:.95}100%{opacity:0;transform:scale(2.05)}}
+
+/* 节奏时间轴：把「悬念是怎么造出来的」直接画出来 */
+.timeline{flex:0 0 auto;padding:0 16px}
+.tl{position:relative;display:flex;gap:2px;height:28px}
+.tlseg{display:flex;flex-direction:column;gap:3px;min-width:0}
+.tlseg i{display:block;height:8px;border-radius:3px;background:#242424;transition:.2s}
+.tlseg span{font-size:8.5px;color:var(--w-ink-4);text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.02em}
+/* 段越短（帧越快）越亮 —— 一眼看出「悬念」是压在哪几段上的 */
+.tlseg.s1 i{background:linear-gradient(180deg,#fcd34d,#f59e0b)}
+.tlseg.s2 i{background:linear-gradient(180deg,rgba(252,211,77,.68),rgba(245,158,11,.42))}
+.tlseg.s3 i{background:linear-gradient(180deg,rgba(245,158,11,.34),rgba(245,158,11,.18))}
+.tlseg.s4 i{background:linear-gradient(180deg,rgba(245,158,11,.16),rgba(245,158,11,.07))}
+.tlseg.fake i{background:linear-gradient(180deg,#fcd34d,#f59e0b);box-shadow:0 0 10px rgba(245,158,11,.5)}
+.tlseg.fake span{color:var(--amber-3);font-weight:700}
+.tlseg.hit i{background:linear-gradient(180deg,#fff,rgba(252,211,77,.6));box-shadow:0 0 12px rgba(252,211,77,.75)}
+.tlseg.hit span{color:#fde68a;font-weight:700}
+.tlseg.reveal i{background:linear-gradient(180deg,#fcd34d,#f59e0b);animation:tlRevealPulse 1.1s ease-in-out infinite}
+@keyframes tlRevealPulse{0%,100%{opacity:.75}50%{opacity:1}}
+.tl .ph{position:absolute;top:-2px;height:12px;width:2px;background:#fff;box-shadow:0 0 8px rgba(255,255,255,.9);opacity:0;border-radius:1px;z-index:2}
+.tl.on .ph{opacity:1}
+
+/* 动作区 */
+.actions{flex:0 0 auto;padding:10px 16px 14px;display:flex;flex-direction:column;align-items:center;gap:8px}
+.draw-btn{position:relative;font:inherit;font-size:15px;font-weight:900;letter-spacing:.34em;text-indent:.34em;color:#1a1300;
+  background:linear-gradient(180deg,var(--amber-3),var(--amber));border:0;border-radius:10px;padding:12px 54px;cursor:pointer;
+  box-shadow:0 6px 22px rgba(245,158,11,.28),inset 0 1px 0 rgba(255,255,255,.5);transition:transform .12s,box-shadow .2s,filter .2s;overflow:hidden}
+.draw-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 10px 28px rgba(245,158,11,.4),inset 0 1px 0 rgba(255,255,255,.55)}
+.draw-btn:active:not(:disabled){transform:translateY(1px) scale(.995)}
+.draw-btn:disabled{cursor:not-allowed;filter:grayscale(.85) brightness(.62);box-shadow:none}
+.draw-btn::after{content:"";position:absolute;top:0;bottom:0;width:34%;left:-45%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.5),transparent);transform:skewX(-18deg)}
+.draw-btn:not(:disabled):hover::after{animation:btnSheen .8s ease-out}
+@keyframes btnSheen{to{left:120%}}
+.hint{font-size:10.5px;color:var(--w-ink-4);text-align:center;line-height:1.45;max-width:440px}
+.hint.warn{color:#fca5a5}
+.hint.warn b{color:#fecaca;font-weight:700}
+
+.result-actions{display:flex;gap:8px;opacity:0;transform:translateY(4px);transition:.32s;pointer-events:none}
+.result-actions.on{opacity:1;transform:none;pointer-events:auto}
+.rbtn{font:inherit;font-size:11px;font-weight:700;border-radius:8px;padding:7px 13px;cursor:pointer;display:flex;align-items:center;gap:6px;transition:.14s;white-space:nowrap}
+.rbtn svg{width:13px;height:13px}
+.rbtn.pri{background:linear-gradient(180deg,rgba(252,211,77,.22),rgba(245,158,11,.16));color:var(--amber-3);border:1px solid rgba(245,158,11,.4)}
+.rbtn.pri:hover{background:rgba(245,158,11,.28)}
+.rbtn.sec{background:#161616;color:var(--w-ink-2);border:1px solid var(--w-line-2)}
+.rbtn.sec:hover{background:#1f1f1f;color:var(--w-ink);border-color:var(--w-line-3)}
+
+/* ------------------------------ 抽选记录 ------------------------------ */
+.history{flex:0 0 auto;border-top:1px solid var(--w-line);background:rgba(15,15,15,.75);padding:9px 14px 11px}
+.history-hd{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.history-hd .t{font-size:11px;font-weight:700;color:var(--w-ink-2);letter-spacing:.04em}
+.history-hd .n{font-size:10px;color:var(--w-ink-4);font-family:var(--font-num)}
+.history-hd .mini{margin-left:auto;font-size:10px;color:var(--w-ink-4);background:none;border:0;cursor:pointer;font-family:inherit}
+.history-hd .mini:hover{color:var(--w-ink-2);text-decoration:underline}
+.history-row{display:flex;gap:7px;overflow-x:auto;overflow-y:hidden;padding-bottom:3px;min-height:74px}
+.hcard{flex:0 0 auto;width:112px;border:1px solid var(--w-line);background:#121212;border-radius:9px;padding:7px 8px;display:flex;flex-direction:column;gap:5px;transition:.16s;cursor:pointer}
+.hcard:hover{border-color:rgba(245,158,11,.34);background:#171717}
+.hcard .r1{display:flex;align-items:center;gap:5px}
+.hcard .r1 img{width:26px;height:26px;object-fit:contain}
+.hcard .r1 .x{font-family:var(--font-num);font-size:11px;color:var(--w-ink-4)}
+.hcard .r2{font-family:var(--font-serif);font-size:11px;color:var(--w-ink-2);line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hcard .r3{display:flex;align-items:center;gap:5px;font-size:9px;color:var(--w-ink-4);font-family:var(--font-num)}
+.hcard .r3 .no{color:var(--amber-2);opacity:.85}
+.history-empty{height:74px;display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--w-ink-4);border:1px dashed var(--w-line);border-radius:9px}
+
+/* =============================================================================
+   抽屉：池子配置（作品筛选 + 手选排除名单）
+   ============================================================================= */
+.mask{position:absolute;inset:0;background:rgba(0,0,0,.62);opacity:0;pointer-events:none;transition:.24s;z-index:20}
+.mask.on{opacity:1;pointer-events:auto}
+.drawer{position:absolute;top:0;right:0;bottom:0;width:520px;max-width:100%;background:#0d0d0d;border-left:1px solid var(--w-line-2);z-index:21;
+  transform:translateX(102%);transition:transform .3s cubic-bezier(.22,.8,.24,1);display:flex;flex-direction:column;box-shadow:-24px 0 60px rgba(0,0,0,.6)}
+.drawer.on{transform:none}
+.drawer-hd{padding:14px 16px 12px;border-bottom:1px solid var(--w-line);display:flex;align-items:flex-start;gap:10px}
+.drawer-hd h2{margin:0;font-size:13px;font-weight:700;color:var(--w-ink)}
+.drawer-hd p{margin:3px 0 0;font-size:10px;color:var(--w-ink-4);line-height:1.5}
+.x-btn{margin-left:auto;width:26px;height:26px;border-radius:7px;background:#171717;border:1px solid var(--w-line-2);color:var(--w-ink-3);cursor:pointer;display:grid;place-items:center;flex:0 0 26px}
+.x-btn:hover{background:#222;color:var(--w-ink)}
+.drawer-bd{flex:1;min-height:0;overflow-y:auto;padding:12px 16px;display:flex;flex-direction:column;gap:11px}
+.drawer-ft{flex:0 0 auto;border-top:1px solid var(--w-line);padding:11px 16px;display:flex;align-items:center;gap:8px;background:#0f0f0f}
+.drawer-ft .stat{font-size:10.5px;color:var(--w-ink-3)}
+.drawer-ft .stat b{color:#fca5a5;font-family:var(--font-num);font-weight:400}
+.drawer-ft .sp{margin-left:auto}
+.search{position:relative}
+.search input{width:100%;font:inherit;font-size:11.5px;color:var(--w-ink);background:#121212;border:1px solid var(--w-line-2);border-radius:8px;padding:7px 10px 7px 30px;outline:none}
+.search input::placeholder{color:var(--w-ink-4)}
+.search input:focus{border-color:rgba(245,158,11,.42);background:#161616}
+.search svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);width:13px;height:13px;color:var(--w-ink-4)}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(58px,1fr));gap:6px}
+.mcell{position:relative;border:1px solid var(--w-line);background:#121212;border-radius:8px;padding:5px 3px 4px;display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer;transition:.14s}
+.mcell img{width:38px;height:38px;object-fit:contain;transition:.18s}
+.mcell .nm{font-size:9px;color:var(--w-ink-4);max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:.18s}
+.mcell:hover{border-color:var(--w-line-3);background:#181818}
+.mcell:hover .nm{color:var(--w-ink-2)}
+.mcell.off{background:#0b0b0b;border-color:#1d1d1d}
+.mcell.off img{filter:grayscale(1) brightness(.5);opacity:.4}
+.mcell.off .nm{color:#3f3f3f}
+.mcell.off::after{content:"";position:absolute;left:14%;right:14%;top:44%;border-top:1.5px solid rgba(248,113,113,.7);transform:rotate(-38deg)}
+.mcell .lv{position:absolute;top:3px;right:4px;font-size:8px;font-family:var(--font-num);padding:0 3px;border-radius:3px}
+.mcell .lv.t1{color:var(--r-tempered);background:rgba(167,139,250,.14)}
+.mcell .lv.t2{color:var(--r-arch);background:rgba(255,160,46,.14)}
+.grp{font-size:10px;font-weight:700;color:var(--w-ink-3);letter-spacing:.08em;display:flex;align-items:center;gap:6px;margin:2px 0 -3px}
+.grp .line{flex:1;height:1px;background:var(--w-line)}
+.grp .c{font-family:var(--font-num);color:var(--w-ink-4);font-weight:400}
+.grp .mini{font-size:9.5px;color:var(--w-ink-4);background:none;border:0;cursor:pointer;font-family:inherit;padding:0}
+.grp .mini:hover{color:var(--amber-2)}
+.empty{font-size:11px;color:var(--w-ink-4);text-align:center;padding:26px 0}
+
+/* =============================================================================
+   紧凑降级：800×550 是 Tauri 的 minWidth/minHeight，必须能完整用
+   两档解耦 —— 窄（宽度不够）与矮（高度不够）会同时命中，规则可叠加
+   ============================================================================= */
+@container (max-width: 920px){
+  .pane-cfg{width:206px;flex:0 0 206px}
+  .work{gap:10px;padding:10px 12px}
+  .topbar{padding:0 13px}
+  .topbar h1{font-size:13px}
+  .ghost-btn{font-size:10.5px;padding:5px 10px}
+  .brief{padding:9px 12px 0}
+  .brief .k{font-size:10px}
+  .reels{gap:10px;padding:4px 10px}
+  .reel-link{width:24px;height:24px;font-size:12px}
+  .actions{padding:8px 12px 11px;gap:6px}
+  .draw-btn{padding:10px 38px;font-size:14px;letter-spacing:.26em;text-indent:.26em}
+  .hint{font-size:10px;max-width:300px}
+  .rbtn{padding:6px 10px;font-size:10.5px}
+  .rbtn svg{width:12px;height:12px}
+  .history{padding:7px 12px 9px}
+  .hcard{width:98px;padding:6px 7px;gap:4px}
+  .hcard .r1 img{width:22px;height:22px}
+  .history-row{min-height:66px}
+  .history-empty{height:66px}
+  .wgrid{gap:3px}
+  .tl-cap span:last-child{display:none}
+}
+@container (max-height: 640px){
+  /* 高度不够时，先砍「解释性」信息：分组标题、英文副名、时间轴分段标签 */
+  .reel-cap{display:none}
+  /* 左栏压紧：把「管理排除名单…」换成标题行里的小入口，保证入口不被折下去 */
+  .pane-cfg{gap:6px}
+  .card{padding:7px 9px}
+  .card-hd{margin-bottom:5px}
+  .card-hd .n{font-size:9.5px}
+  .card-hd .drawer-mini{display:inline;color:var(--amber-2)}
+  .card-hd .n:has(+ .drawer-mini){display:none}
+  .seg3 button{padding:5px 2px;font-size:10.5px}
+  .seg3 button .sub{font-size:8.5px}
+  .wgrid{gap:2px}
+  .wcell{padding:2px}
+  .chips{gap:3px}
+  .chip{padding:3px 6px;font-size:9.5px}
+  .poolstat{margin:5px 0 4px}
+  .poolstat .big{font-size:16px}
+  .poolstat .txt{font-size:9.5px}
+  .wide-btn{display:none}
+  .rail-tip{display:none}
+  .reel-name{min-height:22px}
+  .reel-name .cn{font-size:14px}
+  .reel-name .en{display:none}
+  .reel-frame{max-width:126px}
+  .timeline{padding:0 12px}
+  .tl{height:12px}
+  .tlseg span{display:none}
+  .tl-cap{margin-top:3px;font-size:8.5px}
+  .brief .k b{display:inline}
+  .actions{padding:6px 12px 9px;gap:5px}
+  .draw-btn{padding:9px 34px;font-size:13.5px}
+  .hint{display:none}
+  .result-actions{gap:6px}
+  .history{padding:6px 12px 8px}
+  .history-row{min-height:60px}
+  .hcard{width:92px;padding:5px 6px}
+  .hcard .r2{font-size:10px}
+  .history-empty{height:60px}
+}
+@container (max-height: 600px){
+  .card{padding:8px 9px}
+  .card-hd{margin-bottom:6px}
+  .poolstat{margin:6px 0 5px}
+  .poolstat .big{font-size:17px}
+  .reel-frame{max-width:112px}
+}
+
+/* 轻提示 */
+.toast{position:absolute;left:50%;bottom:26px;transform:translate(-50%,14px);background:#1c1c1c;border:1px solid var(--w-line-3);border-radius:9px;
+  padding:8px 14px;font-size:11.5px;color:var(--w-ink);z-index:40;opacity:0;pointer-events:none;transition:.22s;box-shadow:0 12px 30px rgba(0,0,0,.5);max-width:80%}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.toast b{color:var(--amber-3)}
+
+/* 阶段标注（滚动/揭晓时贴在舞台上的说明气泡，仅设计稿需要） */
+.note{position:absolute;left:14px;top:44px;z-index:6;font-size:9.5px;color:var(--amber-2);background:rgba(245,158,11,.09);border:1px solid rgba(245,158,11,.24);border-radius:7px;padding:4px 8px;opacity:0;transition:.25s;pointer-events:none;line-height:1.4;max-width:220px}
+.note.on{opacity:1}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+</style>
+</head>
+<body>
+
+<!-- ==========================================================================
+     演示控制条
+     ========================================================================== -->
+<div class="mock-top">
+  <div class="mock-top-in">
+    <div>
+      <div class="mock-title">随机抽选 · 交互设计稿</div>
+      <div class="mock-sub">可点击运行的真实原型 · 抽的是真池子、真图标</div>
+    </div>
+    <div class="mock-seg" id="sizeSeg">
+      <button data-w="1000" data-h="700" class="on">默认窗口 1000×700</button>
+      <button data-w="1280" data-h="860">大窗 1280×860</button>
+      <button data-w="800" data-h="550">最小 800×550</button>
+    </div>
+    <div class="mock-seg" id="fxSeg">
+      <button data-fx="normal" class="on">正常速度</button>
+      <button data-fx="slow">慢放 ×0.45</button>
+      <button data-fx="reduce">减少动态</button>
+    </div>
+    <div class="mock-legend">
+      <b>悬念三段式</b>：高速滚动 → <b>伪停</b>（像要停了又继续）→ 逐项锁定 + 金光揭晓。
+      左栏可切「节奏」调整总时长。
+      <b style="color:#fca5a5">注：舞台下方那条按段着色的节奏时间轴是设计说明用，最终产物不显示</b>（2026-09-30 定）——
+      它把「快慢是怎么排的」画给评审看，但对主播是冗余信息，会挤占舞台高度。
+      结果区也只剩「送去点单 / 复制结果」——<b style="color:#fca5a5">「再抽一次」已删</b>，
+      它与中间那颗大按钮完全重复。
+    </div>
+  </div>
+</div>
+
+<div class="stagewrap">
+<div class="app" id="app">
+
+  <!-- 左侧导航（还原现网 MainWindow，随机抽选为新增第 4 项） -->
+  <aside class="rail">
+    <div>
+      <div class="rail-hd">
+        <div class="t1">MonsterOrderWilds</div>
+        <div class="t2">Ascendance (v 1.0.0)</div>
+      </div>
+      <nav>
+        <div class="rail-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.2 19.1 19.1"/></svg>
+          <span>直播连接</span><span class="badge" style="background:#0d3d2b;color:#34d399">●</span>
+        </div>
+        <div class="rail-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>
+          <span>排队管理</span><span class="badge">3</span>
+        </div>
+        <div class="rail-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 12H3"/><path d="M16 6H3"/><path d="M16 18H3"/><path d="M18 9v6"/><path d="M21 12h-6"/></svg>
+          <span>怪物名单</span><span class="badge" style="background:rgba(239,68,68,.2);color:#fca5a5">2</span>
+        </div>
+        <div class="rail-item on new" title="本设计稿新增页签">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M8 8h.01"/><path d="M16 8h.01"/><path d="M8 16h.01"/><path d="M16 16h.01"/><path d="M12 12h.01"/></svg>
+          <span>随机抽选</span>
+        </div>
+        <div class="rail-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="m9 16 2 2 4-4"/></svg>
+          <span>舰长打卡 &amp; GM</span>
+        </div>
+        <div class="rail-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg>
+          <span>设置中心</span>
+        </div>
+      </nav>
+    </div>
+    <div class="rail-ft">
+      <div class="rail-tip">抽选只在本地进行，不占用弹幕额度、不写队列；需要的话可以把结果一键送去点单。</div>
+    </div>
+  </aside>
+
+  <!-- 主视图 -->
+  <main class="main">
+    <header class="topbar">
+      <h1>随机抽选武器与怪物</h1>
+      <button class="ghost-btn">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+        <span>桌面点怪悬浮窗</span>
+      </button>
+    </header>
+
+    <div class="work">
+      <!-- ==================== 左：池子与节奏 ==================== -->
+      <section class="pane-cfg">
+        <div class="card">
+          <div class="card-hd"><span class="t">抽什么</span></div>
+          <div class="seg3" id="modeSeg">
+            <button data-mode="both" class="on">都要<span class="sub">武器+怪物</span></button>
+            <button data-mode="weapon">仅武器<span class="sub">WEAPON</span></button>
+            <button data-mode="monster">仅怪物<span class="sub">MONSTER</span></button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-hd"><span class="t">节奏</span><span class="n" id="paceEta">3.0s</span></div>
+          <div class="seg3" id="paceSeg">
+            <button data-pace="0">快<span class="sub">1.2s</span></button>
+            <button data-pace="1" class="on">标准<span class="sub">3.0s</span></button>
+            <button data-pace="2">拖长<span class="sub">4.8s</span></button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-hd">
+            <span class="t">武器池</span>
+            <span class="n" id="wCount">14 / 14</span>
+            <button class="mini" id="wAll">全选</button>
+            <button class="mini" id="wNone">清空</button>
+          </div>
+          <div class="wgrid" id="wGrid"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-hd">
+            <span class="t">怪物池</span>
+            <span class="n" id="mRatio">175 / 175</span>
+            <button class="mini drawer-mini" id="openDrawerMini">管理名单…</button>
+          </div>
+          <div class="chips" id="gameChips"></div>
+          <div class="poolstat">
+            <span class="big" id="mCount">175</span>
+            <span class="of">只可抽</span>
+            <span class="txt" id="mExcl">排除名单为空</span>
+          </div>
+          <button class="wide-btn" id="openDrawer">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+            管理排除名单…
+          </button>
+        </div>
+      </section>
+
+      <!-- ==================== 中：抽选盘 ==================== -->
+      <section class="pane-stage">
+        <div class="stagecard" id="stage">
+          <div class="compass"><i class="spin"></i><i class="spin2"></i><i></i></div>
+          <div class="burst"></div>
+
+          <div class="brief">
+            <span class="k">本次有效池　武器 <b id="briefW">14</b> 把　·　怪物 <b id="briefM">175</b> 只</span>
+            <span class="phase" id="phase"><span class="dot"></span><span id="phaseTxt">待机</span></span>
+          </div>
+
+          <div class="note" id="note">伪停：速度降到像要停住，再突然冲一次 —— 悬念就卡在这一下</div>
+
+          <div class="reels">
+            <div class="reel reel-w" id="reelW">
+              <div class="reel-frame">
+                <div class="reel-cur"><img alt=""></div>
+                <div class="reel-next"><img alt=""></div>
+                <div class="reel-ring"></div>
+                <div class="reel-flash"></div>
+              </div>
+              <div class="reel-cap">武 器</div>
+              <div class="reel-name">
+                <div class="cn" id="wName">—</div>
+                <div class="en" id="wNameEn">&nbsp;</div>
+              </div>
+            </div>
+
+            <div class="reel-link" id="reelLink">×</div>
+
+            <div class="reel reel-m" id="reelM">
+              <div class="reel-frame">
+                <div class="reel-cur"><img alt=""></div>
+                <div class="reel-next"><img alt=""></div>
+                <div class="reel-ring"></div>
+                <div class="reel-flash"></div>
+              </div>
+              <div class="reel-cap">怪 物</div>
+              <div class="reel-name">
+                <div class="cn" id="mName">—</div>
+                <div class="en" id="mNameEn">&nbsp;</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="timeline">
+            <div class="tl" id="tl"><span class="ph"></span></div>
+            <div class="tl-cap"><span>节奏演出时间轴</span><span>亮 = 帧快 · 暗 = 帧慢　|　末两格：逐项锁定 → 金光揭晓</span></div>
+          </div>
+
+          <div class="actions">
+            <button class="draw-btn" id="drawBtn">抽 选</button>
+            <div class="hint" id="hint"></div>
+            <div class="result-actions" id="resultActions">
+              <button class="rbtn pri" id="againBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+                再抽一次
+              </button>
+              <button class="rbtn sec" id="toOrderBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+                送去点单
+              </button>
+              <button class="rbtn sec" id="copyBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                复制结果
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ==================== 下：抽选记录 ==================== -->
+    <footer class="history">
+      <div class="history-hd">
+        <span class="t">抽选记录</span>
+        <span class="n" id="hCount">最近 12 次 · 0 条</span>
+        <button class="mini" id="hClear">清空</button>
+      </div>
+      <div class="history-row" id="hRow">
+        <div class="history-empty" style="flex:1">还没有抽选记录 —— 点上面的「抽选」开始</div>
+      </div>
+    </footer>
+  </main>
+
+  <!-- ==================== 抽屉：排除名单 ==================== -->
+  <div class="mask" id="mask"></div>
+  <aside class="drawer" id="drawer">
+    <div class="drawer-hd">
+      <div>
+        <h2>排除名单 · 池子配置</h2>
+        <p>点怪物图标切换「排除 / 放回」。排除只影响本页抽选，不动「怪物名单」页签的禁点名单。</p>
+      </div>
+      <button class="x-btn" id="closeDrawer">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="drawer-bd">
+      <div class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+        <input id="mSearch" placeholder="搜怪物名或黑话别称（如「太太」「棺材」）" autocomplete="off">
+      </div>
+      <div class="chips" id="drawerChips"></div>
+      <div id="mGridWrap"></div>
+    </div>
+
+    <div class="drawer-ft">
+      <span class="stat">已排除 <b id="dExcl">0</b> 只 · 当前可抽 <span id="dPool">175</span> 只</span>
+      <span class="sp"></span>
+      <button class="rbtn sec" id="dSync" title="设计稿示意：实装时合并「怪物名单」页签的禁点名单">同步自禁点名单</button>
+      <button class="rbtn sec" id="dReset">全部恢复</button>
+      <button class="rbtn pri" id="dDone">完成</button>
+    </div>
+  </aside>
+
+  <div class="toast" id="toast"></div>
+</div>
+</div>
+
+<script id="monster-data" type="application/json">[{"n":"冻峰龙","i":"MHWilds/MHWilds-Jin_Dahaad_Icon.png","t":0,"a":["冻峰","东风龙","东风","冻峰龙"],"g":"MHWilds"},{"n":"刺花蜘蛛","i":"MHWilds/MHWilds-Lala_Barina_Icon.png","t":0,"a":["呲花","刺花蜘蛛"],"g":"MHWilds"},{"n":"千刃龙","i":"MHWilds/MHWilds-Seregios_Icon.png","t":0,"a":["千刃","千刃鸡","松果鸡","千刃鸡","千刃龙"],"g":"MHWilds"},{"n":"影蜘蛛","i":"MHWilds/MHWilds-Nerscylla_Hatchling_Icon.png","t":0,"a":["影蜘蛛"],"g":"MHWilds"},{"n":"怪鸟","i":"MHWilds/MHWilds-Yian_Kut-Ku_Icon.png","t":0,"a":["大怪鸟","羊库库","老师","怪鸟"],"g":"MHWilds"},{"n":"护凶爪龙","i":"MHWilds/MHWilds-Guardian_Ebony_Odogaron_Icon.png","t":0,"a":["凶爪","凶爪龙","护凶","护凶爪龙"],"g":"MHWilds"},{"n":"护火龙","i":"MHWilds/MHWilds-Guardian_Rathalos_Icon.png","t":0,"a":["护火","护火龙"],"g":"MHWilds"},{"n":"护辟兽","i":"MHWilds/MHWilds-Guardian_Doshaguma_Icon.png","t":0,"a":["护辟","护p","护p兽","护P","护P兽","护阿p","护阿P","护辟兽"],"g":"MHWilds"},{"n":"护锁刃龙","i":"MHWilds/MHWilds-Guardian_Arkveld_Icon.png","t":0,"a":["护锁刃","护锁","护锁刃龙"],"g":"MHWilds"},{"n":"护雷颚龙","i":"MHWilds/MHWilds-Guardian_Fulgur_Anjanath_Icon.png","t":0,"a":["护雷","护雷颚龙","护雷颚","护雷鄂"],"g":"MHWilds"},{"n":"无言的闪光","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Rey_Dau.png","t":2,"a":["王黄磊","王煌雷","王雷","王黄雷","王煌雷龙","历战王黄磊","历战王煌雷","历战王雷","历战王黄雷","历战王煌雷龙","无言的闪光","屋檐的闪光","无语的闪光"],"g":"MHWilds"},{"n":"暗器蛸","i":"MHWilds/MHWilds-Xu_Wu_Icon.png","t":0,"a":["暗器","暗器烧","暗器蛸"],"g":"MHWilds"},{"n":"暗夜渔火","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Nu_Udra.png","t":2,"a":["暗夜渔火，纳吾诅咒","暗夜渔火纳吾诅咒","王章鱼","王章鱼烧","王大章鱼","王狱焰蛸","王狱焰烧","王狱炎蛸","王狱炎烧","王火章鱼","历战王章鱼","历战王章鱼烧","历战王大章鱼","历战王狱焰蛸","历战王狱焰烧","历战王狱炎蛸","历战王狱炎烧","历战王火章鱼"],"g":"MHWilds"},{"n":"桃毛兽王","i":"MHWilds/MHWilds-Congalala_Icon.png","t":0,"a":["大桃毛","桃毛","桃毛兽王"],"g":"MHWilds"},{"n":"毒怪鸟","i":"MHWilds/MHWilds-Gypceros_Icon.png","t":0,"a":["毒怪鸟"],"g":"MHWilds"},{"n":"沙海龙","i":"MHWilds/MHWilds-Balahara_Icon.png","t":0,"a":["沙海","沙海龙"],"g":"MHWilds"},{"n":"沼喷龙","i":"MHWilds/MHWilds-Rompopolo_Icon.png","t":0,"a":["蚊子","蚊子龙","嗦你屁眼","嗦你皮炎","嗦你皮燕","沼喷龙"],"g":"MHWilds"},{"n":"泡狐龙","i":"MHWilds/MHWilds-Mizutsune_Icon.png","t":0,"a":["泡狐","泡泡","泡狐龙"],"g":"MHWilds"},{"n":"波衣龙","i":"MHWilds/MHWilds-Uth_Duna_Icon.png","t":0,"a":["boy龙","boi龙","boi","波一龙","波衣龙"],"g":"MHWilds"},{"n":"海龙","i":"MHWilds/MHWilds-Lagiacrus_Icon.png","t":0,"a":["海龙"],"g":"MHWilds"},{"n":"涟漪涤得残垣清，独爱安眠古都静","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Uth_Duna.png","t":2,"a":["涟漪涤得残垣清","涟漪涤得残垣清，独爱安眠古都静","王boy龙","王boy","王boi龙","王boi","王波一龙","王波衣龙","历战王boy龙","历战王boy","历战王boi龙","历战王boi","历战王波一龙","历战王波衣龙"],"g":"MHWilds"},{"n":"游星欧米茄","i":"MHWilds/MHWilds-Omega_Planetes_Icon.png","t":0,"a":["欧米茄","欧米加","游星欧米茄","游星欧米加"],"g":"MHWilds"},{"n":"火龙","i":"MHWilds/MHWilds-Rathalos_Icon.png","t":0,"a":["雄火龙","雄火","天空王者","天空亡者","火龙"],"g":"MHWilds"},{"n":"炎尾龙","i":"MHWilds/MHWilds-Quematrice_Icon.png","t":0,"a":["鸡哥","坤坤","炎尾","炎尾龙"],"g":"MHWilds"},{"n":"煌雷龙","i":"MHWilds/MHWilds-Rey_Dau_Icon.png","t":0,"a":["黄磊","煌雷","黄雷","煌雷龙"],"g":"MHWilds"},{"n":"犹大环的心脏","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Jin_Dahaad.png","t":2,"a":["犹大环的心脏","历战王冻峰龙","王冻峰龙","王冻峰","王冻","历战王东风龙","王东风龙","王东风"],"g":"MHWilds"},{"n":"狱焰蛸","i":"MHWilds/MHWilds-Nu_Udra_Icon.png","t":0,"a":["章鱼","章鱼烧","大章鱼","狱焰蛸","狱焰烧","狱炎蛸","狱炎烧","火章鱼"],"g":"MHWilds"},{"n":"白炽龙","i":"MHWilds/MHWilds-Zoh_Shia_Icon.png","t":0,"a":["白炽","白炽龙","白炽灯","白痴","白痴龙"],"g":"MHWilds"},{"n":"缠蛙","i":"MHWilds/MHWilds-Chatacabra_Icon.png","t":0,"a":["蛙蛙","缠蛙"],"g":"MHWilds"},{"n":"赫猿兽","i":"MHWilds/MHWilds-Ajarakan_Icon.png","t":0,"a":["二刺螈","二刺猿","火猴","火猴子","赫猿兽"],"g":"MHWilds"},{"n":"走出孤独，名为自由","i":"MHWilds_ArchTempered/MHWilds-Arch_Tempered_Arkveld.png","t":2,"a":["走出孤独，名为自由","历战王锁刃龙","王锁刃龙","王锁刃","王锁","王所"],"g":"MHWilds"},{"n":"辟兽","i":"MHWilds/MHWilds-Doshaguma_Icon.png","t":0,"a":["p兽","P兽","阿p","阿P","辟兽"],"g":"MHWilds"},{"n":"铠龙","i":"MHWilds/MHWilds-Gravios_Icon.png","t":0,"a":["铠龙"],"g":"MHWilds"},{"n":"锁刃龙","i":"MHWilds/MHWilds-Arkveld_Icon.png","t":0,"a":["锁刃","普锁","锁刃龙"],"g":"MHWilds"},{"n":"雌火龙","i":"MHWilds/MHWilds-Rathian_Icon.png","t":0,"a":["雌火","太太","雌火龙"],"g":"MHWilds"},{"n":"雪狮子王","i":"MHWilds/MHWilds-Blangonga_Icon.png","t":0,"a":["雪狮子","大雪狮子","大雪狮","雪狮子王"],"g":"MHWilds"},{"n":"零式游星欧米茄","i":"MHWilds_Tempered/MHWilds-Tempered_Omega_Planetes.png","t":1,"a":["零式欧米茄","零式欧米加","历战欧米茄","历战欧米加","零食欧米茄","零食欧米加","零式","零食","历战游星欧米茄","历战游星欧米加","零式游星欧米茄","零食游星欧米茄","零式游星欧米加","零食游星欧米加","历战游星欧米茄","历战游星欧米加"],"g":"MHWilds"},{"n":"风铗龙","i":"MHWilds/MHWilds-Hirabami_Icon.png","t":0,"a":["风铗","风夹龙","风霞龙","风铗龙"],"g":"MHWilds"},{"n":"黑蚀龙","i":"MHWilds/MHWilds-Gore_Magala_Icon.png","t":0,"a":["黑蚀","黑丝","嗨丝","黑蚀龙"],"g":"MHWilds"},{"n":"250钢龙","i":"MHWorld/MHWI-Kushala_Daora_Icon.png","t":0,"a":["250钢龙"],"g":"MHWorld"},{"n":"冥灯龙","i":"MHWorld/MHWI-Xenojiiva_Icon.png","t":0,"a":["小明","冥灯","冥灯龙"],"g":"MHWorld"},{"n":"古代鹿首精","i":"MHWorld/MHWI-Leshen_Icon.png","t":0,"a":["古代鹿","古代鹿首精"],"g":"MHWorld"},{"n":"土砂龙","i":"MHWorld/MHWI-Barroth_Icon.png","t":0,"a":["土砂","土砂龙"],"g":"MHWorld"},{"n":"大痹贼龙","i":"MHWorld/MHWI-Great_Girros_Icon.png","t":0,"a":["痹贼","大凶颚龙","凶颚龙","大痹贼龙"],"g":"MHWorld"},{"n":"大贼龙","i":"MHWorld/MHWI-Great_Jagras_Icon.png","t":0,"a":["中分哥","大凶豺龙","凶豺龙","贼龙","大贼龙"],"g":"MHWorld"},{"n":"尸套龙","i":"MHWorld/MHWI-Vaal_Hazak_Icon.png","t":0,"a":["尸套","尸套龙"],"g":"MHWorld"},{"n":"岩贼龙","i":"MHWorld/MHWI-Dodogama_Icon.png","t":0,"a":["肥宅","岩贼龙"],"g":"MHWorld"},{"n":"恐暴龙","i":"MHWorld/MHWI-Deviljho_Icon.png","t":0,"a":["恐暴","丝瓜","黄瓜","金瓜","恐暴龙"],"g":"MHWorld"},{"n":"惨爪龙","i":"MHWorld/MHWI-Odogaron_Icon.png","t":0,"a":["惨爪","惨爪龙"],"g":"MHWorld"},{"n":"我的高贵灵魂","i":"MHWorld_Tempered/MHWI-Tempered_Lunastra.png","t":1,"a":["高贵灵魂","我的高贵灵魂"],"g":"MHWorld"},{"n":"搔鸟","i":"MHWorld/MHWI-Kulu-Ya-Ku_Icon.png","t":0,"a":["骚鸟","搔鸟"],"g":"MHWorld"},{"n":"极贝","i":"MHWorld/MHWI-Behemoth_Icon.png","t":0,"a":["极贝"],"g":"MHWorld"},{"n":"樱火龙","i":"MHWorld/MHWI-Pink_Rathian_Icon.png","t":0,"a":["樱火","樱火龙"],"g":"MHWorld"},{"n":"毒妖鸟","i":"MHWorld/MHWI-Pukei-Pukei_Icon.png","t":0,"a":["毒妖","毒妖鸟"],"g":"MHWorld"},{"n":"泥鱼龙","i":"MHWorld/MHWI-Jyuratodus_Icon.png","t":0,"a":["泥鱼","泥鱼龙"],"g":"MHWorld"},{"n":"浮空龙","i":"MHWorld/MHWI-Paolumu_Icon.png","t":0,"a":["浮空","浮空龙"],"g":"MHWorld"},{"n":"灭尽龙","i":"MHWorld/MHWI-Nergigante_Icon.png","t":0,"a":["灭尽","上位咩咩","上位灭尽龙","上位灭尽","上位咩咩子","灭尽龙","咩","咩咩子"],"g":"MHWorld"},{"n":"灭日","i":"MHWorld_Tempered/MHWI-Tempered_Teostra.png","t":1,"a":["灭日"],"g":"MHWorld"},{"n":"炎妃龙","i":"MHWorld/MHWI-Lunastra_Icon.png","t":0,"a":["炎妃","蓝猫","蓝色粪怪","疯婆子","蓝色答辩","娜娜","炎妃龙"],"g":"MHWorld"},{"n":"炎王龙","i":"MHWorld/MHWI-Teostra_Icon.png","t":0,"a":["炎王","红猫","炎喵","红喵","火喵","粉喵","火炎王","粉炎王","炎王龙"],"g":"MHWorld"},{"n":"熔山龙","i":"MHWorld/MHWI-Zorah_Magdaros_Icon.png","t":0,"a":["熔山","熔山龙"],"g":"MHWorld"},{"n":"熔岩龙","i":"MHWorld/MHWI-Lavasioth_Icon.png","t":0,"a":["烤鱼","熔岩龙"],"g":"MHWorld"},{"n":"爆锤龙","i":"MHWorld/MHWI-Uragaan_Icon.png","t":0,"a":["爆锤","姚明","车轮滚滚","暴锤","暴锤龙","爆锤龙"],"g":"MHWorld"},{"n":"爆鳞龙","i":"MHWorld/MHWI-Bazelgeuse_Icon.png","t":0,"a":["爆鳞","B52","上位爆鳞龙","上位爆鳞","阿爆","爆鳞龙"],"g":"MHWorld"},{"n":"眩鸟","i":"MHWorld/MHWI-Tzitzi-Ya-Ku_Icon.png","t":0,"a":["战地记者","记者","眩鸟"],"g":"MHWorld"},{"n":"绚辉龙","i":"MHWorld/MHWI-Kulve_Taroth_Icon.png","t":0,"a":["富婆","渣渣辉","绚辉","绚辉龙"],"g":"MHWorld"},{"n":"苍火龙","i":"MHWorld/MHWI-Azure_Rathalos_Icon.png","t":0,"a":["苍火","苍火龙"],"g":"MHWorld"},{"n":"蛮颚龙","i":"MHWorld/MHWI-Anjanath_Icon.png","t":0,"a":["蛮颚","蛮颚龙","蛮鄂龙","蛮鄂"],"g":"MHWorld"},{"n":"角龙","i":"MHWorld/MHWI-Diablos_Icon.png","t":0,"a":["角龙"],"g":"MHWorld"},{"n":"贝希摩斯","i":"MHWorld/MHWI-Behemoth_Icon.png","t":0,"a":["贝","贝希摩斯"],"g":"MHWorld"},{"n":"钢龙","i":"MHWorld/MHWI-Kushala_Daora_Icon.png","t":0,"a":["钢钢子","阿钢","钢龙"],"g":"MHWorld"},{"n":"风暴的棺材","i":"MHWorld_Tempered/MHWI-Tempered_Kushala_Daora.png","t":1,"a":["历战钢龙","风暴的棺材","棺材"],"g":"MHWorld"},{"n":"风漂龙","i":"MHWorld/MHWI-Legiana_Icon.png","t":0,"a":["风漂","风飘","风飘龙","风漂龙"],"g":"MHWorld"},{"n":"飞雷龙","i":"MHWorld/MHWI-Tobi-Kadachi_Icon.png","t":0,"a":["飞雷","飞雷龙"],"g":"MHWorld"},{"n":"骨锤龙","i":"MHWorld/MHWI-Radobaan_Icon.png","t":0,"a":["骨锤","骨锤龙"],"g":"MHWorld"},{"n":"鹿首精","i":"MHWorld/MHWI-Leshen_Icon.png","t":0,"a":["鹿首精"],"g":"MHWorld"},{"n":"麒麟","i":"MHWorld/MHWI-Kirin_Icon.png","t":0,"a":["电驴","断角麒麟","彩虹小马","小马","麒麟"],"g":"MHWorld"},{"n":"黑角龙","i":"MHWorld/MHWI-Black_Diablos_Icon.png","t":0,"a":["黑角","黑光炯炯","黑角龙"],"g":"MHWorld"},{"n":"你是黄金奖杯","i":"MHWI_Tempered/MHWI-Tempered_Furious_Rajang_Icon.png","t":1,"a":["奖杯","黄金奖杯","原神","猿神","你是黄金奖杯","历战激昂金狮子","历战激昂","J8"],"g":"MHWI"},{"n":"再会雷狼龙","i":"MHWI/MHWI-Zinogre_Icon.png","t":0,"a":["再会雷狼龙","炭只狼","碳只狼","炭治郎"],"g":"MHWI"},{"n":"冥赤龙","i":"MHWI/MHWI-Safijiiva_Icon.png","t":0,"a":["赤龙","冥赤","冥赤龙"],"g":"MHWI"},{"n":"冰呪龙","i":"MHWI/MHWI-Velkhana_Icon.png","t":0,"a":["冰呪","冰粥","冰呪龙","冰粥龙","冰冰子","冰咒","冰咒龙","冰冰"],"g":"MHWI"},{"n":"冰牙龙","i":"MHWI/MHWI-Barioth_Icon.png","t":0,"a":["冰牙","白色答辩","灵活的狗","山里灵活的狗","白色粪怪","冰牙龙"],"g":"MHWI"},{"n":"冰鱼龙","i":"MHWI/MHWI-Beotodus_Icon.png","t":0,"a":["冰鱼","冰鱼龙"],"g":"MHWI"},{"n":"凶爪龙","i":"MHWI/MHWI-Ebony_Odogaron_Icon.png","t":0,"a":["凶爪","凶爪龙"],"g":"MHWI"},{"n":"天地煌啼龙","i":"MHWI/MHWI-Shara_Ishvalda_Icon.png","t":0,"a":["弟弟龙","地啼龙","天地煌啼","天地煌啼龙"],"g":"MHWI"},{"n":"惶怒恐暴龙","i":"MHWI/MHWI-Savage_Deviljho_Icon.png","t":0,"a":["惶怒","酱瓜","瓜瓜","阿瓜","惶怒恐暴龙"],"g":"MHWI"},{"n":"战痕黑狼鸟","i":"MHWI_Tempered/MHWI-Tempered_Scarred_Yian_Garuga_Icon.png","t":1,"a":["战痕黑鸡","战痕","战痕黑狼鸟"],"g":"MHWI"},{"n":"斩龙","i":"MHWI/MHWI-Glavenus_Icon.png","t":0,"a":["斩龙"],"g":"MHWI"},{"n":"最后的白骑士","i":"MHWI_Tempered/MHWI-Tempered_Barioth_Icon.png","t":1,"a":["历战霜牙","历战霜刃冰牙","历战霜冰","最后的白骑士","历战霜刃冰牙龙"],"g":"MHWI"},{"n":"歼世灭尽龙","i":"MHWI/MHWI-Ruiner_Nergigante_Icon.png","t":0,"a":["歼灭","歼咩","花嫁灭尽","花嫁灭尽龙","花嫁歼咩","花嫁歼灭","咩咩","歼世灭尽龙"],"g":"MHWI"},{"n":"水妖鸟","i":"MHWI/MHWI-Coral_Pukei-Pukei_Icon.png","t":0,"a":["水妖","水妖鸟"],"g":"MHWI"},{"n":"浮眠龙","i":"MHWI/MHWI-Nightshade_Paolumu_Icon.png","t":0,"a":["浮眠","眠浮","眠浮龙","浮眠龙"],"g":"MHWI"},{"n":"溟呼远响","i":"MHWI_ArchTempered/MHWI-Arch_Tempered_Namielle_Icon.png","t":2,"a":["王溟波","历战王溟波龙","王冥波","历战王冥波龙","溟呼远响","王明波","王马桶"],"g":"MHWI"},{"n":"溟波龙","i":"MHWI/MHWI-Namielle_Icon.png","t":0,"a":["溟波","溟波龙","冥波","冥波龙","明波龙","马桶"],"g":"MHWI"},{"n":"激昂金狮子","i":"MHWI/MHWI-Furious_Rajang_Icon.png","t":0,"a":["激昂","超级赛亚人","赛亚人","超赛","拉詹很生气","激昂金狮子"],"g":"MHWI"},{"n":"煌黑龙","i":"MHWI/MHWI-Alatreon_Icon.png","t":0,"a":["煌黑","羊驼","煌尼玛","黄黑龙","黄尼玛","草泥马","黎明死星","黄昏黑星","煌黑龙"],"g":"MHWI"},{"n":"狱狼龙","i":"MHWI/MHWI-Stygian_Zinogre_Icon.png","t":0,"a":["狱狼","狱娘","黑狗","狱狼龙"],"g":"MHWI"},{"n":"猛爆碎龙","i":"MHWI/MHWI-Raging_Brachydios_Icon.png","t":0,"a":["猛爆","萌宝","爆碎","萌宝碎龙","猛爆碎龙"],"g":"MHWI"},{"n":"猛牛龙","i":"MHWI/MHWI-Banbaro_Icon.png","t":0,"a":["猛牛","牛牛","猛牛龙"],"g":"MHWI"},{"n":"痹毒龙","i":"MHWI/MHWI-Viper_Tobi-Kadachi_Icon.png","t":0,"a":["痹毒","痹毒龙"],"g":"MHWI"},{"n":"硫斩龙","i":"MHWI/MHWI-Acidic_Glavenus_Icon.png","t":0,"a":["硫斩","流斩","硫斩龙"],"g":"MHWI"},{"n":"碎龙","i":"MHWI/MHWI-Brachydios_Icon.png","t":0,"a":["碎龙"],"g":"MHWI"},{"n":"红莲爆鳞龙","i":"MHWI/MHWI-Seething_Bazelgeuse_Icon.png","t":0,"a":["红莲","红莲爆鳞","红莲阿爆","红莲爆鳞龙"],"g":"MHWI"},{"n":"轰龙","i":"MHWI/MHWI-Tigrex_Icon.png","t":0,"a":["车龙","车车车龙","车车车","车车龙","轰爬爬","轰龙"],"g":"MHWI"},{"n":"迅龙","i":"MHWI/MHWI-Nargacuga_Icon.png","t":0,"a":["迅喵","迅龙"],"g":"MHWI"},{"n":"金火龙","i":"MHWI/MHWI-Gold_Rathian_Icon.png","t":0,"a":["金火","金火龙"],"g":"MHWI"},{"n":"金狮子","i":"MHWI/MHWI-Rajang_Icon.png","t":0,"a":["辣酱","金狮子"],"g":"MHWI"},{"n":"银火龙","i":"MHWI/MHWI-Silver_Rathalos_Icon.png","t":0,"a":["银火","银火龙"],"g":"MHWI"},{"n":"雪花沉睡","i":"MHWI_ArchTempered/MHWI-Arch_Tempered_Velkhana_Icon.png","t":2,"a":["王冰","王冰呪","王冰粥","王冰呪龙","王冰粥龙","王冰咒","王冰冰","历战王冰","历战王冰呪","历战王冰粥","历战王冰呪龙","历战王冰粥龙","历战王冰咒","历战王冰冰","雪花沉睡"],"g":"MHWI"},{"n":"雷狼龙","i":"MHWI/MHWI-Zinogre_Icon.png","t":0,"a":["雷狼","雷娘","雷狗","雷狼龙"],"g":"MHWI"},{"n":"雷颚龙","i":"MHWI/MHWI-Fulgur_Anjanath_Icon.png","t":0,"a":["雷颚","雷颚龙","雷鄂龙","雷鄂"],"g":"MHWI"},{"n":"雾瘴尸套龙","i":"MHWI/MHWI-Blackveil_Vaal_Hazak_Icon.png","t":0,"a":["雾瘴尸套","花嫁尸套龙","花嫁尸套","雾瘴尸套龙"],"g":"MHWI"},{"n":"霜刃冰牙龙","i":"MHWI/MHWI-Frostfang_Barioth_Icon.png","t":0,"a":["霜牙","霜刃冰牙","霜冰","霜刃冰牙龙"],"g":"MHWI"},{"n":"霜翼风漂龙","i":"MHWI/MHWI-Shrieking_Legiana_Icon.png","t":0,"a":["霜漂","霜飘","霜翼风漂","霜翼风飘龙","霜翼风飘","霜翼风漂龙"],"g":"MHWI"},{"n":"黑狼鸟","i":"MHWI/MHWI-Yian_Garuga_Icon.png","t":0,"a":["黑疯子","黑狼","黑鸡","黑狼鸟"],"g":"MHWI"},{"n":"黑轰龙","i":"MHWI/MHWI-Brute_Tigrex_Icon.png","t":0,"a":["黑轰","白轰","白轰龙","黑轰龙"],"g":"MHWI"},{"n":"黑龙","i":"MHWI/MHWI-Fatalis_Icon.png","t":0,"a":["米拉","米拉小姐","嗨龙","米拉波雷亚斯","尼龙","黑龙"],"g":"MHWI"},{"n":"250炎王龙 250炎王","i":"MHRise/MHRS-Teostra_Icon.png","t":0,"a":["250炎王龙 250炎王"],"g":"MHRise"},{"n":"250霞龙","i":"MHRise/MHRS-Chameleos_Icon.png","t":0,"a":["250霞龙"],"g":"MHRise"},{"n":"270天彗龙 270天彗","i":"MHRise/MHRS-Crimson_Glow_Valstrax_Icon.png","t":0,"a":["270天彗龙 270天彗"],"g":"MHRise"},{"n":"人鱼龙","i":"MHRise/MHRS-Somnacanth_Icon.png","t":0,"a":["人鱼","怪异人鱼","怪异化人鱼龙","怪异化人鱼","怪异人鱼龙","300人鱼","300人鱼龙","人鱼龙"],"g":"MHRise"},{"n":"伞鸟","i":"MHRise/MHRS-Aknosom_Icon.png","t":0,"a":["唐伞妖怪","怪异伞鸟","怪异化伞鸟","300伞鸟","伞鸟"],"g":"MHRise"},{"n":"天狗兽","i":"MHRise/MHRS-Bishaten_Icon.png","t":0,"a":["天狗","舔狗","舔狗兽","天狗兽"],"g":"MHRise"},{"n":"奇怪龙","i":"MHRise/MHRS-Khezu_Icon.png","t":0,"a":["夫鲁夫鲁","奇怪牛牛","奇怪龙"],"g":"MHRise"},{"n":"妃蜘蛛","i":"MHRise/MHRS-Rakna-Kadaki_Icon.png","t":0,"a":["妃蜘蛛"],"g":"MHRise"},{"n":"岩龙","i":"MHRise/MHRS-Basarios_Icon.png","t":0,"a":["岩龙"],"g":"MHRise"},{"n":"怨虎龙","i":"MHRise/MHRS-Magnamalo_Icon.png","t":0,"a":["胖虎","胖虎龙","怨虎龙"],"g":"MHRise"},{"n":"毒狗龙王","i":"MHRise/MHRS-Great_Wroggi_Icon.png","t":0,"a":["毒狗","怪异克服毒狗龙王","怪克毒狗龙王","怪异克服毒狗","怪克毒狗","怪异毒狗","怪异毒狗龙","怪异毒狗龙王","毒狗龙王"],"g":"MHRise"},{"n":"水兽","i":"MHRise/MHRS-Royal_Ludroth_Icon.png","t":0,"a":["香蕉","怪异克服水兽","怪克水兽","怪异水兽","水兽"],"g":"MHRise"},{"n":"泥翁龙","i":"MHRise/MHRS-Almudron_Icon.png","t":0,"a":["泥翁","泥翁龙"],"g":"MHRise"},{"n":"白兔兽","i":"MHRise/MHRS-Lagombi_Icon.png","t":0,"a":["白兔","白兔兽"],"g":"MHRise"},{"n":"百龙渊源雷神龙","i":"MHRise/MHRS-Narwa_the_Allmother_Icon.png","t":0,"a":["百龙渊源","百雷","渊雷","百龙渊源雷神龙"],"g":"MHRise"},{"n":"眠狗龙王","i":"MHRise/MHRS-Great_Baggi_Icon.png","t":0,"a":["眠狗","眠狗龙","眠狗龙王"],"g":"MHRise"},{"n":"神秘红光天彗龙","i":"MHRise/MHRS-Crimson_Glow_Valstrax_Icon.png","t":0,"a":["天彗","天彗龙","神秘红光天彗龙"],"g":"MHRise"},{"n":"赤甲兽","i":"MHRise/MHRS-Volvidon_Icon.png","t":0,"a":["赤甲","赤甲兽"],"g":"MHRise"},{"n":"镰鼬龙王","i":"MHRise/MHRS-Great_Izuchi_Icon.png","t":0,"a":["镰鼬","镰鼬龙","镰鼬龙王"],"g":"MHRise"},{"n":"雪鬼兽","i":"MHRise/MHRS-Goss_Harag_Icon.png","t":0,"a":["雪鬼","双刀哥","双刀侠","雪鬼兽"],"g":"MHRise"},{"n":"雷神龙","i":"MHRise/MHRS-Thunder_Serpent_Narwa_Icon.png","t":0,"a":["雷神","雷神龙"],"g":"MHRise"},{"n":"霞龙","i":"MHRise/MHRS-Chameleos_Icon.png","t":0,"a":["霞龙"],"g":"MHRise"},{"n":"霸主泡狐龙","i":"MHRise/MHRS-Apex_Mizutsune_Icon.png","t":0,"a":["霸主泡狐","霸主泡狐龙"],"g":"MHRise"},{"n":"霸主火龙","i":"MHRise/MHRS-Apex_Rathalos_Icon.png","t":0,"a":["霸主雄火龙","霸主火龙"],"g":"MHRise"},{"n":"霸主角龙","i":"MHRise/MHRS-Apex_Diablos_Icon.png","t":0,"a":["霸主角龙"],"g":"MHRise"},{"n":"霸主雌火龙","i":"MHRise/MHRS-Apex_Rathian_Icon.png","t":0,"a":["霸主雌火","霸主太太","霸主雌火龙"],"g":"MHRise"},{"n":"霸主雷狼龙","i":"MHRise/MHRS-Apex_Zinogre_Icon.png","t":0,"a":["霸主雷狼","霸主雷娘","霸主雷狗","霸主雷狼龙"],"g":"MHRise"},{"n":"霸主青熊兽","i":"MHRise/MHRS-Apex_Arzuros_Icon.png","t":0,"a":["霸主青熊","霸主青熊兽"],"g":"MHRise"},{"n":"青熊兽","i":"MHRise/MHRS-Arzuros_Icon.png","t":0,"a":["青熊","青熊兽"],"g":"MHRise"},{"n":"风神龙","i":"MHRise/MHRS-Wind_Serpent_Ibushi_Icon.png","t":0,"a":["风神","风神龙"],"g":"MHRise"},{"n":"冥渊龙","i":"MHRS/MHRS-Gaismagorm_Icon.png","t":0,"a":["冥渊","冥渊龙"],"g":"MHRS"},{"n":"冰人鱼龙","i":"MHRS/MHRS-Aurora_Somnacanth_Icon.png","t":0,"a":["冰人鱼","冰人鱼龙"],"g":"MHRS"},{"n":"冰狼龙","i":"MHRS/MHRS-Lunagaron_Icon.png","t":0,"a":["冰狼","加鲁鲁","兽人加鲁鲁","冰狼龙"],"g":"MHRS"},{"n":"刚缠兽","i":"MHRS/MHRS-Garangolm_Icon.png","t":0,"a":["刚缠","刚缠兽"],"g":"MHRS"},{"n":"原初形态爵银龙","i":"MHRS/MHRS-Primordial_Malzeno_Icon.png","t":0,"a":["原爵","烈祸爵银","烈祸爵","原初爵银","原初爵","原初形态爵银龙","原初形态爵银龙"],"g":"MHRS"},{"n":"嗟怨震天怨虎龙","i":"MHRS/MHRS-Scorned_Magnamalo_Icon.png","t":0,"a":["明日香","霸天虎","大胖虎","独眼胖虎","震天虎","嗟怨震天怨虎龙"],"g":"MHRS"},{"n":"大名盾蟹","i":"MHRS/MHRS-Daimyo_Hermitaur_Icon.png","t":0,"a":["盾蟹","大名盾蟹"],"g":"MHRS"},{"n":"天廻龙","i":"MHRS/MHRS-Shagaru_Magala_Icon.png","t":0,"a":["天廻","天回","天回龙","白丝","天廻龙"],"g":"MHRS"},{"n":"将军镰蟹","i":"MHRS/MHRS-Shogun_Ceanataur_Icon.png","t":0,"a":["镰蟹","将军镰蟹"],"g":"MHRS"},{"n":"岚龙","i":"MHRS/MHRS-Amatsu_Icon.png","t":0,"a":["岚妹","岚龙"],"g":"MHRS"},{"n":"怪异克服天廻龙","i":"MHRS_Risen/MHRS-Risen_Shagaru_Magala_Icon.png","t":0,"a":["怪异克服天廻","怪克天廻龙","怪克天廻","怪异克服天回","怪克天回龙","怪克天回","300天回","300天廻","怪异克服天廻龙"],"g":"MHRS"},{"n":"怪异克服天彗龙","i":"MHRS_Risen/MHRS-Risen_Crimson_Glow_Valstrax_Icon.png","t":0,"a":["怪异克服天彗","怪克天彗龙","怪克天彗","300天彗","300天彗龙","怪异克服天彗龙"],"g":"MHRS"},{"n":"怪异克服炎王龙","i":"MHRS_Risen/MHRS-Risen_Teostra_Icon.png","t":0,"a":["怪异克服炎王","怪克炎王龙","怪克炎王","300炎王","300炎王龙","怪异克服炎王龙"],"g":"MHRS"},{"n":"怪异克服钢龙","i":"MHRS_Risen/MHRS-Risen_Kushala_Daora_Icon.png","t":0,"a":["怪克钢龙","300钢龙","怪异克服钢龙"],"g":"MHRS"},{"n":"怪异克服霞龙","i":"MHRS_Risen/MHRS-Risen_Chameleos_Icon.png","t":0,"a":["怪克霞龙","300霞龙","怪异克服霞龙"],"g":"MHRS"},{"n":"月迅龙","i":"MHRS/MHRS-Lucent_Nargacuga_Icon.png","t":0,"a":["月迅","月迅龙"],"g":"MHRS"},{"n":"棘茶龙","i":"MHRS/MHRS-Flaming_Espinas_Icon.png","t":0,"a":["茶几","茶几龙","棘茶","棘茶龙"],"g":"MHRS"},{"n":"棘龙","i":"MHRS/MHRS-Espinas_Icon.png","t":0,"a":["怪异克服棘龙","怪克棘龙","棘龙"],"g":"MHRS"},{"n":"混沌黑蚀龙","i":"MHRS/MHRS-Chaotic_Gore_Magala_Icon.png","t":0,"a":["混沌黑蚀","奥利奥","混沌黑丝","混沌黑蚀龙"],"g":"MHRS"},{"n":"炽妃蜘蛛","i":"MHRS/MHRS-Pyre_Rakna-Kadaki_Icon.png","t":0,"a":["红蜘蛛","炽妃蜘蛛"],"g":"MHRS"},{"n":"烈祸月迅龙","i":"MHRS/MHRS-Lucent_Nargacuga_Icon.png","t":0,"a":["烈祸月迅","烈祸月迅龙"],"g":"MHRS"},{"n":"烈祸棘茶龙","i":"MHRS/MHRS-Flaming_Espinas_Icon.png","t":0,"a":["烈祸棘茶","烈祸棘","烈祸棘茶龙"],"g":"MHRS"},{"n":"焰狐龙","i":"MHRS/MHRS-Violet_Mizutsune_Icon.png","t":0,"a":["焰狐","紫色答辩","焰狐龙"],"g":"MHRS"},{"n":"熔翁龙","i":"MHRS/MHRS-Magma_Almudron_Icon.png","t":0,"a":["熔翁","熔翁龙"],"g":"MHRS"},{"n":"爵银龙","i":"MHRS/MHRS-Malzeno_Icon.png","t":0,"a":["爵银","爵银龙"],"g":"MHRS"},{"n":"电龙","i":"MHRS/MHRS-Astalos_Icon.png","t":0,"a":["电龙"],"g":"MHRS"},{"n":"绯天狗兽","i":"MHRS/MHRS-Blood_Orange_Bishaten_Icon.png","t":0,"a":["绯天狗","绯天狗兽"],"g":"MHRS"}]</script>
+<script>
+"use strict";
+
+/* =============================================================================
+   数据
+   ============================================================================= */
+const M_ICON = "../../public/monster_icons/";
+const W_ICON = "../../public/weapon_icons/MHWilds/";
+
+/** 14 把武器（官方简中名 + MHWilds 白色基础图标） */
+const WEAPONS = [
+  {cn:"大剑",   en:"GREAT SWORD",     f:"MHWilds-Great_Sword_Icon_Base.png"},
+  {cn:"太刀",   en:"LONG SWORD",      f:"MHWilds-Long_Sword_Icon_Base.png"},
+  {cn:"单手剑", en:"SWORD & SHIELD",  f:"MHWilds-Sword_and_Shield_Icon_Base.png"},
+  {cn:"双剑",   en:"DUAL BLADES",     f:"MHWilds-Dual_Blades_Icon_Base.png"},
+  {cn:"大锤",   en:"HAMMER",          f:"MHWilds-Hammer_Icon_Base.png"},
+  {cn:"狩猎笛", en:"HUNTING HORN",    f:"MHWilds-Hunting_Horn_Icon_Base.png"},
+  {cn:"长枪",   en:"LANCE",           f:"MHWilds-Lance_Icon_Base.png"},
+  {cn:"铳枪",   en:"GUNLANCE",        f:"MHWilds-Gunlance_Icon_Base.png"},
+  {cn:"斩击斧", en:"SWITCH AXE",      f:"MHWilds-Switch_Axe_Icon_Base.png"},
+  {cn:"盾斧",   en:"CHARGE BLADE",    f:"MHWilds-Charge_Blade_Icon_Base.png"},
+  {cn:"操虫棍", en:"INSECT GLAIVE",   f:"MHWilds-Insect_Glaive_Icon_Base.png"},
+  {cn:"轻弩炮", en:"LIGHT BOWGUN",    f:"MHWilds-Light_Bowgun_Icon_Base.png"},
+  {cn:"重弩炮", en:"HEAVY BOWGUN",    f:"MHWilds-Heavy_Bowgun_Icon_Base.png"},
+  {cn:"弓",     en:"BOW",             f:"MHWilds-Bow_Icon_Base.png"},
+];
+const MONSTERS = JSON.parse(document.getElementById("monster-data").textContent);
+
+const GAMES = [
+  {id:"MHWilds", label:"荒野"},
+  {id:"MHWorld", label:"世界"},
+  {id:"MHWI",    label:"冰原"},
+  {id:"MHRise",  label:"崛起"},
+  {id:"MHRS",    label:"曙光"},
+];
+const LV_NAME = ["普通","历战","历战王"];
+
+/* =============================================================================
+   状态
+   ============================================================================= */
+const S = {
+  mode:"both",
+  pace:1,
+  games:new Set(GAMES.map(g=>g.id)),
+  wOff:new Set(),        // 被排除的武器文件名
+  mOff:new Set(),        // 被排除的怪物名
+  fx:"normal",
+  rolling:false,
+  history:[],
+  last:null,
+  seq:0,
+};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const wIcon = w => W_ICON + w.f;
+const mIcon = m => M_ICON + m.i;
+
+const poolW = () => WEAPONS.filter(w => !S.wOff.has(w.f));
+const poolM = () => MONSTERS.filter(m => S.games.has(m.g) && !S.mOff.has(m.n));
+const needW = () => S.mode !== "monster";
+const needM = () => S.mode !== "weapon";
+
+/* =============================================================================
+   节奏表：把「悬念」拆成 7 段可调时间轴
+   ============================================================================= */
+const SEGMENTS = [
+  {id:"wind",  label:"起手", dur:340, gap: 90, tip:"起手：卡片先抖一下，按钮锁定"},
+  {id:"rush1", label:"高速", dur:900, gap: 46, tip:"高速段：46ms 一帧，图标完全糊成残影"},
+  {id:"rush2", label:"中速", dur:900, gap: 62, tip:"中速段：放到 62ms，开始能看清轮廓"},
+  {id:"slow",  label:"减速", dur:500, gap:110, tip:"减速段：明显慢下来，观众以为要停了"},
+  {id:"fake",  label:"伪停", dur:300, gap:200, tip:"伪停：慢到几乎停住 —— 但还没停"},
+  {id:"burst", label:"再冲", dur:200, gap: 70, tip:"再冲：突然又加速一次，把悬念拉回来"},
+  {id:"settle",label:"落位", dur:200, gap:160, tip:"落位：真正停下，进入锁定"},
+];
+const PACES = [{s:.40,eta:"1.2s"},{s:1,eta:"3.0s"},{s:1.60,eta:"4.8s"}];
+
+function schedule(){
+  const p = PACES[S.pace], slow = S.fx==="slow" ? 1/0.45 : 1, red = S.fx==="reduce";
+  const segs = red ? [{...SEGMENTS[0],dur:120,gap:120},{...SEGMENTS[6],dur:160,gap:160}]
+                   : SEGMENTS.map(g => ({...g, dur:g.dur*p.s*slow, gap:g.gap*p.s*slow}));
+  const out = [];
+  for (const g of segs){
+    const steps = Math.max(1, Math.round(g.dur / g.gap));
+    for (let i=0;i<steps;i++) out.push({gap:g.gap, seg:g});
+  }
+  return out;
+}
+
+/* =============================================================================
+   抽选盘
+   ============================================================================= */
+function makeReel(root){
+  const cur = root.querySelector(".reel-cur");
+  const next = root.querySelector(".reel-next");
+  const ic  = el => el.querySelector("img");
+  let current = null;
+  return {
+    show(icon){
+      current = icon;
+      ic(cur).src = icon; ic(next).src = icon;
+    },
+    async step(icon, dur){
+      if (S.fx === "reduce") { this.show(icon); return; }
+      ic(next).src = icon;
+      const a = cur.animate(
+        [{transform:"translateY(0) scale(1)",opacity:1,filter:"blur(0px)"},
+         {transform:"translateY(-58%) scale(.82)",opacity:0,filter:"blur(4px)"}],
+        {duration:dur, easing:"linear", fill:"forwards"});
+      const b = next.animate(
+        [{transform:"translateY(58%) scale(.82)",opacity:0,filter:"blur(4px)"},
+         {transform:"translateY(0) scale(1)",opacity:1,filter:"blur(0px)"}],
+        {duration:dur, easing:"linear", fill:"forwards"});
+      await Promise.all([a.finished, b.finished]);
+      current = icon;
+      ic(cur).src = icon;
+      a.cancel(); b.cancel();
+    },
+    hit(){
+      root.classList.add("locked");
+      setTimeout(()=>root.classList.remove("locked"), 720);
+    },
+  };
+}
+const reelW = makeReel($("reelW"));
+const reelM = makeReel($("reelM"));
+const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+
+/* 时间轴渲染 */
+/** 帧越快 → 色越亮。1=高速 2=中速 3=减速 4=慢速；伪停单独加辉光（它才是悬念的钩子） */
+function speedClass(gap){
+  if (gap <= 50) return "s1";
+  if (gap <= 80) return "s2";
+  if (gap <= 130) return "s3";
+  return "s4";
+}
+
+/** 滚动结束后还有「逐项锁定」与「金光揭晓」两拍，也画进时间轴——不然轨迹会缺一段尾巴 */
+function tailSegs(){
+  const n = (needW() ? 1 : 0) + (needM() ? 1 : 0);
+  const hitMs = S.fx === "reduce" ? 60 * n : 200 * n + 120;
+  const revMs = S.fx === "reduce" ? 220 : 760;
+  return [
+    {label:"锁定", ms:hitMs, cls:"hit",    tip:"逐项锁定：先武器后怪物，错开 200ms 各响一下"},
+    {label:"揭晓", ms:revMs, cls:"reveal", tip:"金光涌起 + 结果名字点亮，按钮解锁"},
+  ];
+}
+
+function renderTimeline(){
+  const sc = schedule();
+  const groups = [];
+  for (const x of sc){
+    const g = groups[groups.length-1];
+    if (g && g.seg.id === x.seg.id) g.n++;
+    else groups.push({seg:x.seg, n:1, ms:x.seg.gap});
+  }
+  const rollMs = groups.reduce((a,g) => a + g.n * g.ms, 0);
+  const tails = tailSegs();
+  const total = rollMs + tails.reduce((a,t) => a + t.ms, 0);
+
+  const bars = groups.map(g => {
+    const ms = Math.round(g.n * g.seg.gap);
+    const cls = "tlseg " + speedClass(g.seg.gap) + (g.seg.id === "fake" ? " fake" : "");
+    return `<div class="${cls}" style="flex:${(ms/total*100).toFixed(3)} 1 0"
+      title="${esc(g.seg.label)} · ${g.n} 帧 × ${Math.round(g.seg.gap)}ms = ${ms}ms&#10;${esc(g.seg.tip)}">
+      <i></i><span>${esc(g.seg.label)}</span></div>`;
+  }).concat(tails.map(t =>
+    `<div class="tlseg ${t.cls}" style="flex:${(t.ms/total*100).toFixed(3)} 1 0" title="${esc(t.label)} · ${Math.round(t.ms)}ms&#10;${esc(t.tip)}">
+      <i></i><span>${esc(t.label)}</span></div>`
+  )).join("");
+
+  $("tl").innerHTML = '<span class="ph"></span>' + bars;
+  $("tl").dataset.total = total;
+  return {sc, total, rollMs};
+}
+
+/* =============================================================================
+   抽选主流程
+   ============================================================================= */
+let rafId = 0;
+function phase(text, cls){
+  $("phaseTxt").textContent = text;
+  $("phase").className = "phase" + (cls ? " " + cls : "");
+}
+function note(text){
+  const n = $("note");
+  if (text){ n.textContent = text; n.classList.add("on"); }
+  else n.classList.remove("on");
+}
+function playhead(total, t0){
+  const tl = $("tl"), ph = tl.querySelector(".ph");
+  tl.classList.add("on");
+  const tick = () => {
+    const e = performance.now() - t0;
+    if (e >= total * 1.06){ tl.classList.remove("on"); return; }
+    ph.style.left = Math.min(100, e/total*100).toFixed(2) + "%";
+    rafId = requestAnimationFrame(tick);
+  };
+  cancelAnimationFrame(rafId);
+  rafId = requestAnimationFrame(tick);
+}
+
+async function draw(){
+  if (S.rolling) return;
+  const pw = poolW(), pm = poolM();
+
+  // 空池守卫：分情况给可操作的提示，而不是笼统「不可抽」
+  if (needW() && !pw.length){ toast("武器池是空的 —— 至少要放回 1 把武器"); return; }
+  if (needM() && !pm.length){ toast("怪物池是空的 —— 放宽作品筛选或从排除名单里放回几只"); return; }
+
+  S.rolling = true;
+  S.last = null;
+  $("resultActions").classList.remove("on");
+  $("drawBtn").disabled = true;
+  $("drawBtn").textContent = "抽选中";
+  $("drawBtn").style.letterSpacing = ".18em";
+
+  const wWin = needW() ? pick(pw) : null;
+  const mWin = needM() ? pick(pm) : null;
+
+  // 起手：卡片抖动
+  [$("reelW"),$("reelM")].forEach(r => { if(!r.classList.contains("off")) r.classList.add("charging"); });
+  note(null);
+  phase("蓄力", "roll");
+  $("stage").classList.add("rolling");
+  await new Promise(r => setTimeout(r, S.fx==="reduce" ? 90 : 260));
+  [$("reelW"),$("reelM")].forEach(r => r.classList.remove("charging"));
+
+  const {sc, total} = renderTimeline();
+  const t0 = performance.now();
+  playhead(total, t0);
+  phase("滚动中", "roll");
+
+  // 两个盘子必须**并行**推进：串行 await 会让实际时长翻倍（标准档 3.0s 跑成 6.0s），
+  // 时间轴播放头也会在半程就停住，和看到的动画对不上。
+  // 最后一帧直接落在中奖项上 —— 真随机只摇一次，滚动的每一帧都只是演出。
+  let curSeg = null;
+  for (let i = 0; i < sc.length; i++){
+    const f = sc[i], last = i === sc.length - 1;
+    if (f.seg !== curSeg){ curSeg = f.seg; note(curSeg.id === "rush1" ? null : curSeg.tip); }
+    const jobs = [];
+    if (needW()) jobs.push(reelW.step(last ? wIcon(wWin) : wIcon(pick(pw)), f.gap));
+    if (needM()) jobs.push(reelM.step(last ? mIcon(mWin) : mIcon(pick(pm)), f.gap));
+    await Promise.all(jobs);
+  }
+  note(null);
+
+  // 逐项锁定：先武器后怪物，错开 200ms
+  const stagger = S.fx==="reduce" ? 60 : 200;
+  if (wWin){ phase("锁定 · 武器"); reelW.hit(); await new Promise(r=>setTimeout(r,stagger)); }
+  if (mWin){ phase("锁定 · 怪物"); reelM.hit(); await new Promise(r=>setTimeout(r,stagger)); }
+
+  // 揭晓
+  S.last = {w:wWin, m:mWin, at:new Date(), no:++S.seq};
+  $("wName").textContent = wWin ? wWin.cn : "—";
+  $("wNameEn").innerHTML  = wWin ? wWin.en : "&nbsp;";
+  $("mName").textContent = mWin ? mWin.n : "—";
+  $("mNameEn").innerHTML  = mWin ? (LV_NAME[mWin.t] || "普通") + (mWin.a.length ? " · " + mWin.a[0] : "") : "&nbsp;";
+  if (wWin) $("reelW").classList.add("hit");
+  if (mWin) $("reelM").classList.add("hit");
+  phase("揭晓", "roll");
+  $("reelLink").classList.add("hot");
+  $("stage").classList.add("revealed");
+  setTimeout(()=>$("stage").classList.remove("revealed"), S.fx==="reduce" ? 400 : 950);
+
+  S.history.unshift(S.last);
+  S.history = S.history.slice(0,12);
+  renderHistory();
+
+  await new Promise(r=>setTimeout(r, S.fx==="reduce" ? 120 : 520));
+  phase("已出结果");
+  $("stage").classList.remove("rolling");
+  S.rolling = false;
+  $("drawBtn").disabled = false;
+  $("drawBtn").textContent = "抽 选";
+  $("drawBtn").style.letterSpacing = ".34em";
+  $("resultActions").classList.add("on");
+  syncHint();
+}
+
+/* =============================================================================
+   渲染
+   ============================================================================= */
+function renderWeapons(){
+  $("wGrid").innerHTML = WEAPONS.map((w,i)=>{
+    const off = S.wOff.has(w.f);
+    return `<div class="wcell ${off?"off":"on"}" data-f="${esc(w.f)}" title="${esc(w.cn)} ${esc(w.en)}${off?"（已排除）":""}"><img src="${wIcon(w)}" alt=""></div>`;
+  }).join("");
+  $("wCount").textContent = `${WEAPONS.length - S.wOff.size} / ${WEAPONS.length}`;
+}
+
+function renderChips(host, onToggle){
+  host.innerHTML = GAMES.map(g=>{
+    const n = MONSTERS.filter(m=>m.g===g.id).length;
+    const on = S.games.has(g.id);
+    return `<button class="chip ${on?"on":""}" data-g="${g.id}">${g.label}<span class="c">${n}</span></button>`;
+  }).join("");
+  host.onclick = e => {
+    const b = e.target.closest("[data-g]"); if (!b) return;
+    onToggle(b.dataset.g);
+  };
+}
+
+function toggleGame(id){
+  if (S.games.has(id)){ if (S.games.size === 1) return toast("至少要保留一个作品"); S.games.delete(id); }
+  else S.games.add(id);
+  renderPools(); renderDrawerGrid();
+}
+
+function renderPools(){
+  renderChips($("gameChips"), toggleGame);
+  const pm = poolM(), total = MONSTERS.length;
+  const gamesM = MONSTERS.filter(m=>S.games.has(m.g)).length;
+  $("mRatio").textContent = `${gamesM} / ${total}`;
+  $("mCount").textContent = pm.length;
+  const excl = MONSTERS.filter(m=>S.mOff.has(m.n)).length;
+  $("mExcl").textContent = excl ? `已排除 ${excl} 只` : "排除名单为空";
+  $("briefW").textContent = poolW().length;
+  $("briefM").textContent = pm.length;
+  syncHint();
+}
+
+function syncHint(){
+  if (S.rolling) return;
+  const pw = poolW(), pm = poolM(), msgs = [];
+  if (needW() && !pw.length) msgs.push("<b>武器池空了</b> —— 全部 14 把都被排除");
+  if (needM() && !pm.length) msgs.push("<b>怪物池空了</b> —— 放宽作品筛选，或从排除名单里放回几只");
+  if (msgs.length){
+    $("hint").innerHTML = msgs.join("；");
+    $("hint").className = "hint warn";
+  } else {
+    const w = pw.length, m = pm.length;
+    $("hint").textContent = S.mode==="weapon" ? `本次从 ${w} 把武器里等概率抽 1 把`
+      : S.mode==="monster" ? `本次从 ${m} 只怪物里等概率抽 1 只`
+      : `本次从 ${w} 把武器 × ${m} 只怪物里等概率各抽 1 个`;
+    $("hint").className = "hint";
+  }
+  $("drawBtn").disabled = S.rolling || (needW() && !pw.length) || (needM() && !pm.length);
+}
+
+function renderReels(){
+  $("reelW").classList.toggle("off", !needW());
+  $("reelM").classList.toggle("off", !needM());
+  $("reelLink").style.display = (needW() && needM()) ? "" : "none";
+}
+
+function renderHistory(){
+  $("hCount").textContent = `最近 12 次 · ${S.history.length} 条`;
+  if (!S.history.length){
+    $("hRow").innerHTML = `<div class="history-empty" style="flex:1">还没有抽选记录 —— 点上面的「抽选」开始</div>`;
+    return;
+  }
+  $("hRow").innerHTML = S.history.map(h=>{
+    const t = h.at.toTimeString().slice(0,5);
+    const names = [h.m ? h.m.n : "—", h.w ? h.w.cn : "—"];
+    return `<div class="hcard" data-no="${h.no}">
+      <div class="r1">
+        ${h.w ? `<img src="${wIcon(h.w)}" alt="">` : ""}
+        ${h.m ? `<img src="${mIcon(h.m)}" alt="">` : ""}
+        <span class="x" style="margin-left:auto">#${h.no}</span>
+      </div>
+      <div class="r2">${esc(names[0])}</div>
+      <div class="r3"><span>${esc(names[1])}</span><span style="margin-left:auto">${t}</span></div>
+    </div>`;
+  }).join("");
+}
+
+/* =============================================================================
+   抽屉
+   ============================================================================= */
+let mKeyword = "";
+function renderDrawerGrid(){
+  const kw = mKeyword.trim().toLowerCase();
+  const list = MONSTERS.filter(m => S.games.has(m.g)).filter(m => {
+    if (!kw) return true;
+    return m.n.toLowerCase().includes(kw) || m.a.some(a => a.toLowerCase().includes(kw));
+  });
+  const wrap = $("mGridWrap");
+  if (!list.length){
+    wrap.innerHTML = `<div class="empty">没有匹配「${esc(mKeyword)}」的怪物</div>`;
+  } else {
+    const by = new Map();
+    for (const m of list){ (by.get(m.g) || by.set(m.g,[]).get(m.g)).push(m); }
+    wrap.innerHTML = GAMES.filter(g=>by.has(g.id)).map(g=>{
+      const arr = by.get(g.id);
+      const offN = arr.filter(m=>S.mOff.has(m.n)).length;
+      return `<div class="grp" style="margin-top:10px">
+          <span>${g.label}</span><span class="c">${arr.length - offN}/${arr.length}</span>
+          <span class="line"></span>
+          <button class="mini" data-grp="${g.id}">${offN===arr.length?"全部放回":"全部排除"}</button>
+        </div>
+        <div class="mgrid">${arr.map(m=>{
+          const off = S.mOff.has(m.n);
+          return `<div class="mcell ${off?"off":""}" data-n="${esc(m.n)}" title="${esc(m.n)}${m.a.length?" · "+esc(m.a.join(" / ")):""}${off?"（已排除）":""}">
+            <img src="${mIcon(m)}" alt="" loading="lazy">
+            ${m.t ? `<span class="lv t${m.t}">${LV_NAME[m.t]}</span>` : ""}
+            <span class="nm">${esc(m.n)}</span>
+          </div>`;
+        }).join("")}</div>`;
+    }).join("");
+  }
+  renderChips($("drawerChips"), toggleGame);
+  const excl = MONSTERS.filter(m=>S.mOff.has(m.n)).length;
+  $("dExcl").textContent = excl;
+  $("dPool").textContent = poolM().length;
+}
+
+function openDrawer(){ renderDrawerGrid(); $("mask").classList.add("on"); $("drawer").classList.add("on"); }
+function closeDrawer(){ $("mask").classList.remove("on"); $("drawer").classList.remove("on"); }
+
+/* =============================================================================
+   提示
+   ============================================================================= */
+let toastT = 0;
+function toast(html){
+  const el = $("toast");
+  el.innerHTML = html;
+  el.classList.add("on");
+  clearTimeout(toastT);
+  toastT = setTimeout(()=>el.classList.remove("on"), 2600);
+}
+
+/* =============================================================================
+   事件绑定
+   ============================================================================= */
+$("modeSeg").onclick = e => {
+  const b = e.target.closest("[data-mode]"); if (!b) return;
+  S.mode = b.dataset.mode;
+  [...e.currentTarget.children].forEach(c => c.classList.toggle("on", c === b));
+  renderReels(); syncHint(); renderPools();
+  $("resultActions").classList.remove("on");
+};
+$("paceSeg").onclick = e => {
+  const b = e.target.closest("[data-pace]"); if (!b) return;
+  S.pace = +b.dataset.pace;
+  [...e.currentTarget.children].forEach(c => c.classList.toggle("on", c === b));
+  $("paceEta").textContent = PACES[S.pace].eta;
+  renderTimeline();
+};
+$("wGrid").onclick = e => {
+  const c = e.target.closest("[data-f]"); if (!c) return;
+  const f = c.dataset.f;
+  if (S.wOff.has(f)) S.wOff.delete(f);
+  else { if (poolW().length === 1){ toast("至少要保留 1 把武器"); return; } S.wOff.add(f); }
+  renderWeapons(); renderPools();
+};
+$("wAll").onclick = () => { S.wOff.clear(); renderWeapons(); renderPools(); };
+$("wNone").onclick = () => {
+  // 清空 = 只留一把，保证池子非空（真正的空池只允许通过「都要/仅武器」时逐步排除造成，并会被守卫拦住）
+  S.wOff = new Set(WEAPONS.slice(1).map(w=>w.f));
+  renderWeapons(); renderPools();
+  toast("已只保留 <b>大剑</b>；把最后一把也排除会被拦下");
+};
+
+$("drawBtn").onclick = draw;
+$("againBtn").onclick = draw;
+$("copyBtn").onclick = () => {
+  if (!S.last) return;
+  const txt = [S.last.w ? S.last.w.cn : null, S.last.m ? S.last.m.n : null].filter(Boolean).join(" × ");
+  navigator.clipboard ? navigator.clipboard.writeText(txt).then(()=>toast(`已复制 <b>${esc(txt)}</b>`)).catch(()=>toast(esc(txt)))
+                      : toast(esc(txt));
+};
+$("toOrderBtn").onclick = () => toast("实装：切到「排队管理」并把 <b>" + esc(S.last && S.last.m ? S.last.m.n : "") + "</b> 预填进选怪面板");
+
+$("openDrawer").onclick = openDrawer;
+$("openDrawerMini").onclick = openDrawer;
+$("closeDrawer").onclick = closeDrawer;
+$("mask").onclick = closeDrawer;
+$("dDone").onclick = closeDrawer;
+$("dReset").onclick = () => { S.mOff.clear(); renderDrawerGrid(); renderPools(); };
+$("dSync").onclick = () => toast("实装：合并「怪物名单」页签的禁点名单（设计稿未接后端）");
+$("hClear").onclick = () => { S.history = []; renderHistory(); };
+
+$("mSearch").oninput = e => { mKeyword = e.target.value; renderDrawerGrid(); };
+$("mGridWrap").onclick = e => {
+  const grp = e.target.closest("[data-grp]");
+  if (grp){
+    const arr = MONSTERS.filter(m=>S.games.has(m.g) && (mKeyword.trim() ? (m.n.toLowerCase().includes(mKeyword.trim().toLowerCase()) || m.a.some(a=>a.toLowerCase().includes(mKeyword.trim().toLowerCase()))) : true));
+    const allOff = arr.every(m=>S.mOff.has(m.n));
+    arr.forEach(m => allOff ? S.mOff.delete(m.n) : S.mOff.add(m.n));
+    renderDrawerGrid(); renderPools(); renderWeapons(); return;
+  }
+  const c = e.target.closest("[data-n]"); if (!c) return;
+  const n = c.dataset.n;
+  if (S.mOff.has(n)) S.mOff.delete(n);
+  else { if (poolM().length === 1){ toast("至少要保留 1 只怪物"); return; } S.mOff.add(n); }
+  renderDrawerGrid(); renderPools();
+};
+
+/* 窗口尺寸 / 动效档位 */
+$("sizeSeg").onclick = e => {
+  const b = e.target.closest("[data-w]"); if (!b) return;
+  [...e.currentTarget.children].forEach(c => c.classList.toggle("on", c === b));
+  $("app").style.setProperty("--app-w", b.dataset.w + "px");
+  $("app").style.setProperty("--app-h", b.dataset.h + "px");
+};
+$("fxSeg").onclick = e => {
+  const b = e.target.closest("[data-fx]"); if (!b) return;
+  [...e.currentTarget.children].forEach(c => c.classList.toggle("on", c === b));
+  S.fx = b.dataset.fx;
+  $("paceEta").textContent = S.fx === "reduce" ? "跳过" : (S.fx === "slow" ? PACES[S.pace].eta + " ×2.2" : PACES[S.pace].eta);
+};
+
+/* =============================================================================
+   自检：设计稿不允许出现「容器被滚动」——那是屏外抽屉掀翻布局的征兆
+   ============================================================================= */
+window.__layoutCheck = () => {
+  // 判据只看「有没有真的被滚过」。别拿 scrollWidth - clientWidth 当判据：
+  // 抽屉靠 translateX(102%) 放在屏外，overflow:clip 下这个差值本来就是 530px。
+  const bad = [];
+  for (const el of document.querySelectorAll(".app,.main,.stagecard,.drawer,.work,.pane-cfg,.rail")){
+    if (el.scrollLeft || el.scrollTop !== 0) bad.push((el.id || el.className) + " scroll=" + el.scrollLeft + "," + el.scrollTop);
+  }
+  const railX = Math.round(document.querySelector(".rail").getBoundingClientRect().x);
+  const appX  = Math.round(document.getElementById("app").getBoundingClientRect().x);
+  return {ok: !bad.length && railX === appX + 1, bad, railX, appX};
+};
+
+/* =============================================================================
+   初始化
+   ============================================================================= */
+renderWeapons();
+renderChips($("gameChips"), toggleGame);
+renderPools();
+renderReels();
+renderTimeline();
+renderHistory();
+reelW.show(wIcon(WEAPONS[0]));
+reelM.show(mIcon(poolM()[0] || MONSTERS[0]));
+</script>
+</body>
+</html>

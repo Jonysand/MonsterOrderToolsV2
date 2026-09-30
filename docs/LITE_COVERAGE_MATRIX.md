@@ -28,6 +28,7 @@
 | 配置 | `get_app_config` / `save_app_config` | 无守卫（保留） | 设置面板可用（TTS/打卡控件置灰） | ✅ 支持 |
 | 运行日志 | 内存环 + `Logs/` 落盘、资源缺失告警（前端日志视图已移除，IPC 保留） | 无守卫（保留） | 资源缺失即时 Toast | ✅ 支持 |
 | 凭据导入 | `import_credentials_file`（安装版首次使用入口） | 无守卫（**决策：保留**） | 设置页「导入凭据文件」按钮 | ✅ 支持 |
+| 随机抽选 | 武器/怪物等概率抽选与演出、作品筛选、排除名单、`get/set_draw_settings` | 无守卫（**决策：保留**） | 页签正常可用 | ✅ 支持 |
 | TTS 播报 | 普通弹幕朗读 `{uname} 说：{msg}` | `handle_incoming_danmu` 第 4 节 `!is_lite && enable_voice` | 置灰 | ❌ 停用 |
 | TTS 播报 | 点餐指令播报（`点餐xxx`，含原文朗读两条） | 同第 4 节 4.1 分支（位于 `!is_lite` 块内） | 置灰 | ❌ 停用 |
 | TTS 播报 | 本地特殊音效（"曼波"等 9 键） | 同第 4 节 4.2；另 `play_special_sound` 守卫 | 置灰 | ❌ 停用 |
@@ -67,12 +68,29 @@
 如需改为 Lite 下禁用（按 AGENTS.md「非排队功能默认不支持」的字面口径），只需在该命令入口
 首行加 `ensure_not_lite(&state, "凭据导入")?` 并将本表该行改为「❌ 停用」——**属一行改动，已预留**。
 
+## 四之二、随机抽选的 Lite 归属决策（2026-09-30）
+
+`RandomDrawTab` / `get_draw_settings` / `set_draw_settings` 判定为 **Lite 下保留**，理由：
+
+1. 该功能不依赖任何被摘掉的模块：没有 TTS 播报、不读打卡库、不调 AI，
+   全部逻辑是「前端按权重等概率选一个 + 一段 CSS/WAAPI 演出」，后端只存一份偏好 JSON。
+2. 它是**点怪周边**而非独立业务：抽出来的怪物最终要经「送去点单」回到排队链路，
+   与 `ONLY_ORDER_MONSTER` 想保留的那条主链路同向，而不是与之并列的新模块。
+3. 对 Lite 用户价值更高：Lite 版是纯点怪工具，「今天随机打什么」正是这类主播的日常玩法。
+
+因此**不加** `ensure_not_lite` 守卫，也不在 `test_ensure_not_lite_guard_matches_build_flavor`
+的拒绝清单里登记；改由 `lib.rs::test_draw_settings_available_in_both_build_flavors`
+在两种构建形态下都断言"设置读写链路一致"，防止后续按「非排队功能默认不支持」的字面口径
+想当然地补上守卫。
+
 ## 五、验证
 
 - `cargo test`（完整版形态）：`test_ensure_not_lite_guard_matches_build_flavor`（守卫放行矩阵）、
   `test_core_queue_works_in_both_build_flavors`（排队不受形态影响）。
 - `cargo test --features lite`（Lite 形态）：同一守卫测试断言统一拒绝 +
   `test_lite_build_disables_non_queue_pipelines`（朗读/点赞/礼物/SC 全部短路）。
+- 随机抽选（两形态一致）：`test_draw_settings_available_in_both_build_flavors`、
+  `draw::tests::*`（默认值/损坏回退/归一化/往返读写/武器图标资源就位）。
 - 打包：`build-windows.bat` / `build-macos.sh` 连产双版本；完整版与 Lite 版
   productName 分别为 `MonsterOrderWilds-Ascendance` / `MonsterOrderWilds-Ascendance-Lite`。
 - 2026-09-25 起不再存在运行时开关（`set_lite_mode` 命令与配置字段 `is_lite_mode` 已删除）；

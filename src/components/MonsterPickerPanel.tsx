@@ -16,6 +16,12 @@ interface Props {
   dict: MonsterDict;
   roster: RosterData;
   submitting: boolean;
+  /**
+   * 外部投递来的预选怪物（「随机抽选」页签的「送去点单」）。
+   * 消费后必须经 `onPresetConsumed` 清空，否则下次挂载（切回本页签）会重复生效。
+   */
+  presetMonster?: string | null;
+  onPresetConsumed?: () => void;
   onSubmit: (payload: PickerOrderPayload) => void;
 }
 
@@ -25,7 +31,14 @@ const LV_NAME = ["普通", "历战", "历战王"];
  * 选怪面板：点图标即点怪（取代原「快速手动点怪」文字表单）。
  * 候选为全量字典；禁点名单内的怪物置灰加锁，点击只提示拦截原因（与弹幕拦截同一份名单）。
  */
-export const MonsterPickerPanel: React.FC<Props> = ({ dict, roster, submitting, onSubmit }) => {
+export const MonsterPickerPanel: React.FC<Props> = ({
+  dict,
+  roster,
+  submitting,
+  presetMonster,
+  onPresetConsumed,
+  onSubmit,
+}) => {
   const [keyword, setKeyword] = useState("");
   const [game, setGame] = useState("all");
   const [selected, setSelected] = useState<string | null>(null);
@@ -62,6 +75,31 @@ export const MonsterPickerPanel: React.FC<Props> = ({ dict, roster, submitting, 
       setFootMsg(`已取消选中「${selected}」（不在当前筛选结果中或已被禁点），请重新点选`);
     }
   }, [blockedSet, hits, selected]);
+
+  /**
+   * 外部预选（「随机抽选」→「送去点单」）。
+   *
+   * 必须同时把搜索与作品筛选放宽到能看见它：下方那条"选中项必须来自当前可见候选"的
+   * 校验会在选中后立刻清空选择，只 setSelected 等于白选。预选本身也走同一套校验，
+   * 命中禁点名单时只提示、不选中 —— 不给"界面显示已选中、提交时却被拦下"的错位留缝。
+   */
+  useEffect(() => {
+    if (!presetMonster) return;
+    onPresetConsumed?.();
+    const hit = entries.find((e) => e.name === presetMonster);
+    if (!hit) {
+      setFootMsg(`抽到的「${presetMonster}」已不在怪物字典中，请在列表里手动点选`);
+      return;
+    }
+    if (blockedSet.has(hit.name)) {
+      setFootMsg(`抽到的「${hit.name}」在禁点名单内，不能点单 —— 先从「怪物名单」移出，或另选一只`);
+      return;
+    }
+    setKeyword("");
+    setGame("all");
+    setSelected(hit.name);
+    setFootMsg(`已选中抽到的「${hit.name}」，填好昵称后点「加入排队」即可`);
+  }, [presetMonster, entries, blockedSet, onPresetConsumed]);
 
   /** 底部状态文案：禁点名单基数决定基线，临时提示由点击行为覆盖 */
   const statusText = roster.items.length

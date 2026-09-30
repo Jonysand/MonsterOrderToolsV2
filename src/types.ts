@@ -163,6 +163,30 @@ export interface RosterSnapshot {
   revision: number;
 }
 
+// ---------- 随机抽选 ----------
+/** 抽选模式：两者都抽 / 仅武器 / 仅怪物 */
+export type DrawMode = "both" | "weapon" | "monster";
+
+/** 节奏档位：快 / 标准 / 拖长（对应演出时长的三个倍率） */
+export type DrawPace = "fast" | "normal" | "long";
+
+/**
+ * 随机抽选设置（后端 draw_settings.json 的镜像）。
+ *
+ * 与「点怪禁点名单」`RosterData` 相互独立：那份是"观众不能点"的业务规则，
+ * 这份是"主播自己不想抽到"的个人偏好，混用会让两者互相惊吓。
+ */
+export interface DrawSettings {
+  /** 参与抽取的作品（GAME_ORDER 的子集；空数组由后端归一化回全部作品） */
+  games: string[];
+  /** 排除的怪物原名 */
+  excluded_monsters: string[];
+  /** 排除的武器 id（= 图标文件名；用文件名而非中文名，改中文名不会让排除失效） */
+  excluded_weapons: string[];
+  mode: DrawMode;
+  pace: DrawPace;
+}
+
 // ---------- D3 跑马灯 ----------
 export interface OrderPlacedPayload {
   user_id: string;

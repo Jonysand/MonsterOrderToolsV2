@@ -202,6 +202,55 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
+/// 临时文件序号：与进程 ID 一起构成同目录唯一临时文件名。
+///
+/// 唯一性是必需的：并发的多个写者若共用一个 `.tmp`，一个写者可能 rename 掉另一个
+/// 正在写的半截文件。进程 ID + 自增序号足以区分同机同进程内的并发写者。
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 原子写入 JSON 配置：同目录唯一临时文件 → `sync_all` → rename 替换。
+///
+/// 直接覆盖目标文件时，写入中断（断电/崩溃/磁盘满）会留下半截 JSON，
+/// 下次启动只能回退默认值，用户数据静默丢失。rename 在同一文件系统上是原子的，
+/// 因此目标文件要么是旧内容、要么是完整的新内容，不存在中间态。
+///
+/// 产出为 UTF-8 无 BOM + 2 空格缩进（JSON 配置编码规范见 scripts/check_encoding.py）。
+/// 注：`roster.rs` 自带一份同构实现（早于本 helper），后续可迁移过来。
+pub fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(value).map_err(|e| format!("配置序列化失败: {}", e))?;
+
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.json".to_string());
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{}.{}.{}.tmp", base, std::process::id(), seq));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写入配置临时文件失败: {}", e));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换配置文件失败: {}（原文件保持不变）", e));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +323,41 @@ mod tests {
             "MACOS_APP_SUPPORT_DIR_NAME 与 tauri.conf.json 的 identifier 不一致"
         );
         println!("[PASS] test_macos_data_dir_name_matches_bundle_identifier passed");
+    }
+
+    /// 原子写 JSON：产出无 BOM、可被重新解析；可覆盖已存在的文件
+    #[test]
+    fn test_write_json_atomic_roundtrip_without_bom() {
+        let base = std::env::temp_dir().join("mh_test_paths_atomic");
+        let _ = std::fs::remove_dir_all(&base);
+        let path = base.join("nested").join("cfg.json");
+
+        let first = serde_json::json!({"a": 1});
+        write_json_atomic(&path, &first).expect("首次写入应成功");
+
+        let raw = std::fs::read(&path).unwrap();
+        assert_ne!(&raw[..3], b"\xef\xbb\xbf", "JSON 配置不得含 BOM");
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(parsed, first);
+
+        // 覆盖已存在文件（rename 替换）
+        let second = serde_json::json!({"b": [1, 2, 3]});
+        write_json_atomic(&path, &second).expect("覆盖写入应成功");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed, second);
+
+        // 目录内不得残留临时文件
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不应残留临时文件: {:?}", leftovers);
+
+        let _ = std::fs::remove_dir_all(&base);
+        println!("[PASS] test_write_json_atomic_roundtrip_without_bom passed");
     }
 
     #[test]

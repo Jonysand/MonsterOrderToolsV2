@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""生成图标清单：扫描 public/monster_icons/**/*.png → src/generated/iconManifest.ts
+"""生成图标清单：扫描随包图标目录 → src/generated/*.ts
 
-后端在打包态看不到前端静态目录，图标选择器的数据源只能在构建期固化。
+后端在打包态看不到前端静态目录，图标选择器与随机抽选盘的数据源只能在构建期固化。
 产物提交入库（保证 CI 与本地一致），编码为 UTF-8 with BOM（见 check_encoding.py）。
+
+当前两处清单：
+  public/monster_icons/**/*.png → src/generated/iconManifest.ts    （怪物图鉴库 / 选怪面板 / 抽选盘怪物池）
+  public/weapon_icons/**/*.png  → src/generated/weaponIconManifest.ts（随机抽选盘的武器池）
 """
 import codecs
 import io
@@ -10,8 +14,6 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ICON_DIR = os.path.join(ROOT, "public", "monster_icons")
-OUT_FILE = os.path.join(ROOT, "src", "generated", "iconManifest.ts")
 BOM = b"\xef\xbb\xbf"
 
 
@@ -57,26 +59,70 @@ def log(text):
     stream.flush()
 
 
-def collect():
+def collect(icon_dir):
+    """扫描目录下全部 PNG，返回相对路径（正斜杠分隔、字典序）。"""
     paths = []
-    for dirpath, dirnames, filenames in os.walk(ICON_DIR):
+    for dirpath, dirnames, filenames in os.walk(icon_dir):
         dirnames.sort()
         for name in sorted(filenames):
             if not name.lower().endswith(".png"):
                 continue
-            rel = os.path.relpath(os.path.join(dirpath, name), ICON_DIR)
+            rel = os.path.relpath(os.path.join(dirpath, name), icon_dir)
             paths.append(rel.replace(os.sep, "/"))
     return sorted(paths)
 
 
-HEADER = """/* 本文件由 scripts/gen_icon_manifest.py 自动生成，请勿手工编辑。
+def normalize_newlines(data):
+    """比对前统一换行符。
+
+    Windows 检出时 .gitattributes（text=auto）会把入库的 LF 换成 CRLF，
+    直接按字节比对会永远判定“有变化”，每次运行都白写一遍文件。
+    """
+    return data.replace(b"\r\n", b"\n")
+
+
+def write_if_changed(out_file, body, changed_msg, unchanged_msg):
+    """仅在内容变化时写盘，返回 0/1（1 表示有 IO 错误）。
+
+    py2 下 body 为 bytes（str），py3 下为 str —— 两者都要能拼出同一份字节流。
+    """
+    data = BOM + (body if isinstance(body, bytes) else body.encode("utf-8"))
+
+    old = None
+    if os.path.exists(out_file):
+        with open(out_file, "rb") as f:
+            old = f.read()
+
+    if old is not None and normalize_newlines(old) == normalize_newlines(data):
+        log(unchanged_msg)
+        return 0
+
+    out_dir = os.path.dirname(out_file)
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    text = body.decode("utf-8") if isinstance(body, bytes) else body
+    # utf-8-sig：写出 UTF-8 with BOM（.ts 编码规范见 check_encoding.py）
+    # newline="\n"：不做平台换行翻译，Windows 与 macOS 产出同一份字节流（仓库统一存 LF）
+    with io.open(out_file, "w", encoding="utf-8-sig", newline="\n") as f:
+        f.write(text)
+    log(changed_msg)
+    return 0
+
+
+MONSTER_DIR = os.path.join(ROOT, "public", "monster_icons")
+MONSTER_OUT = os.path.join(ROOT, "src", "generated", "iconManifest.ts")
+
+WEAPON_DIR = os.path.join(ROOT, "public", "weapon_icons")
+WEAPON_OUT = os.path.join(ROOT, "src", "generated", "weaponIconManifest.ts")
+
+
+def render_monsters(paths):
+    lines = [
+        """/* 本文件由 scripts/gen_icon_manifest.py 自动生成，请勿手工编辑。
    数据源：public/monster_icons 下的全部 PNG（随包图标），条目与磁盘文件一一对应。 */
 
 """
-
-
-def render(paths):
-    lines = [HEADER]
+    ]
     lines.append("/** 全部随包图标（相对 /monster_icons/ 的路径，形如 `MHRS/MHRS-Rathalos_Icon.png`） */\n")
     lines.append("export const ICON_LIST: string[] = [\n")
     for p in paths:
@@ -98,48 +144,61 @@ export function iconGroup(path: string): string {
     return "".join(lines)
 
 
-def normalize_newlines(data):
-    """比对前统一换行符。
+def render_weapons(paths):
+    lines = [
+        """/* 本文件由 scripts/gen_icon_manifest.py 自动生成，请勿手工编辑。
+   数据源：public/weapon_icons 下的全部 PNG（随包图标），条目与磁盘文件一一对应。 */
 
-    Windows 检出时 .gitattributes（text=auto）会把入库的 LF 换成 CRLF，
-    直接按字节比对会永远判定“有变化”，每次运行都白写一遍文件。
-    """
-    return data.replace(b"\r\n", b"\n")
+"""
+    ]
+    lines.append(
+        "/** 全部随包武器图标（相对 /weapon_icons/ 的路径，形如 `MHWilds/MHWilds-Bow_Icon_Base.png`） */\n"
+    )
+    lines.append("export const WEAPON_ICON_LIST: string[] = [\n")
+    for p in paths:
+        lines.append('  "%s",\n' % p)
+    lines.append("];\n")
+    return "".join(lines)
 
 
 def main():
-    if not os.path.isdir(ICON_DIR):
-        log("图标目录不存在: %s" % ICON_DIR)
-        return 1
+    failed = False
 
-    paths = collect()
-    if not paths:
-        log("未找到任何图标: %s" % ICON_DIR)
-        return 1
+    if not os.path.isdir(MONSTER_DIR):
+        log("怪物图标目录不存在: %s" % MONSTER_DIR)
+        failed = True
+    else:
+        paths = collect(MONSTER_DIR)
+        if not paths:
+            log("未找到任何怪物图标: %s" % MONSTER_DIR)
+            failed = True
+        else:
+            rc = write_if_changed(
+                MONSTER_OUT,
+                render_monsters(paths),
+                "已生成 iconManifest.ts：%d 张图标" % len(paths),
+                "iconManifest.ts 无需更新（%d 张图标）" % len(paths),
+            )
+            failed = failed or bool(rc)
 
-    body = render(paths)
-    # py2 下 body 为 bytes（str），py3 下为 str —— 两者都要能拼出同一份字节流
-    data = BOM + (body if isinstance(body, bytes) else body.encode("utf-8"))
+    if not os.path.isdir(WEAPON_DIR):
+        log("武器图标目录不存在: %s" % WEAPON_DIR)
+        failed = True
+    else:
+        paths = collect(WEAPON_DIR)
+        if not paths:
+            log("未找到任何武器图标: %s" % WEAPON_DIR)
+            failed = True
+        else:
+            rc = write_if_changed(
+                WEAPON_OUT,
+                render_weapons(paths),
+                "已生成 weaponIconManifest.ts：%d 张图标" % len(paths),
+                "weaponIconManifest.ts 无需更新（%d 张图标）" % len(paths),
+            )
+            failed = failed or bool(rc)
 
-    old = None
-    if os.path.exists(OUT_FILE):
-        with open(OUT_FILE, "rb") as f:
-            old = f.read()
-
-    if old is not None and normalize_newlines(old) == normalize_newlines(data):
-        log("iconManifest.ts 无需更新（%d 张图标）" % len(paths))
-        return 0
-
-    out_dir = os.path.dirname(OUT_FILE)
-    if not os.path.isdir(out_dir):
-        os.makedirs(out_dir)
-    text = body.decode("utf-8") if isinstance(body, bytes) else body
-    # utf-8-sig：写出 UTF-8 with BOM（.ts 编码规范见 check_encoding.py）
-    # newline="\n"：不做平台换行翻译，Windows 与 macOS 产出同一份字节流（仓库统一存 LF）
-    with io.open(OUT_FILE, "w", encoding="utf-8-sig", newline="\n") as f:
-        f.write(text)
-    log("已生成 iconManifest.ts：%d 张图标" % len(paths))
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
