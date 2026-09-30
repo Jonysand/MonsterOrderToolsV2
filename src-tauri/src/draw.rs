@@ -35,8 +35,9 @@ pub const GAME_IDS: [&str; 5] = ["MHWilds", "MHWorld", "MHWI", "MHRise", "MHRS"]
 /// 抽选模式：两者都抽 / 仅武器 / 仅怪物
 pub const MODES: [&str; 3] = ["both", "weapon", "monster"];
 
-/// 节奏档位：快 / 标准 / 拖长（对应前端演出时长的三个倍率）
-pub const PACES: [&str; 3] = ["fast", "normal", "long"];
+/// 节奏档位：快 / 标准 / 拖长 / 持续（对应前端演出时长的倍率）。
+/// 「持续」（sustain）：滚动无限循环，唯一出口是「结束」按钮或弹幕「结束」指令。
+pub const PACES: [&str; 4] = ["fast", "normal", "long", "sustain"];
 
 const DEFAULT_MODE: &str = "both";
 const DEFAULT_PACE: &str = "normal";
@@ -69,6 +70,12 @@ pub struct DrawSettings {
     pub mode: String,
     #[serde(default = "default_pace")]
     pub pace: String,
+    /// 弹幕指令控制开关：开启后指定观众的整条「开始」/「结束」弹幕可远程控制抽选
+    #[serde(default)]
+    pub command_enabled: bool,
+    /// 弹幕指令触发用户的昵称（与弹幕 `user_name` 精确匹配；开启但留空 = 指令不生效）
+    #[serde(default)]
+    pub command_user: String,
 }
 
 impl Default for DrawSettings {
@@ -79,7 +86,56 @@ impl Default for DrawSettings {
             excluded_weapons: Vec::new(),
             mode: default_mode(),
             pace: default_pace(),
+            command_enabled: false,
+            command_user: String::new(),
         }
+    }
+}
+
+/// 抽选弹幕指令动作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawCommand {
+    /// 「开始」：立即开抽一次
+    Start,
+    /// 「结束」：跳过演出直接进入锁定与揭晓
+    End,
+}
+
+impl DrawCommand {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DrawCommand::Start => "start",
+            DrawCommand::End => "end",
+        }
+    }
+}
+
+/// 判定一条弹幕是否命中抽选指令。
+///
+/// 全部条件必须同时满足：
+/// - `command_enabled` 为真且 `command_user` 归一化后非空（留空的"开着"不生效，
+///   避免往上追溯到"开启但没填昵称"的中间态时把开关抹掉——归一化只管 trim）；
+/// - 弹幕发送者昵称与 `command_user` **整条精确一致**（非包含、非前缀）；
+/// - 弹幕原文去空白后整条精确等于「开始」或「结束」——与「优先」提权指令同口径，
+///   句中带词不触发（"开始吧"/"快结束"都只是聊天）。
+///
+/// 指令弹幕**不独占语义**：命中后调用方只旁路广播事件，弹幕仍照常走
+/// 点怪匹配与朗读链路（与「优先」的处理姿态一致）。
+pub fn match_draw_command(
+    settings: &DrawSettings,
+    user_name: &str,
+    message: &str,
+) -> Option<DrawCommand> {
+    if !settings.command_enabled || settings.command_user.is_empty() {
+        return None;
+    }
+    if user_name.trim() != settings.command_user {
+        return None;
+    }
+    match message.trim() {
+        "开始" => Some(DrawCommand::Start),
+        "结束" => Some(DrawCommand::End),
+        _ => None,
     }
 }
 
@@ -107,6 +163,7 @@ impl DrawSettings {
     fn normalized(mut self) -> Self {
         self.excluded_monsters = normalize_list(self.excluded_monsters);
         self.excluded_weapons = normalize_list(self.excluded_weapons);
+        self.command_user = self.command_user.trim().to_string();
 
         let picked: HashSet<String> = normalize_list(self.games).into_iter().collect();
         self.games = GAME_IDS
@@ -218,12 +275,13 @@ impl DrawSettingsManager {
         crate::paths::write_json_atomic(&self.path, &next)?;
         *self.write_data() = next.clone();
         crate::log_info!(
-            "[Draw] 抽选设置已更新（作品 {} 个 / 排除怪物 {} 只 / 排除武器 {} 把 / {} / {}）",
+            "[Draw] 抽选设置已更新（作品 {} 个 / 排除怪物 {} 只 / 排除武器 {} 把 / {} / {} / 弹幕指令{}）",
             next.games.len(),
             next.excluded_monsters.len(),
             next.excluded_weapons.len(),
             next.mode,
-            next.pace
+            next.pace,
+            if next.command_enabled { format!("开·{}", next.command_user) } else { "关".to_string() }
         );
         Ok(next)
     }
@@ -272,6 +330,8 @@ mod tests {
                 excluded_weapons: vec!["MHWilds-Bow_Icon_Base.png".into()],
                 mode: "monster".into(),
                 pace: "long".into(),
+                command_enabled: true,
+                command_user: "猎人甲".into(),
             })
             .expect("replace 应成功");
 
@@ -342,6 +402,119 @@ mod tests {
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
         println!("[PASS] test_games_normalized_to_known_ids passed");
+    }
+
+    /// 弹幕指令命中矩阵：开启 + 昵称精确匹配 + 消息整条精确等于指令词，三者缺一不可
+    #[test]
+    fn test_draw_command_matching() {
+        let mk = |enabled: bool, user: &str| DrawSettings {
+            command_enabled: enabled,
+            command_user: user.into(),
+            ..DrawSettings::default()
+        };
+
+        // 命中：开始 / 结束（含首尾空白）
+        let s = mk(true, "猎人甲");
+        assert_eq!(match_draw_command(&s, "猎人甲", "开始"), Some(DrawCommand::Start));
+        assert_eq!(match_draw_command(&s, "猎人甲", "结束"), Some(DrawCommand::End));
+        assert_eq!(match_draw_command(&s, "猎人甲", "  开始  "), Some(DrawCommand::Start));
+
+        // 关闭：永不命中
+        assert_eq!(match_draw_command(&mk(false, "猎人甲"), "猎人甲", "开始"), None);
+        // 开启但没填昵称：同样不命中（避免"任何人都能触发"的空配置事故）
+        assert_eq!(match_draw_command(&mk(true, ""), "猎人甲", "开始"), None);
+        assert_eq!(match_draw_command(&mk(true, "   "), "猎人甲", "开始"), None);
+
+        // 其他用户：不命中；昵称要求整条精确（非包含、非前缀）
+        assert_eq!(match_draw_command(&s, "猎人乙", "开始"), None);
+        assert_eq!(match_draw_command(&s, "小猎人甲", "开始"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲2", "开始"), None);
+
+        // 指令词要求整条精确：句中带词 / 带标点 / 其他任何内容都不算指令
+        assert_eq!(match_draw_command(&s, "猎人甲", "开始吧"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "快开始"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "开始！"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "开始 结束"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "今天开始打猎"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "优先"), None);
+
+        println!("[PASS] test_draw_command_matching passed");
+    }
+
+    /// 弹幕指令设置：旧版本文件缺字段回默认值；昵称 trim；往返一致
+    #[test]
+    fn test_command_settings_roundtrip_and_legacy() {
+        let path = temp_path("cmd");
+
+        // 旧版本（0.1.13 及之前）的文件没有 command_* 字段 → 回默认值且不阻断
+        fs::write(
+            &path,
+            r#"{"games": ["MHWilds"], "excluded_monsters": ["黑龙"], "mode": "both", "pace": "fast"}"#,
+        )
+        .unwrap();
+        let mgr = DrawSettingsManager::load(Some(&path));
+        let s = mgr.snapshot();
+        assert!(!s.command_enabled, "缺字段应默认关闭指令");
+        assert_eq!(s.command_user, "");
+        assert_eq!(s.mode, "both", "其余字段照常生效");
+
+        // 落盘往返：昵称去空白，开关与昵称保真
+        let saved = mgr
+            .replace(DrawSettings {
+                command_enabled: true,
+                command_user: "  猎人甲  ".into(),
+                ..DrawSettings::default()
+            })
+            .unwrap();
+        assert_eq!(saved.command_user, "猎人甲");
+        assert!(saved.command_enabled);
+
+        let reloaded = DrawSettingsManager::load(Some(&path));
+        let r = reloaded.snapshot();
+        assert!(r.command_enabled);
+        assert_eq!(r.command_user, "猎人甲");
+
+        // 归一化只 trim 昵称，不把"开着但昵称空"的中间态抹成关闭：
+        // 输入昵称过程中每击键都会整表提交，若此时改写开关会产生前后状态不一致的鬼镜像
+        let trimmed_empty = mgr
+            .replace(DrawSettings {
+                command_enabled: true,
+                command_user: "   ".into(),
+                ..DrawSettings::default()
+            })
+            .unwrap();
+        assert!(trimmed_empty.command_enabled, "开关原样保留");
+        assert_eq!(trimmed_empty.command_user, "", "昵称只被 trim");
+        // 空昵称 + 开 = 匹配层不生效
+        assert_eq!(match_draw_command(&trimmed_empty, "猎人甲", "开始"), None);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        println!("[PASS] test_command_settings_roundtrip_and_legacy passed");
+    }
+
+    /// 「持续」是合法 pace：前端抽选编排依赖它进入无限滚动，被归一化回退会退化成标准档
+    #[test]
+    fn test_sustain_pace_is_valid() {
+        let path = temp_path("sustain");
+        fs::write(&path, r#"{"pace": "sustain"}"#).unwrap();
+        let mgr = DrawSettingsManager::load(Some(&path));
+        assert_eq!(
+            mgr.snapshot().pace,
+            "sustain",
+            "持久化的持续档重载后必须原样生效"
+        );
+
+        // 往返保持（replace 时归一化不得抹掉）
+        let saved = mgr
+            .replace(DrawSettings {
+                pace: "sustain".into(),
+                ..DrawSettings::default()
+            })
+            .unwrap();
+        assert_eq!(saved.pace, "sustain");
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        println!("[PASS] test_sustain_pace_is_valid passed");
     }
 
     /// mode / pace 非枚举值回退默认，且不影响其余字段

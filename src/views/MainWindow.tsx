@@ -68,11 +68,6 @@ export const MainWindow: React.FC = () => {
   const [activeTab, setActiveTab] = useState<
     "queue" | "monster" | "draw" | "bili" | "gm" | "settings"
   >("bili");
-  /**
-   * 待点单的怪物（「随机抽选」→「送去点单」）。
-   * 选怪面板消费后立即清空 —— 否则每次切回排队页签都会重新预选同一只。
-   */
-  const [pickerPreset, setPickerPreset] = useState<string | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   // 编译期形态常量（vite --mode lite 注入）：完整版 false / Lite 版 true，运行期不可切换
   const isLite = __IS_LITE__;
@@ -84,10 +79,39 @@ export const MainWindow: React.FC = () => {
   /** 磁盘落盘异常提示（内存已更新、磁盘待重试），成功后自动收起 */
   const [queueSaveWarning, setQueueSaveWarning] = useState(false);
 
-  /** 「送去点单」：切到排队页签并把抽到的怪预填进选怪面板 */
-  const sendToOrder = (monsterName: string) => {
-    setPickerPreset(monsterName);
-    setActiveTab("queue");
+  /**
+   * 「送去点单」：把抽到的怪**直接写入排队队列**（以「随机抽选」身份、按抽中的等阶入队）。
+   * 原为「切页签 + 预填选怪面板再手点入队」，2026-09-30 按需求改为直入，
+   * 与弹幕/选怪面板共用 add_picked_order：后端照常做禁点校验，
+   * order-placed 事件照常驱动跑马灯金字与悬浮窗受理金印。
+   */
+  const sendOrderingRef = useRef(false);
+  const sendToOrder = async (monsterName: string, temperedLevel: number) => {
+    // 防双击连发：入队尚未返回时忽略后续点击（每次点击都会生成新 userId，后端不会去重）
+    if (sendOrderingRef.current) return;
+    sendOrderingRef.current = true;
+    const userId = `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const snap = await invoke<QueueSnapshot>("add_picked_order", {
+        userId,
+        userName: "随机抽选",
+        monsterName,
+        isPriority: false,
+        guardLevel: 0,
+        temperedLevel,
+      });
+      applyQueueSnapshot(snap);
+      // Toast 只报后端实际确认的条目，不复述未校验的请求文案
+      const confirmed =
+        snap.items.find((i) => i.user_id === userId)?.monster_name ?? monsterName;
+      showToast(`随机抽选 点怪 ${confirmed} 已入队`);
+    } catch (err) {
+      // 抽到禁点怪等拒绝场景在这里提示（抽选池不禁点、禁点名单另有语义）
+      showToast(`送去点单失败: ${err}`);
+      await fetchRoster();
+    } finally {
+      sendOrderingRef.current = false;
+    }
   };
 
   // 怪物字典与禁点名单（名单内的怪不可被点：弹幕点怪与选怪面板共享同一份约束）
@@ -945,8 +969,6 @@ export const MainWindow: React.FC = () => {
                     dict={monsterDict}
                     roster={roster}
                     submitting={orderSubmitting}
-                    presetMonster={pickerPreset}
-                    onPresetConsumed={() => setPickerPreset(null)}
                     onSubmit={handlePickerOrder}
                   />
                 </section>

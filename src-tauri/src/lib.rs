@@ -1431,6 +1431,27 @@ pub fn handle_incoming_danmu(
         record_business_history_probe(&entry);
     }
 
+    // 1.2 随机抽选弹幕指令：指定观众的整条「开始」/「结束」→ 通知前端开抽或快进。
+    //     放在 IS_LITE 段之外：抽选本身完整版与 Lite 版均支持（见 draw.rs 模块注释），
+    //     指令走的又是普通弹幕管道。只旁路广播、**不 return**：指令弹幕继续走
+    //     点怪匹配与朗读链路（与「优先」提权指令同一姿态）。昵称不进普通 Logs。
+    if let Some(action) = draw::match_draw_command(
+        &state.draw_settings.snapshot(),
+        &danmu.user_name,
+        &danmu.message,
+    ) {
+        crate::log_info!("[Draw] 弹幕抽选指令命中（{}）", action.as_str());
+        if let Some(handle) = app_handle {
+            let _ = handle.emit(
+                "draw-command",
+                &serde_json::json!({
+                    "action": action.as_str(),
+                    "user_name": danmu.user_name,
+                }),
+            );
+        }
+    }
+
     // 2. 非 Lite 构建下的弹幕学习、舰长打卡与补签指令判定
     if !IS_LITE {
         let msg_trim = danmu.message.trim();
@@ -3450,6 +3471,29 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         println!("[PASS] test_draw_settings_available_in_both_build_flavors passed");
+    }
+
+    /// 弹幕抽选指令走 AppState 的设置快照判定（与 handle_incoming_danmu 1.2 同一数据源）：
+    /// 配好昵称后「开始/结束」命中、未配置不命中；Lite 同样生效（不设 ensure_not_lite 守卫）
+    #[test]
+    fn test_draw_command_via_app_state() {
+        let state = AppState::new_test();
+        let path = state.draw_settings.path().to_path_buf();
+        // handle_incoming_danmu 每条弹幕读的是这份权威快照，这里以同一入口验证
+        state.draw_settings.replace(DrawSettings {
+            command_enabled: true,
+            command_user: "猎人甲".into(),
+            ..DrawSettings::default()
+        }).expect("抽选指令设置应可写入");
+
+        let s = state.draw_settings.snapshot();
+        assert_eq!(draw::match_draw_command(&s, "猎人甲", "开始"), Some(draw::DrawCommand::Start));
+        assert_eq!(draw::match_draw_command(&s, "猎人甲", "结束"), Some(draw::DrawCommand::End));
+        assert_eq!(draw::match_draw_command(&s, "猎人乙", "开始"), None);
+        assert_eq!(draw::match_draw_command(&s, "猎人甲", "开始吧"), None);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        println!("[PASS] test_draw_command_via_app_state passed");
     }
 
     /// E1：统一 Lite 守卫 —— 按编译形态分门：Lite 构建下非排队模块统一拒绝；

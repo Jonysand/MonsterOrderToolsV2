@@ -3000,6 +3000,9 @@ body {
   gap: 2px;
 }
 
+/* 四选项的段控件（节奏栏：快 / 标准 / 拖长 / 持续），其余样式全部沿用 rd-seg3 */
+.rd-seg4 { grid-template-columns: repeat(4, 1fr); }
+
 .rd-seg3 button {
   font: inherit;
   font-size: 11px;
@@ -3030,6 +3033,43 @@ body {
   margin-top: 1px;
   font-family: var(--font-num);
 }
+
+/* ------------------------------ 弹幕指令卡 ------------------------------ */
+.rd-cmd-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--w-ink-2);
+  cursor: pointer;
+  user-select: none;
+  margin: 4px 0 6px;
+}
+
+.rd-cmd-toggle input { width: 14px; height: 14px; accent-color: var(--amber-2); cursor: pointer; }
+.rd-cmd-toggle input:disabled { cursor: not-allowed; }
+.rd-cmd-toggle svg { margin-left: auto; color: var(--w-ink-4); }
+
+.rd-cmd-user {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--w-ink);
+  background: #121212;
+  border: 1px solid var(--w-line-2);
+  border-radius: 8px;
+  padding: 7px 10px;
+  outline: none;
+  transition: .14s;
+}
+
+.rd-cmd-user::placeholder { color: var(--w-ink-4); }
+.rd-cmd-user:focus { border-color: rgba(245,158,11,.42); background: #161616; }
+.rd-cmd-user:disabled { opacity: .5; cursor: not-allowed; }
+
+.rd-cmd-hint { margin: 5px 0 0; font-size: 10px; color: var(--w-ink-4); line-height: 1.55; }
+.rd-cmd-hint b { color: var(--amber-2); font-weight: 700; }
 
 .rd-wgrid {
   display: grid;

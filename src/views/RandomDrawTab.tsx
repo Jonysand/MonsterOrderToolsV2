@@ -1,7 +1,8 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Copy, Dices, Send, Settings2 } from "lucide-react";
-import { DrawMode, DrawPace, DrawSettings, MonsterDict, RosterData } from "../types";
+import { listen } from "@tauri-apps/api/event";
+import { Copy, Dices, FastForward, Radio, Send, Settings2 } from "lucide-react";
+import { DrawCommandPayload, DrawMode, DrawPace, DrawSettings, MonsterDict, RosterData } from "../types";
 import {
   GAME_LABEL,
   GAME_ORDER,
@@ -17,8 +18,8 @@ interface Props {
   dict: MonsterDict;
   /** 点怪禁点名单：仅用于「同步自禁点名单」的一致性导入，不参与抽选判定 */
   roster: RosterData;
-  /** 把抽到的怪物送去点单（切页签并预填选怪面板） */
-  onSendToOrder: (monsterName: string) => void;
+  /** 把抽到的怪物送去点单（直接写入排队队列，与弹幕/选怪面板同一条队列） */
+  onSendToOrder: (monsterName: string, temperedLevel: number) => void;
   toast: (msg: string) => void;
 }
 
@@ -51,11 +52,13 @@ const SEGMENTS: Segment[] = [
   { id: "settle", label: "落位", dur: 200, gap: 160 },
 ];
 
-const PACE_SCALE: Record<DrawPace, number> = { fast: 0.4, normal: 1, long: 1.6 };
+const PACE_SCALE: Record<DrawPace, number> = { fast: 0.4, normal: 1, long: 1.6, sustain: 1 };
 const PACE_LABEL: Record<DrawPace, { label: string; sub: string }> = {
   fast: { label: "快", sub: "FAST" },
   normal: { label: "标准", sub: "NORMAL" },
   long: { label: "拖长", sub: "LONG" },
+  /** 持续：滚动无限循环，「结束」按钮与弹幕「结束」指令是唯一出口（收束与快进同一条通路） */
+  sustain: { label: "持续", sub: "SUSTAIN" },
 };
 
 const MODE_LABEL: Record<DrawMode, { label: string; sub: string }> = {
@@ -72,6 +75,8 @@ const DEFAULT_SETTINGS: DrawSettings = {
   excluded_weapons: [],
   mode: "both",
   pace: "normal",
+  command_enabled: false,
+  command_user: "",
 };
 
 interface Frame {
@@ -133,8 +138,13 @@ const clockOf = (ts: number) => {
  * 之后每一帧滚动都只是演出，最后一帧落到中奖项上。绝不"边滚边随机"——
  * 那样观感上会像结果在被动画牵着走，也失去了"一次等概率"的可解释性。
  *
- * 抽选是**纯本地、零副作用**的：不写队列、不占弹幕额度、不发弹幕。
- * 想把结果变成真订单得主播自己点「送去点单」。
+ * 抽选过程零副作用：不写队列、不占弹幕额度、不发弹幕；要把结果变成真订单
+ * 得主播自己点「送去点单」（直接写入排队队列）。
+ *
+ * 「持续」节奏档没有设计终局：情绪节拍循环往复地滚，唯一出口是
+ * 「结束 · 揭晓」按钮或弹幕「结束」指令 —— 两者与快进共用同一条收束通路
+ * （`skipToEnd()` 置标志 → 循环退出 → 短促落位 → 锁定与揭晓照常）。
+ * **跳过的是演出而不是重摇**：结果在按下「抽选」那一刻就已定死。
  *
  * Lite 形态同样可用（2026-09-30 决策）：不依赖 TTS / 打卡 / AI。
  */
@@ -155,6 +165,8 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
   const stageRef = useRef<HTMLDivElement>(null);
   const seqRef = useRef(0);
   const rollingRef = useRef(false);
+  /** 本次抽选的快进标志（「结束」按钮与弹幕指令共用）：帧边界感知后跳过剩余滚动 */
+  const skipRef = useRef(false);
   /** 卸载/重开时作废进行中的编排，避免在已销毁的组件上继续 setState */
   const runIdRef = useRef(0);
 
@@ -327,10 +339,14 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
   );
 
   /**
-   * 一次抽选的端到端时长读数（滚动 + 逐项锁定 + 揭晓）。
+   * 一次抽选的端到端时长读数（滚动 + 逐项锁定 + 揭示）。
+   * 持续档没有设计终局，读数改为提示「直到结束」—— 挂不上一个秒数。
    * 只给主播一个量级感 —— 舞台上那条按段着色的节奏示意条已按 2026-09-30 决定从产物中移除。
    */
-  const paceEta = (rollSecs[settings.pace] + tailMs / 1000).toFixed(1) + "s";
+  const sustain = settings.pace === "sustain";
+  const paceEta = sustain
+    ? "直到结束"
+    : (rollSecs[settings.pace] + tailMs / 1000).toFixed(1) + "s";
 
   // -------------------------------------------------------------------------
   // 抽选编排
@@ -347,6 +363,16 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
     rollingRef.current = false;
     setRolling(false);
     setReelBusy(false);
+  }, []);
+
+  /**
+   * 收束到结束阶段（快进与持续档共用）：跳过剩余滚动演出，锁定与揭晓照常
+   * （结果早已定死，不重摇）。持续档没有别的出口，这里就是唯一终局。
+   */
+  const skipToEnd = useCallback(() => {
+    if (!rollingRef.current || skipRef.current) return;
+    skipRef.current = true;
+    setPhase("收束");
   }, []);
 
   const draw = useCallback(async () => {
@@ -368,6 +394,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
      */
     const instant = reduceMotion || document.hidden;
     const runId = ++runIdRef.current;
+    skipRef.current = false;
     rollingRef.current = true;
     setRolling(true);
     setReelBusy(true);
@@ -387,25 +414,74 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
     await asleep(instant ? 90 : 260);
     if (runId !== runIdRef.current) return;
 
-    setPhase("滚动中");
+    const sustain = settingsRef.current.pace === "sustain";
+    setPhase(sustain ? "持续滚动" : "滚动中");
 
-    for (let i = 0; i < frames.length; i++) {
-      if (runId !== runIdRef.current) return;
-      const f = frames[i];
-      const isLast = i === frames.length - 1;
-      // 两个盘**并行**推进：串行 await 会让实际时长翻倍，与档位标签承诺的秒数对不上
+    /** 单帧推进：两个盘**并行**（串行 await 会让实际时长翻倍，与档位标签承诺的秒数对不上） */
+    const stepFrame = (f: Frame, lastFrame: boolean) => {
       const jobs: Promise<void>[] = [];
       if (needW && wWin) {
-        jobs.push(weaponReelRef.current?.step(isLast ? weaponSrc(wWin.icon) : weaponSrc(pick(poolW).icon), f.gap) ?? Promise.resolve());
+        jobs.push(
+          weaponReelRef.current?.step(weaponSrc(lastFrame ? wWin.icon : pick(poolW).icon), f.gap) ??
+            Promise.resolve()
+        );
       }
       if (needM && mWin) {
-        jobs.push(monsterReelRef.current?.step(isLast ? iconSrc(mWin.icon) : iconSrc(pick(poolM).icon), f.gap) ?? Promise.resolve());
+        jobs.push(
+          monsterReelRef.current?.step(iconSrc(lastFrame ? mWin.icon : pick(poolM).icon), f.gap) ??
+            Promise.resolve()
+        );
       }
-      await Promise.all(jobs);
+      return Promise.all(jobs);
+    };
+
+    if (sustain) {
+      // 持续档：**没有设计终局** —— 情绪节拍（加速→伪停→再冲→落位）循环往复，
+      // 唯一出口是「结束 · 揭晓」按钮 / 弹幕「结束」指令置起 skipRef。
+      // 即时模式（减少动态 / 页面不可见）下逐帧滚不出动画：静止轮询等待结束信号即可。
+      if (instant) {
+        while (!skipRef.current) {
+          if (runId !== runIdRef.current) return;
+          await asleep(200);
+        }
+      } else {
+        for (let i = 0; ; i = (i + 1) % frames.length) {
+          if (runId !== runIdRef.current) return;
+          if (skipRef.current) break;
+          await stepFrame(frames[i], false);
+        }
+      }
+    } else {
+      for (let i = 0; i < frames.length; i++) {
+        if (runId !== runIdRef.current) return;
+        // 快进在帧边界生效：一帧最长 200ms（伪停段），这个量级的响应足够"按下即停"
+        if (skipRef.current) break;
+        await stepFrame(frames[i], i === frames.length - 1);
+      }
     }
     if (runId !== runIdRef.current) return;
 
-    // 逐项锁定：先武器后怪物，错开一拍
+    // 收束落位：胜者图标上盘本该由「最后一帧」完成，但持续档与中途快进都跳出了
+    // 循环、最后一帧从未发生 —— 必须显式落一次位再进入锁定，否则会出现
+    // "盘上留着随机图、名字写着胜者"的错位（快进功能初版遗漏，在此一并钉死）。
+    if (sustain || skipRef.current) {
+      if (instant) {
+        if (needW && wWin) weaponReelRef.current?.show(weaponSrc(wWin.icon));
+        if (needM && mWin) monsterReelRef.current?.show(iconSrc(mWin.icon));
+      } else {
+        const jobs: Promise<void>[] = [];
+        if (needW && wWin) {
+          jobs.push(weaponReelRef.current?.step(weaponSrc(wWin.icon), 170) ?? Promise.resolve());
+        }
+        if (needM && mWin) {
+          jobs.push(monsterReelRef.current?.step(iconSrc(mWin.icon), 170) ?? Promise.resolve());
+        }
+        await Promise.all(jobs);
+        if (runId !== runIdRef.current) return;
+      }
+    }
+
+    // 逐项锁定：先武器后怪物，错开一拍（快进后这段就是"结束阶段"本身：收得干脆，不拖）
     const stagger = instant ? 60 : 200;
     if (wWin) {
       setPhase("锁定 · 武器");
@@ -445,6 +521,44 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
   }, [
     needW, needM, poolW, poolM, frames, reduceMotion, settle,
   ]);
+
+  /**
+   * `draw` 的稳定引用桥。事件订阅只建一次（依赖里放 dep 不稳定的 `draw`
+   * 会让每次池子/设置变更都拆掉 listener 再重挂，弹幕指令在间隙里会丢）。
+   */
+  const drawRef = useRef(draw);
+  useEffect(() => {
+    drawRef.current = draw;
+  });
+
+  /**
+   * 弹幕抽选指令（后端已按"开开关 + 昵称精确匹配 + 整条指令词"过滤后才广播）：
+   * 「开始」开抽、「结束」快进。抽选演出只有本页签可见，故指令也只在本页签
+   * 挂载期间响应 —— 跑弹幕控制抽选的主播应停留在本页签。
+   */
+  useEffect(() => {
+    const unlisten = listen<DrawCommandPayload>("draw-command", (ev) => {
+      const { action, user_name } = ev.payload;
+      if (action === "start") {
+        if (rollingRef.current) {
+          toastRef.current(`收到 ${user_name} 的「开始」，已在抽选中，已忽略`);
+          return;
+        }
+        toastRef.current(`收到 ${user_name} 的「开始」指令，开始抽选`);
+        void drawRef.current();
+      } else {
+        if (!rollingRef.current) {
+          toastRef.current(`收到 ${user_name} 的「结束」，当前没有进行中的抽选`);
+          return;
+        }
+        toastRef.current(`收到 ${user_name} 的「结束」指令，收束揭晓`);
+        skipToEnd();
+      }
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, [skipToEnd]);
 
   /**
    * 首屏给两个盘一张静止的开场图，避免空白框 —— **只铺一次**。
@@ -597,8 +711,8 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
         <div>
           <h1>随机抽选武器与怪物</h1>
           <p className="sub">
-            从当前池子里等概率各抽 1 个 · 抽选<b>不写队列不占额度</b>，要入队请点「送去点单」·
-            排除名单与「怪物名单」的禁点名单相互独立
+            从当前池子里等概率各抽 1 个 · 抽选本身<b>不写队列不占额度</b>，点「送去点单」直接入队
+            · 弹幕指令与「快进 · 结束」都能提前收束演出 · 排除名单与「怪物名单」的禁点名单相互独立
           </p>
         </div>
       </header>
@@ -630,19 +744,66 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
               <span className="t">节奏</span>
               <span className="n">{paceEta}</span>
             </div>
-            <div className="rd-seg3">
+            <div className="rd-seg3 rd-seg4">
               {(Object.keys(PACE_LABEL) as DrawPace[]).map((p) => (
                 <button
                   key={p}
                   className={settings.pace === p ? "on" : ""}
                   onClick={() => mutate((prev) => ({ ...prev, pace: p }))}
                   disabled={rolling}
+                  title={p === "sustain" ? "滚动不限时长，直到点「结束 · 揭晓」或弹幕「结束」才收束" : undefined}
                 >
                   {PACE_LABEL[p].label}
-                  <span className="sub">{rollSecs[p].toFixed(1)}s 滚</span>
+                  <span className="sub">
+                    {p === "sustain" ? "∞ 滚动" : rollSecs[p].toFixed(1) + "s 滚"}
+                  </span>
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="rd-card">
+            <div className="rd-card-hd">
+              <span className="t">弹幕指令</span>
+              <span className="n">
+                {settings.command_enabled
+                  ? settings.command_user.trim()
+                    ? "已开启"
+                    : "未生效"
+                  : "未开启"}
+              </span>
+            </div>
+            <label className="rd-cmd-toggle">
+              <input
+                type="checkbox"
+                checked={settings.command_enabled}
+                onChange={(e) =>
+                  mutate((p) => ({ ...p, command_enabled: e.target.checked }))
+                }
+              />
+              <span>允许弹幕触发抽选</span>
+              <Radio className="w-3 h-3" />
+            </label>
+            <input
+              className="rd-cmd-user"
+              value={settings.command_user}
+              onChange={(e) => mutate((p) => ({ ...p, command_user: e.target.value }))}
+              placeholder="触发用户昵称（精确匹配）"
+            />
+            <p className="rd-cmd-hint">
+              {settings.command_enabled ? (
+                settings.command_user.trim() ? (
+                  <>
+                    收到 <b>{settings.command_user.trim()}</b> 的整条弹幕「开始」→
+                    开抽；「结束」→ 收束揭晓（持续档的唯一出口）。仅在本页签打开时响应。
+                  </>
+                ) : (
+                  "填好触发昵称后指令才会生效（留空 = 谁都触发不了）"
+                )
+              ) : (
+                "开启后，指定观众的整条「开始 / 结束」弹幕可远程控制抽选；配合持续档即可全程弹幕操控"
+              )}
+            </p>
           </div>
 
           <div className="rd-card">
@@ -763,20 +924,49 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
               <button className="rd-draw" onClick={() => void draw()} disabled={rolling || !!emptyReason}>
                 {rolling ? "抽选中" : "抽 选"}
               </button>
+              {rolling && (
+                <button
+                  className="rd-btn pri"
+                  onClick={skipToEnd}
+                  title={
+                    sustain
+                      ? "结束持续滚动，进入锁定与揭晓（结果早已定死，不重摇）"
+                      : "跳过剩余滚动演出，直接进入锁定与揭晓（结果不变）"
+                  }
+                >
+                  <FastForward className="w-3.5 h-3.5" />
+                  {sustain ? "结束 · 揭晓" : "快进 · 结束"}
+                </button>
+              )}
               {emptyReason ? (
                 <div className="rd-hint warn">{emptyReason}</div>
+              ) : rolling && sustain ? (
+                <div className="rd-hint">
+                  持续滚动中 —— 点「结束 · 揭晓」
+                  {settings.command_enabled && settings.command_user.trim()
+                    ? `，或等 ${settings.command_user.trim()} 的弹幕「结束」`
+                    : ""}
+                  收束演出
+                </div>
               ) : (
-                <div className="rd-hint">{hint}</div>
+                <div className="rd-hint">
+                  {hint}
+                  {sustain ? " · 滚动不限时长，直到手动「结束」" : null}
+                </div>
               )}
               {/* 结果区只放"把结果用起来"的动作：重新抽就是中间那颗大按钮，不在这里重复摆 */}
               <div className={`rd-result-actions${last && !rolling ? " on" : ""}`}>
                 <button
                   className="rd-btn sec"
                   disabled={!last?.monster}
-                  onClick={() => last?.monster && onSendToOrder(last.monster.name)}
+                  onClick={() => {
+                    if (!last?.monster) return;
+                    // 抽到的是哪一档（普通/历战/历战王）就入哪一档，与盘面揭晓一致
+                    onSendToOrder(last.monster.name, last.monster.level);
+                  }}
                   title={
                     last?.monster
-                      ? `切到「排队管理」并把「${last.monster.name}」预填进选怪面板`
+                      ? `把「${last.monster.name}」直接加入点单排队（以「随机抽选」身份入队）`
                       : "仅抽武器时没有可送去的怪物"
                   }
                 >
