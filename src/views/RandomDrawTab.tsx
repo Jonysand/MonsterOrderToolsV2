@@ -711,8 +711,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
         <div>
           <h1>随机抽选武器与怪物</h1>
           <p className="sub">
-            从当前池子里等概率各抽 1 个 · 抽选本身<b>不写队列不占额度</b>，点「送去点单」直接入队
-            · 弹幕指令与「快进 · 结束」都能提前收束演出 · 排除名单与「怪物名单」的禁点名单相互独立
+            从当前池子里等概率各抽 1 个 · 抽选<b>不写队列不占额度</b>，点「送去点单」直接入队
           </p>
         </div>
       </header>
@@ -784,26 +783,28 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
               <span>允许弹幕触发抽选</span>
               <Radio className="w-3 h-3" />
             </label>
-            <input
-              className="rd-cmd-user"
-              value={settings.command_user}
-              onChange={(e) => mutate((p) => ({ ...p, command_user: e.target.value }))}
-              placeholder="触发用户昵称（精确匹配）"
-            />
-            <p className="rd-cmd-hint">
-              {settings.command_enabled ? (
-                settings.command_user.trim() ? (
-                  <>
-                    收到 <b>{settings.command_user.trim()}</b> 的整条弹幕「开始」→
-                    开抽；「结束」→ 收束揭晓（持续档的唯一出口）。仅在本页签打开时响应。
-                  </>
-                ) : (
-                  "填好触发昵称后指令才会生效（留空 = 谁都触发不了）"
-                )
-              ) : (
-                "开启后，指定观众的整条「开始 / 结束」弹幕可远程控制抽选；配合持续档即可全程弹幕操控"
-              )}
-            </p>
+            {/* 输入框与玩法提示只在开启后展开：这张卡未开启时是左栏里最「虚」的一块，
+                整段常驻会把左栏撑得远高于舞台，页面右下留出一大块空背景 */}
+            {settings.command_enabled && (
+              <>
+                <input
+                  className="rd-cmd-user"
+                  value={settings.command_user}
+                  onChange={(e) => mutate((p) => ({ ...p, command_user: e.target.value }))}
+                  placeholder="触发用户昵称（精确匹配）"
+                />
+                <p className="rd-cmd-hint">
+                  {settings.command_user.trim() ? (
+                    <>
+                      收到 <b>{settings.command_user.trim()}</b> 的整条弹幕「开始」→
+                      开抽；「结束」→ 收束揭晓（持续档的唯一出口）。仅在本页签打开时响应。
+                    </>
+                  ) : (
+                    "填好触发昵称后指令才会生效（留空 = 谁都触发不了）"
+                  )}
+                </p>
+              </>
+            )}
           </div>
 
           <div className="rd-card">
@@ -864,13 +865,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
                 );
               })}
             </div>
-            <div className="rd-poolstat">
-              <span className="big">{poolM.length}</span>
-              <span className="of">只可抽</span>
-              <span className="txt">
-                {excludedM.size ? `已排除 ${excludedM.size} 只` : "排除名单为空"}
-              </span>
-            </div>
+            {/* 可抽/已排除数在卡头 n 与抽屉底栏都有，这里不再重复一行统计 */}
             <button className="rd-wide" onClick={() => setDrawerOpen(true)} disabled={rolling}>
               <Settings2 className="w-3.5 h-3.5" />
               管理排除名单…
