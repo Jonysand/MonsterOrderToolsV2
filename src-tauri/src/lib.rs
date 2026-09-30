@@ -674,6 +674,30 @@ fn picked_order_enqueue(
     Ok(())
 }
 
+/// `order-placed` 事件载荷（跑马灯文案与悬浮窗受理金印共用，字段与弹幕路径同一契约）。
+///
+/// 面板点怪没有弹幕的「二段式提权」，`is_priority` 直接取条目最终优先位：勾了优先就报优先，
+/// 与命令回执 Toast「（优先置前）」措辞一致。怪名与优先位都以**快照内实际条目**为准
+/// （面板请求的怪名可能带空白，入队时已规范化为字典原名）；快照中查不到该条目
+/// （理论上不会发生）时退回入队请求参数 —— 事件本身不因查表失败而沉默。
+fn order_placed_payload(
+    snapshot: &QueueSnapshot,
+    user_id: &str,
+    user_name: &str,
+    requested_monster: &str,
+    requested_priority: bool,
+) -> serde_json::Value {
+    let item = snapshot.items.iter().find(|i| i.user_id == user_id);
+    serde_json::json!({
+        "user_id": user_id,
+        "user_name": user_name,
+        "monster_name": item
+            .map(|i| i.monster_name.clone())
+            .unwrap_or_else(|| requested_monster.trim().to_string()),
+        "is_priority": item.map(|i| i.is_priority).unwrap_or(requested_priority),
+    })
+}
+
 /// 选怪面板入队（主播手动点单）。
 ///
 /// 与弹幕点怪的关键差异：面板展示的是**字典原名**，因此这里按原名精确取键，
@@ -692,8 +716,8 @@ fn add_picked_order(
 ) -> Result<QueueSnapshot, String> {
     picked_order_enqueue(
         &state,
-        user_id,
-        user_name,
+        user_id.clone(),
+        user_name.clone(),
         &monster_name,
         is_priority,
         guard_level,
@@ -702,6 +726,13 @@ fn add_picked_order(
 
     let snapshot = save_queue_now(&state, Some(&app_handle));
     emit_queue_snapshot(&app_handle, &snapshot);
+
+    // 受理反馈：面板点怪与弹幕点怪共用 order-placed —— 跑马灯金字文案 + 悬浮窗 QUEST ACCEPTED 金印。
+    // 顺序必须与弹幕路径一致：快照先广播、本事件后发，悬浮窗才能按 data-uid 定位到已渲染的行
+    let _ = app_handle.emit(
+        "order-placed",
+        &order_placed_payload(&snapshot, &user_id, &user_name, &monster_name, is_priority),
+    );
     Ok(snapshot)
 }
 
@@ -5048,6 +5079,41 @@ mod tests {
         let item = q.items.iter().find(|i| i.user_id == "m2").unwrap();
         assert_eq!(item.tempered_level, 2, "显式覆盖必须生效");
         println!("[PASS] test_picked_order_tempered_level_override_semantics passed");
+    }
+
+    /// 面板点怪必须产出与弹幕同契约的 order-placed 载荷 —— 它是跑马灯文案与悬浮窗 QUEST ACCEPTED 金印
+    /// 的唯一触发源，缺失即「手动入队无受理反馈」。怪名与优先位以快照内实际条目为准。
+    #[test]
+    fn test_picked_order_placed_payload_uses_authoritative_item() {
+        let state = AppState::new_test();
+        picked_order_enqueue(
+            &state,
+            "manual_fx".into(),
+            "房管".into(),
+            "黑龙",
+            true,
+            None,
+            None,
+        )
+        .expect("字典内的原名应可入队");
+        let snapshot = state.queue_mgr.lock().unwrap().snapshot();
+
+        // ① 请求怪名带空白：载荷必须是字典规范名（悬浮窗按 user_id 定位行，怪名只影响文案）
+        let payload = order_placed_payload(&snapshot, "manual_fx", "房管", " 黑龙 ", true);
+        assert_eq!(payload["user_id"], "manual_fx");
+        assert_eq!(payload["user_name"], "房管");
+        assert_eq!(payload["monster_name"], "黑龙");
+        assert_eq!(payload["is_priority"], true);
+
+        // ② 优先位以条目为准：请求未勾选但条目已置前，文案仍走「优先」分支
+        let upgraded = order_placed_payload(&snapshot, "manual_fx", "房管", "黑龙", false);
+        assert_eq!(upgraded["is_priority"], true);
+
+        // ③ 快照未命中（理论上不出现）：退回请求参数，事件不因查表失败而消失
+        let fallback = order_placed_payload(&snapshot, "manual_absent", "房管", "未知怪", false);
+        assert_eq!(fallback["monster_name"], "未知怪");
+        assert_eq!(fallback["is_priority"], false);
+        println!("[PASS] test_picked_order_placed_payload_uses_authoritative_item passed");
     }
 
     /// B2 锁序：持有名单读 guard 时，名单写入必须等待（检查与动作处于同一临界区）
