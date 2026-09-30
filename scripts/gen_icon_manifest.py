@@ -4,19 +4,57 @@
 后端在打包态看不到前端静态目录，图标选择器的数据源只能在构建期固化。
 产物提交入库（保证 CI 与本地一致），编码为 UTF-8 with BOM（见 check_encoding.py）。
 """
+import codecs
 import io
 import os
 import sys
-
-# Windows 上 stdout 被重定向（CI 日志、管道）时默认用 cp1252，中文 print 会抛 UnicodeEncodeError
-# 把构建整个带崩；py2 无 reconfigure，hasattr 兜住。
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ICON_DIR = os.path.join(ROOT, "public", "monster_icons")
 OUT_FILE = os.path.join(ROOT, "src", "generated", "iconManifest.ts")
 BOM = b"\xef\xbb\xbf"
+
+
+def console_encoding():
+    """stdout 直连控制台时返回其代码页；管道、重定向或代码页不可用时返回 None（此时按 UTF-8 输出）。"""
+    if not sys.stdout.isatty():
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            code_page = int(ctypes.windll.kernel32.GetConsoleOutputCP())
+        except Exception:
+            return None
+        if code_page <= 0:
+            return None
+        name = "cp%d" % code_page
+        try:
+            codecs.lookup(name)
+        except LookupError:
+            # py2 不认识 cp65001 之类的名字；此时控制台本就是 UTF-8，回落正好
+            return None
+    else:
+        name = sys.stdout.encoding or "utf-8"
+    return name
+
+
+def log(text):
+    """输出一行日志。
+
+    py2 的 stdout 是字节流，Windows 控制台按代码页解析写入的字节：直写 UTF-8 字节时，
+    cp936 会把整段缓冲区按双字节重新切分，切出非法序列（如尾部只剩半个汉字）即写入失败，
+    Python 抛 IOError [Errno 0]，足以带崩 dev/build。
+    故控制台直连时按控制台代码页编码（无法表示的字符退化为 ?），管道与重定向仍写 UTF-8。
+    因此本脚本要求 py2/py3 都能跑（npm 里的 `python` 未必是 py3），不能只依赖 reconfigure。
+    """
+    raw = text if isinstance(text, bytes) else text.encode("utf-8")
+    encoding = console_encoding() if sys.version_info[0] < 3 else None
+    if encoding:
+        raw = raw.decode("utf-8").encode(encoding, "replace")
+    stream = getattr(sys.stdout, "buffer", sys.stdout)  # py2 无 buffer，直接写字节流
+    stream.write(raw + b"\n")
+    stream.flush()
 
 
 def collect():
@@ -60,14 +98,23 @@ export function iconGroup(path: string): string {
     return "".join(lines)
 
 
+def normalize_newlines(data):
+    """比对前统一换行符。
+
+    Windows 检出时 .gitattributes（text=auto）会把入库的 LF 换成 CRLF，
+    直接按字节比对会永远判定“有变化”，每次运行都白写一遍文件。
+    """
+    return data.replace(b"\r\n", b"\n")
+
+
 def main():
     if not os.path.isdir(ICON_DIR):
-        print("图标目录不存在: %s" % ICON_DIR)
+        log("图标目录不存在: %s" % ICON_DIR)
         return 1
 
     paths = collect()
     if not paths:
-        print("未找到任何图标: %s" % ICON_DIR)
+        log("未找到任何图标: %s" % ICON_DIR)
         return 1
 
     body = render(paths)
@@ -79,8 +126,8 @@ def main():
         with open(OUT_FILE, "rb") as f:
             old = f.read()
 
-    if old == data:
-        print("iconManifest.ts 无需更新（%d 张图标）" % len(paths))
+    if old is not None and normalize_newlines(old) == normalize_newlines(data):
+        log("iconManifest.ts 无需更新（%d 张图标）" % len(paths))
         return 0
 
     out_dir = os.path.dirname(OUT_FILE)
@@ -88,9 +135,10 @@ def main():
         os.makedirs(out_dir)
     text = body.decode("utf-8") if isinstance(body, bytes) else body
     # utf-8-sig：写出 UTF-8 with BOM（.ts 编码规范见 check_encoding.py）
-    with io.open(OUT_FILE, "w", encoding="utf-8-sig") as f:
+    # newline="\n"：不做平台换行翻译，Windows 与 macOS 产出同一份字节流（仓库统一存 LF）
+    with io.open(OUT_FILE, "w", encoding="utf-8-sig", newline="\n") as f:
         f.write(text)
-    print("已生成 iconManifest.ts：%d 张图标" % len(paths))
+    log("已生成 iconManifest.ts：%d 张图标" % len(paths))
     return 0
 
 
