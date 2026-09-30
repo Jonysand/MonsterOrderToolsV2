@@ -57,7 +57,7 @@ const PACE_LABEL: Record<DrawPace, { label: string; sub: string }> = {
   fast: { label: "快", sub: "FAST" },
   normal: { label: "标准", sub: "NORMAL" },
   long: { label: "拖长", sub: "LONG" },
-  /** 持续：滚动无限循环，「结束」按钮与弹幕「结束」指令是唯一出口（收束与快进同一条通路） */
+  /** 持续：滚动无限循环，「结束」按钮与弹幕「停」指令是唯一出口（收束与快进同一条通路） */
   sustain: { label: "持续", sub: "SUSTAIN" },
 };
 
@@ -142,7 +142,7 @@ const clockOf = (ts: number) => {
  * 得主播自己点「送去点单」（直接写入排队队列）。
  *
  * 「持续」节奏档没有设计终局：情绪节拍循环往复地滚，唯一出口是
- * 「结束 · 揭晓」按钮或弹幕「结束」指令 —— 两者与快进共用同一条收束通路
+ * 「结束 · 揭晓」按钮或弹幕「停」指令 —— 两者与快进共用同一条收束通路
  * （`skipToEnd()` 置标志 → 循环退出 → 短促落位 → 锁定与揭晓照常）。
  * **跳过的是演出而不是重摇**：结果在按下「抽选」那一刻就已定死。
  *
@@ -437,7 +437,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
 
     if (sustain) {
       // 持续档：**没有设计终局** —— 情绪节拍（加速→伪停→再冲→落位）循环往复，
-      // 唯一出口是「结束 · 揭晓」按钮 / 弹幕「结束」指令置起 skipRef。
+      // 唯一出口是「结束 · 揭晓」按钮 / 弹幕「停」指令置起 skipRef。
       // 即时模式（减少动态 / 页面不可见）下逐帧滚不出动画：静止轮询等待结束信号即可。
       if (instant) {
         while (!skipRef.current) {
@@ -533,7 +533,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
 
   /**
    * 弹幕抽选指令（后端已按"开开关 + 昵称精确匹配 + 整条指令词"过滤后才广播）：
-   * 「开始」开抽、「结束」快进。抽选演出只有本页签可见，故指令也只在本页签
+   * 「开始」开抽、「停」快进。抽选演出只有本页签可见，故指令也只在本页签
    * 挂载期间响应 —— 跑弹幕控制抽选的主播应停留在本页签。
    */
   useEffect(() => {
@@ -548,10 +548,10 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
         void drawRef.current();
       } else {
         if (!rollingRef.current) {
-          toastRef.current(`收到 ${user_name} 的「结束」，当前没有进行中的抽选`);
+          toastRef.current(`收到 ${user_name} 的「停」，当前没有进行中的抽选`);
           return;
         }
-        toastRef.current(`收到 ${user_name} 的「结束」指令，收束揭晓`);
+        toastRef.current(`收到 ${user_name} 的「停」指令，收束揭晓`);
         skipToEnd();
       }
     });
@@ -750,7 +750,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
                   className={settings.pace === p ? "on" : ""}
                   onClick={() => mutate((prev) => ({ ...prev, pace: p }))}
                   disabled={rolling}
-                  title={p === "sustain" ? "滚动不限时长，直到点「结束 · 揭晓」或弹幕「结束」才收束" : undefined}
+                  title={p === "sustain" ? "滚动不限时长，直到点「结束 · 揭晓」或弹幕【停】才收束" : undefined}
                 >
                   {PACE_LABEL[p].label}
                   <span className="sub">
@@ -783,28 +783,30 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
               <span>允许弹幕触发抽选</span>
               <Radio className="w-3 h-3" />
             </label>
-            {/* 输入框与玩法提示只在开启后展开：这张卡未开启时是左栏里最「虚」的一块，
-                整段常驻会把左栏撑得远高于舞台，页面右下留出一大块空背景 */}
+            {/* 指令词提示**常驻一行**：关着的时候主播也得知道有哪两条指令可发。
+                输入框与完整玩法提示仍只在开启后展开 —— 这张卡未开启时是左栏里最「虚」的
+                一块，整段常驻会把左栏撑得远高于舞台，页面右下留出一大块空背景 */}
             {settings.command_enabled && (
-              <>
-                <input
-                  className="rd-cmd-user"
-                  value={settings.command_user}
-                  onChange={(e) => mutate((p) => ({ ...p, command_user: e.target.value }))}
-                  placeholder="触发用户昵称（精确匹配）"
-                />
-                <p className="rd-cmd-hint">
-                  {settings.command_user.trim() ? (
-                    <>
-                      收到 <b>{settings.command_user.trim()}</b> 的整条弹幕「开始」→
-                      开抽；「结束」→ 收束揭晓（持续档的唯一出口）。仅在本页签打开时响应。
-                    </>
-                  ) : (
-                    "填好触发昵称后指令才会生效（留空 = 谁都触发不了）"
-                  )}
-                </p>
-              </>
+              <input
+                className="rd-cmd-user"
+                value={settings.command_user}
+                onChange={(e) => mutate((p) => ({ ...p, command_user: e.target.value }))}
+                placeholder="触发用户昵称（精确匹配）"
+              />
             )}
+            <p className="rd-cmd-hint">
+              {settings.command_enabled && settings.command_user.trim() ? (
+                <>
+                  收到 <b>{settings.command_user.trim()}</b> 的整条弹幕 <b>【开始】</b> →
+                  开抽；<b>【停】</b> → 收束揭晓（持续档的唯一出口）。仅在本页签打开时响应。
+                </>
+              ) : (
+                <>
+                  指令词：整条弹幕 <b>【开始】</b> 开抽 · <b>【停】</b> 收束揭晓
+                  {settings.command_enabled ? " —— 填好触发昵称后才会生效" : "（勾选开启后生效）"}
+                </>
+              )}
+            </p>
           </div>
 
           <div className="rd-card">
@@ -939,7 +941,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
                 <div className="rd-hint">
                   持续滚动中 —— 点「结束 · 揭晓」
                   {settings.command_enabled && settings.command_user.trim()
-                    ? `，或等 ${settings.command_user.trim()} 的弹幕「结束」`
+                    ? `，或等 ${settings.command_user.trim()} 的弹幕【停】`
                     : ""}
                   收束演出
                 </div>

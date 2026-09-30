@@ -3660,11 +3660,12 @@ body {
 }
 
 .rd-mcell img { width: 38px; height: 38px; object-fit: contain; transition: .18s; }
-.rd-mcell .nm { font-size: 9px; color: var(--w-ink-4); max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: .18s; }
+/* 名字用白色：9px 的小字在暗底上原本只有 #525252，直播压屏后几乎不可辨 */
+.rd-mcell .nm { font-size: 9px; color: #fff; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: .18s; }
 .rd-mcell:hover { border-color: var(--w-line-3); background: #181818; }
-.rd-mcell:hover .nm { color: var(--w-ink-2); }
 .rd-mcell.off { background: #0b0b0b; border-color: #1d1d1d; }
 .rd-mcell.off img { filter: grayscale(1) brightness(.5); opacity: .4; }
+/* 已排除态保持暗灰：白色留给"在池里"的名字，明暗差本身就是排除状态的一部分 */
 .rd-mcell.off .nm { color: #3f3f3f; }
 
 .rd-mcell.off::after {

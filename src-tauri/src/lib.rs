@@ -1431,7 +1431,7 @@ pub fn handle_incoming_danmu(
         record_business_history_probe(&entry);
     }
 
-    // 1.2 随机抽选弹幕指令：指定观众的整条「开始」/「结束」→ 通知前端开抽或快进。
+    // 1.2 随机抽选弹幕指令：指定观众的整条「开始」/「停」→ 通知前端开抽或快进。
     //     放在 IS_LITE 段之外：抽选本身完整版与 Lite 版均支持（见 draw.rs 模块注释），
     //     指令走的又是普通弹幕管道。只旁路广播、**不 return**：指令弹幕继续走
     //     点怪匹配与朗读链路（与「优先」提权指令同一姿态）。昵称不进普通 Logs。
@@ -3474,7 +3474,7 @@ mod tests {
     }
 
     /// 弹幕抽选指令走 AppState 的设置快照判定（与 handle_incoming_danmu 1.2 同一数据源）：
-    /// 配好昵称后「开始/结束」命中、未配置不命中；Lite 同样生效（不设 ensure_not_lite 守卫）
+    /// 配好昵称后「开始/停」命中、未配置不命中；Lite 同样生效（不设 ensure_not_lite 守卫）
     #[test]
     fn test_draw_command_via_app_state() {
         let state = AppState::new_test();
@@ -3488,7 +3488,7 @@ mod tests {
 
         let s = state.draw_settings.snapshot();
         assert_eq!(draw::match_draw_command(&s, "猎人甲", "开始"), Some(draw::DrawCommand::Start));
-        assert_eq!(draw::match_draw_command(&s, "猎人甲", "结束"), Some(draw::DrawCommand::End));
+        assert_eq!(draw::match_draw_command(&s, "猎人甲", "停"), Some(draw::DrawCommand::End));
         assert_eq!(draw::match_draw_command(&s, "猎人乙", "开始"), None);
         assert_eq!(draw::match_draw_command(&s, "猎人甲", "开始吧"), None);
 

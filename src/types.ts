@@ -167,7 +167,7 @@ export interface RosterSnapshot {
 /** 抽选模式：两者都抽 / 仅武器 / 仅怪物 */
 export type DrawMode = "both" | "weapon" | "monster";
 
-/** 节奏档位：快 / 标准 / 拖长 / 持续（持续 = 无限滚动直到手动或弹幕「结束」收束） */
+/** 节奏档位：快 / 标准 / 拖长 / 持续（持续 = 无限滚动直到手动或弹幕「停」收束） */
 export type DrawPace = "fast" | "normal" | "long" | "sustain";
 
 /**
@@ -185,13 +185,13 @@ export interface DrawSettings {
   excluded_weapons: string[];
   mode: DrawMode;
   pace: DrawPace;
-  /** 弹幕指令控制开关：开启后指定观众的整条「开始」/「结束」弹幕可远程控制抽选 */
+  /** 弹幕指令控制开关：开启后指定观众的整条「开始」/「停」弹幕可远程控制抽选 */
   command_enabled: boolean;
   /** 弹幕指令触发用户昵称（后端与弹幕 user_name 精确匹配；开启但留空 = 指令不生效） */
   command_user: string;
 }
 
-/** 「开始」/「结束」抽选弹幕指令（后端 draw-command 事件载荷） */
+/** 「开始」/「停」抽选弹幕指令（后端 draw-command 事件载荷） */
 export interface DrawCommandPayload {
   action: "start" | "end";
   user_name: string;

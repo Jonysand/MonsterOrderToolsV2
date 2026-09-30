@@ -36,7 +36,7 @@ pub const GAME_IDS: [&str; 5] = ["MHWilds", "MHWorld", "MHWI", "MHRise", "MHRS"]
 pub const MODES: [&str; 3] = ["both", "weapon", "monster"];
 
 /// 节奏档位：快 / 标准 / 拖长 / 持续（对应前端演出时长的倍率）。
-/// 「持续」（sustain）：滚动无限循环，唯一出口是「结束」按钮或弹幕「结束」指令。
+/// 「持续」（sustain）：滚动无限循环，唯一出口是「结束」按钮或弹幕「停」指令。
 pub const PACES: [&str; 4] = ["fast", "normal", "long", "sustain"];
 
 const DEFAULT_MODE: &str = "both";
@@ -70,7 +70,7 @@ pub struct DrawSettings {
     pub mode: String,
     #[serde(default = "default_pace")]
     pub pace: String,
-    /// 弹幕指令控制开关：开启后指定观众的整条「开始」/「结束」弹幕可远程控制抽选
+    /// 弹幕指令控制开关：开启后指定观众的整条「开始」/「停」弹幕可远程控制抽选
     #[serde(default)]
     pub command_enabled: bool,
     /// 弹幕指令触发用户的昵称（与弹幕 `user_name` 精确匹配；开启但留空 = 指令不生效）
@@ -97,7 +97,7 @@ impl Default for DrawSettings {
 pub enum DrawCommand {
     /// 「开始」：立即开抽一次
     Start,
-    /// 「结束」：跳过演出直接进入锁定与揭晓
+    /// 「停」：跳过演出直接进入锁定与揭晓
     End,
 }
 
@@ -116,8 +116,9 @@ impl DrawCommand {
 /// - `command_enabled` 为真且 `command_user` 归一化后非空（留空的"开着"不生效，
 ///   避免往上追溯到"开启但没填昵称"的中间态时把开关抹掉——归一化只管 trim）；
 /// - 弹幕发送者昵称与 `command_user` **整条精确一致**（非包含、非前缀）；
-/// - 弹幕原文去空白后整条精确等于「开始」或「结束」——与「优先」提权指令同口径，
-///   句中带词不触发（"开始吧"/"快结束"都只是聊天）。
+/// - 弹幕原文去空白后整条精确等于「开始」或「停」——与「优先」提权指令同口径，
+///   句中带词不触发（"开始吧"/"停下"都只是聊天）。旧指令词「结束」**不再命中**：
+///   单字「停」与点怪语境零冲突，主播读起来也更顺口。
 ///
 /// 指令弹幕**不独占语义**：命中后调用方只旁路广播事件，弹幕仍照常走
 /// 点怪匹配与朗读链路（与「优先」的处理姿态一致）。
@@ -134,7 +135,7 @@ pub fn match_draw_command(
     }
     match message.trim() {
         "开始" => Some(DrawCommand::Start),
-        "结束" => Some(DrawCommand::End),
+        "停" => Some(DrawCommand::End),
         _ => None,
     }
 }
@@ -413,11 +414,12 @@ mod tests {
             ..DrawSettings::default()
         };
 
-        // 命中：开始 / 结束（含首尾空白）
+        // 命中：开始 / 停（含首尾空白）
         let s = mk(true, "猎人甲");
         assert_eq!(match_draw_command(&s, "猎人甲", "开始"), Some(DrawCommand::Start));
-        assert_eq!(match_draw_command(&s, "猎人甲", "结束"), Some(DrawCommand::End));
+        assert_eq!(match_draw_command(&s, "猎人甲", "停"), Some(DrawCommand::End));
         assert_eq!(match_draw_command(&s, "猎人甲", "  开始  "), Some(DrawCommand::Start));
+        assert_eq!(match_draw_command(&s, "猎人甲", "  停  "), Some(DrawCommand::End));
 
         // 关闭：永不命中
         assert_eq!(match_draw_command(&mk(false, "猎人甲"), "猎人甲", "开始"), None);
@@ -434,9 +436,14 @@ mod tests {
         assert_eq!(match_draw_command(&s, "猎人甲", "开始吧"), None);
         assert_eq!(match_draw_command(&s, "猎人甲", "快开始"), None);
         assert_eq!(match_draw_command(&s, "猎人甲", "开始！"), None);
-        assert_eq!(match_draw_command(&s, "猎人甲", "开始 结束"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "开始 停"), None);
         assert_eq!(match_draw_command(&s, "猎人甲", "今天开始打猎"), None);
         assert_eq!(match_draw_command(&s, "猎人甲", "优先"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "停下"), None);
+        assert_eq!(match_draw_command(&s, "猎人甲", "停！"), None);
+
+        // 旧指令词「结束」自本版起不再命中（改用单字「停」）
+        assert_eq!(match_draw_command(&s, "猎人甲", "结束"), None);
 
         println!("[PASS] test_draw_command_matching passed");
     }
