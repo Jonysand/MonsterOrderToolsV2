@@ -71,6 +71,101 @@ jobs:
       - name: Rust 单元测试（Lite 形态）
         run: cargo test --manifest-path src-tauri/Cargo.toml --features lite
 
+  # Rust release 依赖预热：为 Release workflow（tag 触发）提供 target/release 编译缓存。
+  # 背景：Actions 缓存按 ref 作用域隔离，tag 之间互相读不到对方保存的缓存，而 master 作用域
+  # 的缓存对任何 tag 可见；verify job 只编 debug profile（cargo test），缓存帮不上 release
+  # 编译。故由本 job 常驻编译 release 依赖（--lib 跳过 bin 的 LTO 链接，编译量最小仍覆盖全部
+  # 371 个依赖），Release job 通过相同 shared-key 直接命中，免全量冷编。
+  # key 含 OS-arch 段，Windows 与 macOS 预热 job 可共用 shared-key 值不冲突。
+  warm-rust-windows:
+    name: 预热 Rust release 缓存 (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 准备 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: 准备 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: release-deps
+          add-job-id-key: false
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # credentials.dat 为加密凭据不入库，tauri-build 编译期校验其存在性，缺文件会直接挡住编译
+      - name: 生成随包预置凭据
+        env:
+          CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+        run: python scripts/ci_credentials.py
+
+      # tauri-build 校验 frontendDist(../dist) 是否存在，须先产前端产物才能编 Rust
+      - name: 前端构建
+        run: npm run build
+
+      # 只编依赖与 build 脚本：跳过 bin 的 LTO 链接（lto=true + codegen-units=1 的链接
+      # 单独要 ~4 分钟，由 Release job 全价构建）；依赖 .rlib 与 fingerprint 进缓存供 Release 复用
+      - name: 编译 Rust release 依赖
+        run: cargo build --release --lib --manifest-path src-tauri/Cargo.toml
+
+  warm-rust-macos:
+    name: 预热 Rust release 缓存 (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 准备 Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: 准备 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 准备 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: release-deps
+          add-job-id-key: false
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 生成随包预置凭据
+        env:
+          CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+        run: python scripts/ci_credentials.py
+
+      - name: 前端构建
+        run: npm run build
+
+      # 同 warm-rust-windows：预热 release 依赖产物，跳过 bin 的 LTO 链接
+      - name: 编译 Rust release 依赖
+        run: cargo build --release --lib --manifest-path src-tauri/Cargo.toml
+
   verify-macos:
     name: 构建与单元测试 (macOS)
     runs-on: macos-latest
