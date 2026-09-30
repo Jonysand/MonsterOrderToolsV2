@@ -91,7 +91,7 @@
   --g99: #34d399;
 
   --stamp: #e0472f;
-  /* 受理金印色阶（ORDER IN，docs/design/overlay_order_accepted_stamp.html 方案B）：
+  /* 受理金印色阶（QUEST ACCEPTED，docs/design/overlay_order_accepted_stamp.html 方案B）：
      与 --stamp 同策略不随主题切换 —— 完成 / 受理语义全局唯一 */
   --gold-hi: #fff3c4;
   --gold-main: #f0d47a;
@@ -781,7 +781,7 @@ body {
 }
 
 /* =============================================================================
-   受理特效（ORDER IN 金印光耀）：点怪成功时在对应行上浮现金渐变衬线大字，
+   受理特效（QUEST ACCEPTED 金印光耀）：点怪成功时在对应行上浮现金渐变衬线大字，
    与完成朱印钤印成对（朱印 = 讨伐完，金印 = 受理入列）。
    方案与节奏见 docs/design/overlay_order_accepted_stamp.html（方案B 定稿）：
    行入场 0.3s 后金印浮现落定，余韵 0.4s，1.22s 起收印（淡出上浮），1.55s 全收；
@@ -794,6 +794,8 @@ body {
 }
 
 /* 金字主体：DM Serif 金渐变裁字（与完成印面同字体工艺）。
+   字号 30px = 受理比完成（34px）收一档：QUEST ACCEPTED 字身宽 8.05em 长于
+   QUEST CLEAR 的 6.22em，同字号会让受理印比完成印还宽，设计稿「受理次强、完成最强」的梯度倒挂。
    关键帧内的 drop-shadow 与基础 filter 保持一致 —— filter 在关键帧间插值时会
    整表替换基础值，落定后（42% 起）若不带上光晕会被 blur(0) 整个抹掉 */
 .order-glow {
@@ -801,7 +803,7 @@ body {
   left: 50%;
   top: 50%;
   font-family: var(--font-num);
-  font-size: 34px;
+  font-size: 30px;
   line-height: 1.3;
   letter-spacing: 0.1em;
   white-space: nowrap;

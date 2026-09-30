@@ -31,7 +31,7 @@ const BUBBLE_TTL_MS = 15000;
 const QUEUE_ROW_HEIGHT = 60;
 /** 完成动效总时长：钤印 560ms 与离场 420ms（延迟 560ms）重叠 */
 const COMPLETE_ANIM_MS = 980;
-/** 受理动效总时长（ORDER IN 金印）：0.3s 起 + 0.56s 落定 + 余韵，1.22s 起收印，1550ms 全收 */
+/** 受理动效总时长（QUEST ACCEPTED 金印）：0.3s 起 + 0.56s 落定 + 余韵，1.22s 起收印，1550ms 全收 */
 const ORDER_FX_MS = 1550;
 /** 受理行内容压暗恢复时刻：金印开始收走时让行回归常态 */
 const ORDER_DIM_MS = 1200;
@@ -310,7 +310,7 @@ export const OverlayWindow: React.FC = () => {
   };
 
   /**
-   * 受理特效（ORDER IN 金印）：order-placed 触发，在对应行上盖金印。
+   * 受理特效（QUEST ACCEPTED 金印）：order-placed 触发，在对应行上盖金印。
    * 后端先广播队列快照、后发本事件 —— 行已随快照提交渲染，按 data-uid 定位；
    * 行不在可视区（虚拟列表只渲染可视行）则不播，跑马灯仍是兜底提示。
    * 特效层挂面板根，层叠与渲染位置见 queue-order-fx 渲染处注释。
@@ -402,7 +402,7 @@ export const OverlayWindow: React.FC = () => {
     });
 
     // D3 跑马灯：点怪成功提示入队（文案对齐原工程 DanmuManager.OnDanmuProcessed）；
-    // 受理特效：金印 ORDER IN 盖在对应行上（快照先发、本事件后到，行已随快照渲染）
+    // 受理特效：金印 QUEST ACCEPTED 盖在对应行上（快照先发、本事件后到，行已随快照渲染）
     const unlistenOrder = listen<OrderPlacedPayload>("order-placed", (event) => {
       const { user_id, user_name, monster_name, is_priority } = event.payload;
       const text = is_priority
@@ -989,7 +989,7 @@ export const OverlayWindow: React.FC = () => {
     if (ghost) classNames.push("queue-row-completing");
     else if (placeholder) classNames.push("queue-row-placeholder");
     if (enteringIds.has(item.id)) classNames.push("queue-row-enter");
-    // 受理压暗：金印 ORDER IN 播放期间行内容让位（App.css .queue-row.ordering）
+    // 受理压暗：金印 QUEST ACCEPTED 播放期间行内容让位（App.css .queue-row.ordering）
     if (orderingIds.has(item.user_id)) classNames.push("ordering");
 
     return (
@@ -1245,7 +1245,7 @@ export const OverlayWindow: React.FC = () => {
           </div>
         ))}
 
-        {/* 受理特效层：点怪成功金印（ORDER IN）。层叠与 queue-clear-fx 同为 z60 面板根
+        {/* 受理特效层：点怪成功金印（QUEST ACCEPTED）。层叠与 queue-clear-fx 同为 z60 面板根
             （顶栏/气泡/拖拽浮起之上），渲染顺序在其后 —— 同 z-index 时后来者居上，
             受理与完成同帧叠加时金印盖在朱印上，与「先受理后讨伐」的时序一致 */}
         {orderGhosts.map((g) => (
@@ -1256,7 +1256,7 @@ export const OverlayWindow: React.FC = () => {
           >
             <span className="order-rays" />
             <span className="order-ring" />
-            <span className="order-glow">ORDER IN</span>
+            <span className="order-glow">QUEST ACCEPTED</span>
           </div>
         ))}
       </div>

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>点怪成功提示升级 · ORDER IN 金印受理方案</title>
+<title>点怪成功提示升级 · QUEST ACCEPTED 金印受理方案</title>
 <style>
 /* =============================================================================
    点怪成功提示升级设计方案（仅设计评审用，不代表已落地）
@@ -517,6 +517,8 @@ table.spec td b { color: #ecdfb8; }
   border: 1px solid rgba(217, 181, 88, 0.5); border-radius: 2px;
 }
 .copy-cell .stamp-sample.cjk { font-family: var(--f-serif); font-weight: 800; letter-spacing: 0.14em; }
+/* 长拉丁文案样本降档：QUEST ACCEPTED 字身宽 8.05em，24px 会撑出 240px 示例卡 */
+.copy-cell .stamp-sample.long { font-size: 17px; letter-spacing: 0.05em; }
 .copy-cell p { margin: 10px 0 0; font-size: 12px; color: #a2aab3; text-align: left; }
 .copy-cell .rec { color: #9fd98a; }
 
@@ -555,10 +557,10 @@ ol.todo code, .note code {
 <div class="page">
 
   <div class="page-head">
-    <h1>点怪成功提示升级 · ORDER IN 金印受理方案</h1>
+    <h1>点怪成功提示升级 · QUEST ACCEPTED 金印受理方案</h1>
     <p>悬浮窗「狩猎点单队列」点怪成功提示：现状仅 12.5px 跑马灯文字，强度与完成钤印（QUEST CLEAR）严重倒挂；本方案为其配一枚同构金印，构成「金印受理 / 朱印讨伐」成对语义</p>
     <p>对照组件：跑马灯（OverlayWindow.tsx 310–319 order-placed）· 新行入场 <code style="color:#e8d5a8">.queue-row-enter</code>（applyQueue 187–193 enteringIds）· 完成特效 <code style="color:#e8d5a8">.queue-clear-fx</code>（复用其 ghost 层定位机制）</p>
-    <span class="doc-tag">设计评审稿 · 2026-09-29 · 仅评审用不代表已落地</span>
+    <span class="doc-tag">设计评审稿 · 2026-09-29 · 2026-09-30 落地：文案定稿 QUEST ACCEPTED（30px），其余按方案B</span>
   </div>
 
   <!-- ============================ 现状与差距 ============================ -->
@@ -614,7 +616,7 @@ ol.todo code, .note code {
   <div class="ref-grid">
     <div class="ref-card">
       <h4>成对语义：金印受理 ↔ 朱印讨伐</h4>
-      <p>复用完成钤印的全部动画语法（<b style="color:#ecdfb8">缩砸急停 + 落定回弹 + 冲击环 + 十字光 + 内容压暗</b>），只换印面与色阶：朱红 = 讨伐完成（QUEST CLEAR），金色 = 点单受理（ORDER IN）。观众看一眼就知道「谁加入了、谁打完了」。</p>
+      <p>复用完成钤印的全部动画语法（<b style="color:#ecdfb8">缩砸急停 + 落定回弹 + 冲击环 + 十字光 + 内容压暗</b>），只换印面与色阶：朱红 = 讨伐完成（QUEST CLEAR），金色 = 点单受理（QUEST ACCEPTED）。观众看一眼就知道「谁加入了、谁打完了」。</p>
       <span class="kw">同构不同色 · 语义成对 · 风格零漂移</span>
     </div>
     <div class="ref-card">
@@ -637,7 +639,7 @@ ol.todo code, .note code {
   <table class="spec">
     <tr><th>Token</th><th>完成（QUEST CLEAR 现状）</th><th>受理（本方案）</th><th>说明</th></tr>
     <tr><td>字号 font-size</td><td class="num old">34px</td><td class="num new">30px（0.88×）</td><td>受理收半档，完成保持最强语义</td></tr>
-    <tr><td>印面文案</td><td class="num old">QUEST CLEAR</td><td class="num new">ORDER IN（优先档 PRIORITY）</td><td>拉丁衬线，与 QUEST CLEAR 同工艺</td></tr>
+    <tr><td>印面文案</td><td class="num old">QUEST CLEAR</td><td class="num new">QUEST ACCEPTED（优先档 PRIORITY）</td><td>拉丁衬线，与 QUEST CLEAR 同工艺</td></tr>
     <tr><td>印色</td><td class="num old">朱红 --stamp（全局）</td><td class="num new">金 --gold-main / 优先 --gold-prio（全局）</td><td>两印色均不随主题切换，语义全局唯一</td></tr>
     <tr><td>印框</td><td class="num old">3px + 内衬 1px 双线</td><td class="num new">3px + 内衬 1px 双线（金）</td><td>同构</td></tr>
     <tr><td>倾角 rotate</td><td class="num old">-8°</td><td class="num new">-6°</td><td>与完成略区分，避免同帧错认</td></tr>
@@ -687,7 +689,7 @@ ol.todo code, .note code {
     </div>
   </div>
 
-  <p class="replay-tip">普通点怪：金印 ORDER IN 砸在新行上，1.55s 后印收行留。优先插队：金白 PRIORITY + 放射光束 + 双冲击环，插到队首。</p>
+  <p class="replay-tip">普通点怪：金印 QUEST ACCEPTED 砸在新行上，1.55s 后印收行留。优先插队：金白 PRIORITY + 放射光束 + 双冲击环，插到队首。</p>
   <button class="replay-btn" onclick="autoDemo()">▶ 自动演示一轮（普通 → 优先）</button>
 
   <!-- ============================ 方案B ============================ -->
@@ -714,12 +716,12 @@ ol.todo code, .note code {
   </div>
 
   <!-- ============================ 文案选项 ============================ -->
-  <h2>五、印面文案 <span class="sub">三选一，默认建议 ORDER IN</span></h2>
+  <h2>五、印面文案 <span class="sub">三选一，定稿 QUEST ACCEPTED（落地版）</span></h2>
 
   <div class="copy-grid">
     <div class="copy-cell">
-      <span class="stamp-sample">ORDER IN</span>
-      <p><b class="rec">推荐</b>——拉丁衬线大写，与 QUEST CLEAR 印面同工艺成对（CLEAR = 讨伐完，IN = 受理入列）；随包 DM Serif 只需确认 O/D/R/N/I 六字符在子集内。</p>
+      <span class="stamp-sample long">QUEST ACCEPTED</span>
+      <p><b class="rec">定稿</b>——QUEST 系列成对（CLEAR = 讨伐完，ACCEPTED = 受理入列），拉丁衬线大写与完成印同工艺；随包 DM Serif 按拉丁整包分发，Q/U/E/S/T/A/C/P/D 实测全部命中，无需再子集化。</p>
     </div>
     <div class="copy-cell">
       <span class="stamp-sample cjk">受注</span>
@@ -742,7 +744,7 @@ ol.todo code, .note code {
     <li><b>App.css 新增受理特效段落</b>（不动完成动效段）：<code>.queue-order-fx / .order-stamp / .order-ring / .order-flare / .order-rays</code> 与 <code>.queue-row.ordering</code> 压暗规则，规格按第三节规格表；金色 token 复用 <code>--gold-*</code>（若评审稿未落地则一并新增）。</li>
     <li><b>OverlayWindow.tsx 联动</b>：<code>order-placed</code> 监听里暂存 <code>{user_id, is_priority}</code> 到 <code>pendingOrderRef</code>；<code>applyQueue</code> 的 fresh 检测（187–193 行）命中 <code>user_id</code> 时量 rect（复用 <code>rowRectInPanel</code>）建 fx 层，1550ms 后移除；行加 <code>ordering</code> 类、1.2s 后摘类恢复。</li>
     <li><b>跑马灯同步增强</b>：order 消息播放期间 marquee span 加金色 + <code>orderMarqueeFlash</code> 辉光（文案逻辑不变，只加样式分支）。</li>
-    <li><b>字体子集确认</b>：印面定 ORDER IN / PRIORITY 后核对随包 DM Serif 子集含 O/R/D/E/I/N/P/Y（QUEST CLEAR 子集已含 E/R，需补 O/D/I/N/P/Y），缺则更新 <code>scripts/fonts/subset_fonts.py</code> 字表重新子集化。</li>
+    <li><b>字体字形确认</b>：读 <code>DMSerifDisplay-Regular.woff2</code> 的 cmap 实测 QUEST ACCEPTED / PRIORITY 所需字形全部命中（该字体按拉丁整包分发，见 <code>scripts/fonts/subset_fonts.py</code>）。<span class="ok">✓ 无需子集化</span></li>
     <li><b>冲突处理</b>：受理印播放中（1.55s 内）主播点击该行完成时，完成特效照常叠加播放（两层各自定位不冲突）；若评审要求互斥，在完成触发时强制摘除该行受理层。</li>
     <li><b>Lite 形态</b>：点怪队列是 Lite 唯一保留的核心功能，受理印随本体一并生效，无需 <code>ensure_not_lite</code> 守卫、不涉及 <code>IS_LITE</code> 分支。<span class="ok">✓ 无额外工作</span></li>
     <li><b>验证</b>：纯 CSS/TSX 前端变更 —— 跑 <code>npm run build</code>；人工核对两主题 × 普通/优先两档 × 队首插入/队尾插入，以及受理后立即完成、连续多单快速进入两个冲突场景。</li>
@@ -801,9 +803,9 @@ seedRows(document.getElementById("glow-rows"), 4);
 /* fx 层骨架 */
 function fxHTML(priority, glow) {
   if (glow) {
-    return `<span class="order-rays"></span><span class="order-ring"></span><span class="order-glow">ORDER IN</span>`;
+    return `<span class="order-rays"></span><span class="order-ring"></span><span class="order-glow">QUEST ACCEPTED</span>`;
   }
-  const stamp = priority ? "PRIORITY" : "ORDER IN";
+  const stamp = priority ? "PRIORITY" : "QUEST ACCEPTED";
   return `<span class="order-rays"></span><span class="order-ring"></span>${priority ? '<span class="order-ring ring2"></span>' : ""}<span class="order-flare"><i></i><i></i><i></i><i></i></span><span class="order-stamp${priority ? " prio" : ""}">${stamp}</span>`;
 }
 
