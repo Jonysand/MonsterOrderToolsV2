@@ -6,6 +6,8 @@ import {
   QueueItem,
   QueueSnapshot,
   AppConfig,
+  BatchDequeueResult,
+  BatchRestoreResult,
   OrderPlacedPayload,
   OrderBlockedPayload,
   CheckinReplyPayload,
@@ -20,7 +22,7 @@ import {
 } from "../types";
 import { VirtualList } from "../components/VirtualList";
 import { MarqueeText } from "../components/MarqueeText";
-import { Shield, X, GripVertical, Volume2, Lock, Bell } from "lucide-react";
+import { Shield, X, GripVertical, Volume2, Lock, Bell, ListChecks, Check } from "lucide-react";
 
 const FALLBACK_MARQUEE = "发送'点怪 xxx'进行点怪";
 /** 单条跑马灯滚动时长（原工程固定 10s） */
@@ -37,6 +39,9 @@ const ORDER_FX_MS = 1550;
 const ORDER_DIM_MS = 1200;
 /** 撤销垫保留时长 */
 const UNDO_TTL_MS = 5200;
+/** 拖拽移动阈值：手柄按下后位移超过该距离才真正进入拖拽态。
+ *  没有阈值时点删除的手往左偏一点就会误触成拖拽，一松手顺序就被改掉 */
+const DRAG_THRESHOLD_PX = 4;
 
 type BubbleTone = "checkin" | "retro" | "like" | "gift" | "system";
 
@@ -69,9 +74,10 @@ interface GhostRow {
   rect: { left: number; top: number; width: number; height: number };
 }
 
+/** 撤销记录：单条完成压一条长度 1 的 entries，批量清点压整批。
+ *  index 记录「删除那一刻」的队列下标，批量撤销时按删除顺序逆序插回即可精确还原 */
 interface UndoRecord {
-  item: QueueItem;
-  index: number;
+  entries: { item: QueueItem; index: number }[];
 }
 
 /** 受理特效层（queue-order-fx）：定位矩形 + 递增 key —— 同用户连单由 active 集合去重，不并存 */
@@ -120,6 +126,10 @@ export const OverlayWindow: React.FC = () => {
   const [orderGhosts, setOrderGhosts] = useState<OrderGhostFx[]>([]);
   const [orderingIds, setOrderingIds] = useState<Set<string>>(new Set());
   const [undoStack, setUndoStack] = useState<UndoRecord[]>([]);
+  /** 批量清点模式：行点击改为勾选，底部出现「清理选中」操作条（不改变布局、不播特效） */
+  const [batchMode, setBatchMode] = useState(false);
+  /** 批量模式下已勾选的 user_id 集合 */
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [theme, setTheme] = useState<"wilds" | "asc">("wilds");
   const [decor, setDecor] = useState<boolean>(false);
   const [conn, setConn] = useState<ConnectionStatusPayload | null>(null);
@@ -152,6 +162,18 @@ export const OverlayWindow: React.FC = () => {
     width: number;
     y: number;
     valid: boolean;
+  } | null>(null);
+  /** 拖拽态镜像：pointermove 里刚 setDrag 后闭包里的 state 仍是旧值，事件逻辑一律读此 ref */
+  const dragRef = useRef<DragState | null>(null);
+  /** 拖拽预备态：手柄已按下但位移未达阈值，尚未进入拖拽（松手不产生任何副作用） */
+  const dragPendingRef = useRef<{
+    uid: string;
+    origin: string[];
+    startX: number;
+    startY: number;
+    grabOffset: number;
+    left: number;
+    width: number;
   } | null>(null);
   /** 上一帧各行布局顶边与行序指纹，供让位补间（FLIP）判定位移 */
   const rowLayoutRef = useRef<{ key: string; firstTop: number; tops: Map<string, number> }>({
@@ -187,6 +209,12 @@ export const OverlayWindow: React.FC = () => {
     return opChainRef.current;
   };
 
+  /** 同步拖拽态：state 供渲染，ref 供事件回调读取（同一事件内 setDrag 后 state 尚未更新） */
+  const applyDrag = (d: DragState | null) => {
+    dragRef.current = d;
+    setDrag(d);
+  };
+
   /**
    * 队列写入唯一入口：fetchQueue、queue-updated 与命令成功回调都走这里。
    *
@@ -215,6 +243,14 @@ export const OverlayWindow: React.FC = () => {
       if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
       enterTimerRef.current = setTimeout(() => setEnteringIds(new Set()), 500);
     }
+
+    // 批量清点：队列变化后剔除已不在队中的勾选项（完成、被清点或被弹幕改动）
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const next = new Set<string>();
+      for (const it of items) if (prev.has(it.user_id)) next.add(it.user_id);
+      return next.size === prev.size ? prev : next;
+    });
 
     setQueue(items);
   };
@@ -596,6 +632,13 @@ export const OverlayWindow: React.FC = () => {
     return () => clearTimeout(timer);
   }, [undoStack]);
 
+  // 批量清点：锁定（穿透）或队列清空时自动退出，避免模式残留
+  useEffect(() => {
+    if (!batchMode) return;
+    if (locked || queue.length === 0) exitBatchMode();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchMode, locked, queue.length]);
+
   /** 是否正在显示默认文本（决定循环滚动样式与单次滚动样式） */
   const isDefaultMarquee = marqueeText === defaultMarquee;
 
@@ -683,9 +726,9 @@ export const OverlayWindow: React.FC = () => {
    * setPointerCapture 把后续事件绑在手柄上：指针移出窗口也不会丢 pointerup。
    */
   const handleGripPointerDown = (e: React.PointerEvent<HTMLElement>, userId: string) => {
-    if (locked || e.button !== 0) return;
+    if (locked || batchMode || e.button !== 0) return;
     e.preventDefault(); // 阻止拖动时选中文本、触发原生拖放
-    e.stopPropagation(); // 不冒泡到行（点击完成）与窗口拖动
+    e.stopPropagation(); // 不冒泡到行（点击完成/勾选）与窗口拖动
     const rowEl = e.currentTarget.closest<HTMLElement>(".queue-row");
     const origin = authoritativeRef.current.items.map((i) => i.user_id);
     if (!rowEl || !origin.includes(userId)) return;
@@ -693,14 +736,17 @@ export const OverlayWindow: React.FC = () => {
     const rect = rowEl.getBoundingClientRect();
     // 捕获挂在外层根节点：拖拽中列表会重排、被拖行可能被虚拟列表摘掉，手柄不是稳定宿主
     rootRef.current?.setPointerCapture(e.pointerId);
-    dragGeomRef.current = {
+    // 只落预备态：位移超过 DRAG_THRESHOLD_PX 才真正进入拖拽（见 handleGripPointerMove），
+    // 只是「按下手柄」不进入拖拽，松手也不产生任何副作用
+    dragPendingRef.current = {
+      uid: userId,
+      origin,
+      startX: e.clientX,
+      startY: e.clientY,
       grabOffset: e.clientY - rect.top,
       left: rect.left,
       width: rect.width,
-      y: rect.top,
-      valid: true,
     };
-    setDrag({ uid: userId, origin, order: origin });
   };
 
   /**
@@ -709,8 +755,29 @@ export const OverlayWindow: React.FC = () => {
    * 位置一律取布局值：让位补间期间 rect 含在途 transform，按它判定会让落点随动画来回跳。
    */
   const handleGripPointerMove = (e: React.PointerEvent<HTMLElement>) => {
+    // 预备态升级：位移超过阈值才真正进入拖拽态
+    const pending = dragPendingRef.current;
+    if (pending) {
+      if (
+        Math.abs(e.clientX - pending.startX) < DRAG_THRESHOLD_PX &&
+        Math.abs(e.clientY - pending.startY) < DRAG_THRESHOLD_PX
+      ) {
+        return;
+      }
+      dragPendingRef.current = null;
+      dragGeomRef.current = {
+        grabOffset: pending.grabOffset,
+        left: pending.left,
+        width: pending.width,
+        y: e.clientY - pending.grabOffset,
+        valid: true,
+      };
+      applyDrag({ uid: pending.uid, origin: pending.origin, order: pending.origin });
+    }
+
+    const d = dragRef.current;
     const geom = dragGeomRef.current;
-    if (!drag || !geom) return;
+    if (!d || !geom) return;
     const rows = listRef.current?.querySelectorAll<HTMLElement>(".queue-row:not(.queue-row-completing)");
     if (!rows || rows.length === 0) return;
 
@@ -742,29 +809,32 @@ export const OverlayWindow: React.FC = () => {
     }
     if (!anchorUid) return;
 
-    const rest = drag.order.filter((u) => u !== drag.uid);
+    const rest = d.order.filter((u) => u !== d.uid);
     const at = rest.indexOf(anchorUid);
     // at === -1 表示锚点就是被拖条目自己：指针还在原地，无需让位
     if (at === -1) return;
 
     const insert = at + (after ? 1 : 0);
-    const next = [...rest.slice(0, insert), drag.uid, ...rest.slice(insert)];
-    if (next.some((u, i) => u !== drag.order[i])) setDrag({ ...drag, order: next });
+    const next = [...rest.slice(0, insert), d.uid, ...rest.slice(insert)];
+    if (next.some((u, i) => u !== d.order[i])) applyDrag({ ...d, order: next });
   };
 
   const handleGripPointerUp = () => {
+    // 预备态未升级（只是一次点击手柄）：丢弃，不产生任何副作用
+    dragPendingRef.current = null;
     const geom = dragGeomRef.current;
-    const d = drag;
+    const d = dragRef.current;
     dragGeomRef.current = null;
-    setDrag(null);
+    applyDrag(null);
     if (!geom || !d) return;
     if (!locked && geom.valid && d.order.some((u, i) => u !== d.origin[i])) commitDragOrder(d.order);
   };
 
   /** 取消拖拽（指针捕获丢失 / 被系统取消）：原样收回，不提交 */
   const cancelGripDrag = () => {
+    dragPendingRef.current = null;
     dragGeomRef.current = null;
-    setDrag(null);
+    applyDrag(null);
   };
 
   /** 元素当前布局顶边：rect 含在途过渡的 transform，减掉才是真实布局位置 */
@@ -837,7 +907,7 @@ export const OverlayWindow: React.FC = () => {
    *  第一行的 2× 印面会被列表顶边裁掉 —— 特效层挂面板根（见渲染处 queue-clear-fx），
    *  此处只捕获行完成瞬间的面板坐标 */
   const handleComplete = (item: QueueItem, index: number, rect: GhostRow["rect"]) => {
-    if (locked) return;
+    if (locked || batchMode) return;
     if (completingRef.current.has(item.user_id)) return; // 行级锁：连点同一行只删一次
 
     completingRef.current.add(item.user_id);
@@ -859,27 +929,79 @@ export const OverlayWindow: React.FC = () => {
       completeTimersRef.current.delete(item.user_id);
       completingRef.current.delete(item.user_id);
       setGhosts((prev) => prev.filter((g) => g.item.user_id !== item.user_id));
-      setUndoStack((prev) => [...prev, { item, index }]);
+      // 单条撤销同样压整批结构（长度 1），与批量清点共用撤销链路
+      setUndoStack((prev) => [...prev, { entries: [{ item, index }] }]);
     }, COMPLETE_ANIM_MS);
     completeTimersRef.current.set(item.user_id, timer);
   };
 
-  /** 撤销完成：原样插回原下标（保留 id 与 timestamp，不重置插入语义） */
+  /** 批量清点：勾选/取消勾选一行（只改选中态，不改变布局、不播任何特效） */
+  const toggleSelect = (userId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(userId)) next.delete(userId);
+      else next.add(userId);
+      return next;
+    });
+  };
+
+  const exitBatchMode = () => {
+    setSelectedIds(new Set());
+    setBatchMode(false);
+  };
+
+  /** 进入批量清点：先收掉任何在途拖拽与预备态，避免手柄残留 */
+  const enterBatchMode = () => {
+    if (locked) return;
+    cancelGripDrag();
+    setSelectedIds(new Set());
+    setBatchMode(true);
+  };
+
+  /**
+   * 批量清理：整批一次删除（后端 `dequeue_many` 只落盘一次、只广播一次），
+   * 被删条目连同删除时下标原样压入撤销栈，供整批撤销逆序插回。
+   * 这条路不走 handleComplete，因此不产生逐行钤印幽灵行 ——
+   * 连续清理原先正是被「幽灵行占位 980ms 点不动 + 特效盖住下一行」卡住的。
+   */
+  const handleBatchClear = () => {
+    if (locked) return;
+    const userIds = [...selectedIds];
+    if (userIds.length === 0) return;
+    serial(async () => {
+      try {
+        const res = await invoke<BatchDequeueResult>("dequeue_many", { userIds });
+        applyQueue(res.snapshot);
+        if (res.removed.length > 0) {
+          setUndoStack((prev) => [
+            ...prev,
+            { entries: res.removed.map((r) => ({ item: r.item, index: r.index })) },
+          ]);
+          pushMarquee(`已清理 ${res.removed.length} 单`);
+        }
+        exitBatchMode();
+      } catch (err) {
+        pushMarquee(`批量清理失败：${err}`);
+        await fetchQueue();
+      }
+    });
+  };
+
+  /** 撤销完成：单条与批量共用（单条是长度为 1 的整批），原样插回原下标。
+   *  已重新入队的条目由后端跳过而非整批拒绝，实际复原条数由返回值告知 */
   const handleUndo = () => {
     if (locked) return;
     const record = undoStack[undoStack.length - 1];
     if (!record) return;
 
-    const at = Math.min(record.index, authoritativeRef.current.items.length);
-    // 后端确认成功后才消耗撤销入口；同一用户已重新入队时必须保留条目并提示失败
     serial(async () => {
       try {
-        const snap = await invoke<QueueSnapshot>("restore_order", {
-          item: record.item,
-          index: at,
-        });
-        applyQueue(snap);
+        const res = await invoke<BatchRestoreResult>("restore_orders", { entries: record.entries });
+        applyQueue(res.snapshot);
         setUndoStack((prev) => prev.filter((r) => r !== record));
+        if (res.restored < record.entries.length) {
+          pushMarquee(`撤销完成：${record.entries.length - res.restored} 单已重新入队，未复原`);
+        }
       } catch (err) {
         pushMarquee(`撤销失败：${err}`);
         await fetchQueue();
@@ -922,18 +1044,29 @@ export const OverlayWindow: React.FC = () => {
       <span className="queue-corner tl" />
       <span className="queue-corner br" />
 
-      {/* 行首手柄热区：手柄图标与顺位号一起可按下（到昵称之前为止）；stopPropagation 挡住冒泡成点击完成 */}
-      <span
-        className="queue-handle"
-        title="拖拽调整顺序"
-        onClick={(e) => e.stopPropagation()}
-        onPointerDown={(e) => handleGripPointerDown(e, item.user_id)}
-      >
-        <span className="queue-grip">
-          <GripVertical className="w-3 h-3" />
+      {batchMode ? (
+        /* 批量清点：手柄位换成勾选框（同一槽宽 40px，行内其余槽位不位移）。
+           勾选只改选中态，不动布局也不播特效 —— 连续清理时目标零漂移 */
+        <span className="queue-check">
+          <span className={`queue-check-box${selectedIds.has(item.user_id) ? " on" : ""}`}>
+            {selectedIds.has(item.user_id) && <Check className="w-2.5 h-2.5" />}
+          </span>
+          <span className="queue-seq">{String(seq).padStart(2, "0")}</span>
         </span>
-        <span className="queue-seq">{String(seq).padStart(2, "0")}</span>
-      </span>
+      ) : (
+        /* 行首手柄热区：手柄图标与顺位号一起可按下（到昵称之前为止）；stopPropagation 挡住冒泡成点击完成 */
+        <span
+          className="queue-handle"
+          title="拖拽调整顺序"
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => handleGripPointerDown(e, item.user_id)}
+        >
+          <span className="queue-grip">
+            <GripVertical className="w-3 h-3" />
+          </span>
+          <span className="queue-seq">{String(seq).padStart(2, "0")}</span>
+        </span>
+      )}
 
       <MarqueeText text={item.user_name} className="queue-nick" />
 
@@ -964,7 +1097,9 @@ export const OverlayWindow: React.FC = () => {
         {item.is_priority && <span className="queue-chip prio">优先</span>}
       </span>
 
-      <span className="queue-hint">点击完成</span>
+      <span className="queue-hint">
+        {batchMode ? (selectedIds.has(item.user_id) ? "点击取消" : "点击选择") : "点击完成"}
+      </span>
       <span className="queue-sheen" />
     </>
   );
@@ -989,6 +1124,8 @@ export const OverlayWindow: React.FC = () => {
     if (ghost) classNames.push("queue-row-completing");
     else if (placeholder) classNames.push("queue-row-placeholder");
     if (enteringIds.has(item.id)) classNames.push("queue-row-enter");
+    // 批量清点：勾选行加选中描边（不改变布局）
+    if (batchMode && selectedIds.has(item.user_id)) classNames.push("selected");
     // 受理压暗：金印 QUEST ACCEPTED 播放期间行内容让位（App.css .queue-row.ordering）
     if (orderingIds.has(item.user_id)) classNames.push("ordering");
 
@@ -1000,7 +1137,16 @@ export const OverlayWindow: React.FC = () => {
         data-priority={item.is_priority ? "1" : "0"}
         data-uid={item.user_id}
         data-no-window-drag
-        onClick={placeholder ? undefined : (e) => handleComplete(item, idx, rowRectInPanel(e.currentTarget))}
+        onClick={
+          placeholder
+            ? undefined
+            : batchMode
+              ? (e) => {
+                  e.stopPropagation();
+                  toggleSelect(item.user_id);
+                }
+              : (e) => handleComplete(item, idx, rowRectInPanel(e.currentTarget))
+        }
       >
         {placeholder ? null : renderRowBody(item, idx + 1)}
       </div>
@@ -1065,6 +1211,9 @@ export const OverlayWindow: React.FC = () => {
           <span className="overlay-count pointer-events-none">
             {String(queue.length).padStart(2, "0")}
           </span>
+          {batchMode && (
+            <span className="overlay-selcount pointer-events-none">已选 {selectedIds.size}</span>
+          )}
           {locked && (
             <span
               className="pointer-events-none flex items-center gap-0.5 text-[10.5px] border px-1 py-0.5 rounded-sm shrink-0"
@@ -1110,6 +1259,15 @@ export const OverlayWindow: React.FC = () => {
               </span>
             )}
           </div>
+
+          <button
+            onClick={batchMode ? exitBatchMode : enterBatchMode}
+            disabled={locked}
+            className={`overlay-batch-btn${batchMode ? " on" : ""}`}
+            title={batchMode ? "退出批量清点" : "批量清点"}
+          >
+            <ListChecks className="w-3.5 h-3.5" />
+          </button>
 
           <button
             onClick={handleClose}
@@ -1215,12 +1373,33 @@ export const OverlayWindow: React.FC = () => {
           )}
         </div>
 
-        {/* 撤销垫：连点几单就压几层，点一次回退一单 */}
-        {undoStack.length > 0 && (
+        {/* 批量操作条：批量清点模式下随布局贴在列表下方（不悬浮、不遮挡任何行） */}
+        {batchMode && (
+          <div className="queue-batch-bar">
+            <span className="qbb-label">
+              已选 <b>{selectedIds.size}</b> 单
+            </span>
+            <button
+              className="qbb-clear"
+              onClick={handleBatchClear}
+              disabled={selectedIds.size === 0}
+            >
+              清理选中
+            </button>
+            <button className="qbb-cancel" onClick={exitBatchMode}>
+              取消
+            </button>
+          </div>
+        )}
+
+        {/* 撤销垫：连点几单就压几层，点一次回退一批（批量清点期间让位给操作条） */}
+        {!batchMode && undoStack.length > 0 && (
           <div className="queue-undo show">
             <span>
-              「{undoStack[undoStack.length - 1].item.monster_name}」讨伐完毕
-              {undoStack.length > 1 ? ` · 可撤销 ${undoStack.length} 单` : ""}
+              {undoStack[undoStack.length - 1].entries.length > 1
+                ? `已清理 ${undoStack[undoStack.length - 1].entries.length} 单`
+                : `「${undoStack[undoStack.length - 1].entries[0]?.item.monster_name ?? ""}」讨伐完毕`}
+              {undoStack.length > 1 ? ` · 可撤销 ${undoStack.length} 次` : ""}
             </span>
             <button onClick={handleUndo}>撤销</button>
           </div>

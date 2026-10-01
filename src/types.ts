@@ -28,6 +28,24 @@ export interface QueueSnapshot {
   persistence: QueuePersistence;
 }
 
+/** 批量清点的被删条目：index 为删除那一刻的队列下标（整批撤销按删除顺序逆序插回） */
+export interface BatchRemovedEntry {
+  index: number;
+  item: QueueItem;
+}
+
+/** 批量清点命令 `dequeue_many` 结果 */
+export interface BatchDequeueResult {
+  snapshot: QueueSnapshot;
+  removed: BatchRemovedEntry[];
+}
+
+/** 批量撤销命令 `restore_orders` 结果：restored 为实际复原条数（已重新入队的条目会被跳过） */
+export interface BatchRestoreResult {
+  snapshot: QueueSnapshot;
+  restored: number;
+}
+
 export interface UserProfile {
   uid: string;
   username: string;

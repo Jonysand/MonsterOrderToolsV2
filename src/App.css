@@ -311,6 +311,41 @@ body {
   border-radius: 2px;
 }
 
+/* 顶栏「批量清点」入口：与右侧关闭按钮同形制，进入后点亮以示模式已在 */
+.overlay-batch-btn {
+  padding: 4px;
+  border-radius: 3px;
+  color: var(--ink-faint);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.overlay-batch-btn:hover:not(:disabled) {
+  color: var(--hl);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.overlay-batch-btn.on {
+  color: var(--hl);
+  background: var(--glow);
+}
+
+.overlay-batch-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* 批量模式已选计数徽章：沿用计数徽章形制，高亮底以示当前在批量模式 */
+.overlay-selcount {
+  font-size: 11px;
+  color: var(--hl);
+  border: 1px solid var(--hl);
+  background: var(--glow);
+  padding: 1px 6px;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
 /* 顶栏回纹饰带：几何回纹为 MH 系列品牌纹样 */
 .overlay-band {
   display: block;
@@ -598,6 +633,52 @@ body {
    不提示点击完成，右侧徽章也让回来可读（提示与徽章同一位置，本来互相顶掉） */
 .queue-row:has(.queue-handle:hover) .queue-hint { opacity: 0; }
 .queue-row:has(.queue-handle:hover) .queue-badges { opacity: 1; }
+
+/* ---------------- 批量清点（勾选态） ----------------
+   勾选只改选中态：描边点亮 + 脊线加亮，不动布局、不播特效 ——
+   连续清理时行的位置与内容是稳定目标，不会出现「删一个缩一格」的漂移 */
+
+.queue-row.selected {
+  border-color: var(--hl);
+  background: var(--row-bg-hover);
+  box-shadow: inset 0 0 0 1px var(--glow);
+}
+
+.queue-row.selected .queue-spine {
+  filter: brightness(1.3);
+}
+
+.queue-row.selected .queue-seq {
+  color: var(--hl);
+}
+
+/* 勾选框槽：与手柄槽同宽 40px（图标 14 + 间距 6 + 顺位号 20），行内其余槽位不位移 */
+.queue-check {
+  flex: none;
+  width: 40px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.queue-check-box {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--line-soft);
+  border-radius: 2px;
+  /* 勾的描线色：选中时压在亮色填充上，用深墨色保证对比 */
+  color: #17120a;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.queue-check-box.on {
+  border-color: var(--hl);
+  background: var(--hl);
+}
 
 /* =============================================================================
    队列行动效
@@ -1064,10 +1145,12 @@ body {
    撤销垫
    ============================================================================= */
 
+/* 撤销垫：贴右下角。原先底部居中悬浮会盖住列表最后一行，
+   连续删除时点到最后一行正好被它（pointer-events:auto）吃掉点击 */
 .queue-undo {
   position: absolute;
-  left: 50%;
-  bottom: 10px;
+  right: 8px;
+  bottom: 8px;
   z-index: 6;
   display: flex;
   align-items: center;
@@ -1078,7 +1161,7 @@ body {
   border: 1px solid var(--danger);
   color: #ffb3a3;
   font-size: 13px;
-  transform: translateX(-50%) translateY(10px);
+  transform: translateY(10px);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.22s, transform 0.22s;
@@ -1086,7 +1169,7 @@ body {
 
 .queue-undo.show {
   opacity: 1;
-  transform: translateX(-50%) translateY(0);
+  transform: translateY(0);
   pointer-events: auto;
 }
 
@@ -1103,6 +1186,68 @@ body {
 
 .queue-undo button:hover {
   background: rgba(192, 57, 43, 0.22);
+}
+
+/* =============================================================================
+   批量清点操作条
+   随布局贴在列表下方（flex 流内），不悬浮、不遮挡任何行 ——
+   勾选期间用户还要继续点列表，悬浮条会把下方行变成点击死区
+   ============================================================================= */
+
+.queue-batch-bar {
+  position: relative;
+  z-index: 6;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 0 6px 6px;
+  padding: 5px 10px;
+  border-radius: 3px;
+  background: rgba(12, 10, 8, 0.94);
+  border: 1px solid var(--line-soft);
+  color: var(--ink-dim);
+  font-size: 13px;
+}
+
+.queue-batch-bar .qbb-label b {
+  font-family: var(--font-num);
+  font-weight: 600;
+  color: var(--hl);
+  padding: 0 2px;
+}
+
+.queue-batch-bar button {
+  font-size: 13px;
+  padding: 3px 10px;
+  border-radius: 2px;
+  cursor: pointer;
+  background: transparent;
+  transition: background 0.16s, opacity 0.16s;
+}
+
+.queue-batch-bar .qbb-clear {
+  border: 1px solid #ff8b7a;
+  color: #ff8b7a;
+}
+
+.queue-batch-bar .qbb-clear:hover:not(:disabled) {
+  background: rgba(192, 57, 43, 0.22);
+}
+
+.queue-batch-bar .qbb-clear:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.queue-batch-bar .qbb-cancel {
+  border: 1px solid var(--line-soft);
+  color: var(--ink-dim);
+}
+
+.queue-batch-bar .qbb-cancel:hover {
+  background: rgba(255, 255, 255, 0.06);
 }
 
 /* =============================================================================

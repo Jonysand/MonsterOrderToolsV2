@@ -335,6 +335,55 @@ impl QueueManager {
         true
     }
 
+    /// 批量按 user_id 保序删除（悬浮窗「批量清点」模式）。
+    ///
+    /// 与逐条调用 `dequeue_by_user_id` 的差别在版本语义：整批只递增一次版本，
+    /// 因此命令层只落盘一次、只广播一次快照，不会产生一串中间态快照。
+    /// 返回「删除时下标 + 条目」并保持删除顺序 —— 每条下标都以它被删除那一刻的
+    /// 列表为准，调用方按**逆序**插回即可精确还原删除前的顺序。
+    /// 未命中的 id 静默跳过（含同一请求内重复的 id）；全部未命中时不递增版本。
+    pub fn dequeue_many_by_user_ids(&mut self, user_ids: &[String]) -> Vec<(usize, QueueItem)> {
+        let mut removed: Vec<(usize, QueueItem)> = Vec::new();
+        let mut seen = std::collections::HashSet::with_capacity(user_ids.len());
+        for uid in user_ids {
+            if !seen.insert(uid.as_str()) {
+                continue;
+            }
+            if let Some(pos) = self.items.iter().position(|i| i.user_id == *uid) {
+                let item = self.items.remove(pos);
+                self.user_index.remove(&item.user_id);
+                removed.push((pos, item));
+            }
+        }
+        if !removed.is_empty() {
+            self.touch();
+        }
+        removed
+    }
+
+    /// 批量撤销完成：按 `dequeue_many_by_user_ids` 的记录**逆序**插回原下标。
+    ///
+    /// 不复用单条 `restore`：那条路径每插一条就递增一次版本，整批撤销会变成
+    /// 多次落盘与多次广播；本方法整批只递增一次。已在队中的条目（删除后用户
+    /// 又发弹幕点怪）跳过不复插 —— 恢复意图已由新单满足，且不得覆盖新单的时间戳。
+    /// 返回实际恢复的条数；一条都没恢复时不递增版本。
+    pub fn restore_many(&mut self, entries: &[(usize, QueueItem)]) -> usize {
+        let mut restored = 0;
+        for (index, item) in entries.iter().rev() {
+            if self.user_index.contains(&item.user_id) {
+                continue;
+            }
+            let at = (*index).min(self.items.len());
+            self.user_index.insert(item.user_id.clone());
+            self.items.insert(at, item.clone());
+            restored += 1;
+        }
+        if restored > 0 {
+            self.touch();
+        }
+        restored
+    }
+
     /// 稳定排序（保证相同优先级下的先后次序）
     pub fn sort_queue(&mut self) {
         self.items.sort_by(|a, b| a.compare_priority(b));
@@ -1153,6 +1202,84 @@ mod tests {
         assert!(q2.restore(mk_item("y", false, 2), 99));
         assert_eq!(q2.items[1].user_id, "y");
         println!("[PASS] test_restore_timestamp_semantics_for_later_priority passed");
+    }
+
+    /// 批量清点（dequeue_many_by_user_ids / restore_many）：
+    /// 整批只递增一次版本，逆序插回精确还原原顺序
+    #[test]
+    fn test_dequeue_many_preserves_order_and_single_revision() {
+        let mut q = QueueManager::new();
+        for (i, uid) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            q.add_or_update(mk_item(uid, false, (i as i64 + 1) * 10));
+        }
+        let rev_before = q.revision;
+
+        let removed =
+            q.dequeue_many_by_user_ids(&["b".to_string(), "d".to_string()]);
+        // 下标以「删除那一刻」为准：删掉 b 后列表为 [a,c,d,e]，d 处于下标 2
+        assert_eq!(
+            removed
+                .iter()
+                .map(|(i, it)| (*i, it.user_id.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, "b".to_string()), (2, "d".to_string())]
+        );
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            vec!["a", "c", "e"]
+        );
+        assert_eq!(q.revision, rev_before + 1, "整批删除只递增一次版本");
+
+        // 逆序插回：d 先回下标 2，b 再回下标 1
+        let restored = q.restore_many(&removed);
+        assert_eq!(restored, 2);
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d", "e"],
+            "整批撤销应精确还原原顺序"
+        );
+        assert_eq!(q.revision, rev_before + 2, "整批撤销同样只递增一次版本");
+        println!("[PASS] test_dequeue_many_preserves_order_and_single_revision passed");
+    }
+
+    #[test]
+    fn test_dequeue_many_misses_and_requeue_conflict() {
+        let mut q = QueueManager::new();
+        q.add_or_update(mk_item("a", false, 10));
+        q.add_or_update(mk_item("b", false, 20));
+
+        // 未命中静默跳过；同一请求内重复 id 只处理一次
+        let removed = q.dequeue_many_by_user_ids(&[
+            "nobody".to_string(),
+            "a".to_string(),
+            "a".to_string(),
+        ]);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            q.items.iter().map(|i| i.user_id.clone()).collect::<Vec<_>>(),
+            vec!["b"]
+        );
+
+        // 全部未命中：不递增版本（无变更不触发强制写盘）
+        let rev_before = q.revision;
+        assert!(q.dequeue_many_by_user_ids(&["nobody".to_string()]).is_empty());
+        assert_eq!(q.revision, rev_before);
+
+        // 撤销时该用户已重新入队：跳过不复插，不覆盖新单
+        q.add_or_update(mk_item("a", false, 99));
+        let restored = q.restore_many(&removed);
+        assert_eq!(restored, 0, "用户已重新入队，应跳过");
+        assert_eq!(
+            q.items.iter().find(|i| i.user_id == "a").unwrap().timestamp,
+            99,
+            "新单时间戳不得被旧记录覆盖"
+        );
+        assert_eq!(
+            q.revision,
+            rev_before + 1,
+            "重新入队递增一次，跳过恢复不再递增"
+        );
+        println!("[PASS] test_dequeue_many_misses_and_requeue_conflict passed");
     }
 
     // ---------------- A1：队列 revision 与「只接受版本＋ID 顺序」反测 ----------------

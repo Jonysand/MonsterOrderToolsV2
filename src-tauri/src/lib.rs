@@ -656,6 +656,90 @@ fn restore_order(
     Ok(snapshot)
 }
 
+/// 批量清点结果：权威快照 + 被删条目（含删除时下标，按删除顺序）。
+/// `removed` 是整批撤销的凭据：逆序插回即可还原删除前的顺序。
+#[derive(Serialize)]
+struct BatchDequeueResult {
+    snapshot: QueueSnapshot,
+    removed: Vec<BatchRemovedEntry>,
+}
+
+#[derive(Serialize)]
+struct BatchRemovedEntry {
+    index: usize,
+    item: QueueItem,
+}
+
+/// 批量删除请求条目（前端把整批撤销记录原样回传）
+#[derive(serde::Deserialize)]
+struct BatchRestoreEntry {
+    index: usize,
+    item: QueueItem,
+}
+
+#[derive(Serialize)]
+struct BatchRestoreResult {
+    snapshot: QueueSnapshot,
+    restored: usize,
+}
+
+/// 批量清点：一次删除多条（悬浮窗「批量清点」模式）。
+///
+/// 整批只递增一次版本，因此只落盘一次、只广播一次快照 —— 逐条调用
+/// `dequeue_by_user_id` 会广播一串中间态快照，前端会看到多次重排。
+#[tauri::command]
+fn dequeue_many(
+    user_ids: Vec<String>,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<BatchDequeueResult, String> {
+    let removed = {
+        let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+        q.dequeue_many_by_user_ids(&user_ids)
+    };
+
+    // 未命中任何条目时不产生无变更的强制写盘（对齐单条删除语义）
+    let snapshot = if removed.is_empty() {
+        queue_snapshot_or_default(&state)
+    } else {
+        save_queue_now(&state, Some(&app_handle))
+    };
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(BatchDequeueResult {
+        snapshot,
+        removed: removed
+            .into_iter()
+            .map(|(index, item)| BatchRemovedEntry { index, item })
+            .collect(),
+    })
+}
+
+/// 批量撤销完成：按记录逆序插回原下标（整批只落盘一次、只广播一次）。
+/// 与单条 `restore_order` 的差别：已在队中的条目跳过而非整批拒绝 ——
+/// 批量撤销里某一条已重新入队，不应连带其余条目一起撤不回来。
+#[tauri::command]
+fn restore_orders(
+    entries: Vec<BatchRestoreEntry>,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<BatchRestoreResult, String> {
+    let (restored, snapshot) = {
+        let mut q = state.queue_mgr.lock().map_err(|e| e.to_string())?;
+        let pairs: Vec<(usize, QueueItem)> =
+            entries.into_iter().map(|e| (e.index, e.item)).collect();
+        let restored = q.restore_many(&pairs);
+        (restored, q.snapshot())
+    };
+
+    let snapshot = if restored > 0 {
+        save_queue_now(&state, Some(&app_handle))
+    } else {
+        snapshot
+    };
+    emit_queue_snapshot(&app_handle, &snapshot);
+    Ok(BatchRestoreResult { snapshot, restored })
+}
+
 /// 选怪面板入队的核心逻辑（不依赖 Tauri `State`，便于单测直接覆盖）。
 ///
 /// 锁序统一为 **queue_mutex → 字典读 → 名单读**（与弹幕路径 `process_danmu` 一致）：
@@ -3428,9 +3512,11 @@ pub fn run() {
             add_order,
             add_picked_order,
             dequeue_by_user_id,
+            dequeue_many,
             clear_queue,
             reorder_queue,
             restore_order,
+            restore_orders,
             toggle_window,
             hide_window,
             get_credentials_status,
