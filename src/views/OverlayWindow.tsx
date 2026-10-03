@@ -7,6 +7,7 @@ import {
   QueueSnapshot,
   AppConfig,
   BatchDequeueResult,
+  BatchRemovedEntry,
   BatchRestoreResult,
   OrderPlacedPayload,
   OrderBlockedPayload,
@@ -42,6 +43,9 @@ const UNDO_TTL_MS = 5200;
 /** 拖拽移动阈值：手柄按下后位移超过该距离才真正进入拖拽态。
  *  没有阈值时点删除的手往左偏一点就会误触成拖拽，一松手顺序就被改掉 */
 const DRAG_THRESHOLD_PX = 4;
+/** 批量清点钤印：相邻行错开 80ms 落定，整批最多铺开 320ms（行多时按行数自动压缩间隔） */
+const BATCH_STAMP_STEP_MS = 80;
+const BATCH_STAMP_SPREAD_MS = 320;
 
 type BubbleTone = "checkin" | "retro" | "like" | "gift" | "system";
 
@@ -64,14 +68,22 @@ const CONN_DOT_COLORS: Record<string, string> = {
 interface RenderRow {
   item: QueueItem;
   ghost: boolean;
+  /** 幽灵行的钤印延迟：批量清点整批错峰落定时的起点，行身退场与印面按同一延迟走 */
+  fxDelay?: number;
 }
+
+/** 面板坐标系矩形：钤印特效层挂在面板根，按此对齐完成行 */
+type PanelRect = { left: number; top: number; width: number; height: number };
 
 interface GhostRow {
   item: QueueItem;
   /** 完成时在渲染列表中的下标，合并时按下标插回原位 */
   index: number;
-  /** 完成时行的面板坐标：钤印特效层挂在面板根（虚拟列表滚动容器会裁切行内上溢），按此定位 */
-  rect: { left: number; top: number; width: number; height: number };
+  /** 完成时行的面板坐标。批量清点里滚出可视区的行量不到坐标，置 null —— 幽灵行只占位、
+   *  不挂特效层（特效层挂面板根不受列表裁切，印面会画到列表之外） */
+  rect: PanelRect | null;
+  /** 钤印起始延迟（ms）：批量清点按行序级联，单条完成不留延迟 */
+  delay?: number;
 }
 
 /** 撤销记录：单条完成压一条长度 1 的 entries，批量清点压整批。
@@ -83,7 +95,7 @@ interface UndoRecord {
 /** 受理特效层（queue-order-fx）：定位矩形 + 递增 key —— 同用户连单由 active 集合去重，不并存 */
 interface OrderGhostFx {
   key: number;
-  rect: GhostRow["rect"];
+  rect: PanelRect;
 }
 
 /**
@@ -185,6 +197,8 @@ export const OverlayWindow: React.FC = () => {
   const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
   /** 完成动画定时器（按 user_id），卸载时统一清理 */
   const completeTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  /** 批量清点钤印的收尾定时器（整批共一个：幽灵行同时撤除，列表只收束一次） */
+  const batchClearTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 受理特效在播的 user_id：同用户连点不叠印 */
   const orderFxActiveRef = useRef<Set<string>>(new Set());
@@ -615,6 +629,8 @@ export const OverlayWindow: React.FC = () => {
       bubbleTimersRef.current.clear();
       completeTimersRef.current.forEach((timer) => clearTimeout(timer));
       completeTimersRef.current.clear();
+      batchClearTimersRef.current.forEach((timer) => clearTimeout(timer));
+      batchClearTimersRef.current.clear();
       if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
       orderFxTimersRef.current.forEach((timer) => clearTimeout(timer));
       orderFxTimersRef.current.clear();
@@ -661,7 +677,11 @@ export const OverlayWindow: React.FC = () => {
     const out: RenderRow[] = orderedQueue.map((item) => ({ item, ghost: false }));
     if (ghosts.length > 0) {
       for (const g of [...ghosts].sort((a, b) => a.index - b.index)) {
-        out.splice(Math.min(Math.max(g.index, 0), out.length), 0, { item: g.item, ghost: true });
+        out.splice(Math.min(Math.max(g.index, 0), out.length), 0, {
+          item: g.item,
+          ghost: true,
+          fxDelay: g.delay,
+        });
       }
     }
     return out;
@@ -906,7 +926,7 @@ export const OverlayWindow: React.FC = () => {
    *  钤印特效不渲染在行内：虚拟列表滚动容器 overflow-y:auto 必裁行内上溢内容，
    *  第一行的 2× 印面会被列表顶边裁掉 —— 特效层挂面板根（见渲染处 queue-clear-fx），
    *  此处只捕获行完成瞬间的面板坐标 */
-  const handleComplete = (item: QueueItem, index: number, rect: GhostRow["rect"]) => {
+  const handleComplete = (item: QueueItem, index: number, rect: PanelRect) => {
     if (locked || batchMode) return;
     if (completingRef.current.has(item.user_id)) return; // 行级锁：连点同一行只删一次
 
@@ -959,24 +979,94 @@ export const OverlayWindow: React.FC = () => {
   };
 
   /**
+   * 批量清点的钤印坐标：删除命令发出前量行 —— 回执到达时行还在（批量不做乐观移除），
+   * 量到的就是原位。虚拟列表只渲染可视区，滚出可视区的行没有 DOM，返回里就没有它们的
+   * 坐标（幽灵行照旧占位，只是不挂特效层）。
+   */
+  const measureRowRects = (userIds: string[]): Map<string, PanelRect> => {
+    const out = new Map<string, PanelRect>();
+    const panel = rootRef.current?.getBoundingClientRect();
+    const scroller = listRef.current?.firstElementChild;
+    const view = scroller instanceof HTMLElement ? scroller.getBoundingClientRect() : null;
+    if (!panel || !view) return out;
+    for (const uid of userIds) {
+      const el = listRef.current?.querySelector<HTMLElement>(
+        `.queue-row[data-uid="${CSS.escape(uid)}"]`,
+      );
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom <= view.top || r.top >= view.bottom) continue; // 完全滚出可视区
+      out.set(uid, {
+        left: r.left - panel.left,
+        top: r.top - panel.top,
+        width: r.width,
+        height: r.height,
+      });
+    }
+    return out;
+  };
+
+  /**
+   * 批量清点的钤印：整批被清条目各留一个幽灵行占位、各挂一处钤印特效层，印面按行序
+   * 自上而下错峰落定，最后一个印落定后整批幽灵行一次撤除 —— 列表只收束一次，不会像
+   * 逐行删除那样删一个往上缩一格。幽灵行不参与点击（.queue-row-completing 已关指针），
+   * 撤销记录与单条完成同一时刻压栈（动画收尾），避免动画期间撤销与幽灵行重叠。
+   */
+  const spawnBatchClearGhosts = (
+    removed: BatchRemovedEntry[],
+    rects: Map<string, PanelRect>,
+    indices: Map<string, number>,
+  ) => {
+    const ordered = [...removed].sort(
+      (a, b) => (indices.get(a.item.user_id) ?? a.index) - (indices.get(b.item.user_id) ?? b.index),
+    );
+    if (ordered.length === 0) return;
+
+    const step = Math.min(
+      BATCH_STAMP_STEP_MS,
+      BATCH_STAMP_SPREAD_MS / Math.max(ordered.length - 1, 1),
+    );
+    const entries: GhostRow[] = ordered.map((r, i) => ({
+      item: r.item,
+      // 渲染列表下标（含在播的幽灵行）而非后端队列下标：合并时按渲染下标插回，落到的正是原槽位
+      index: indices.get(r.item.user_id) ?? r.index,
+      rect: rects.get(r.item.user_id) ?? null,
+      delay: Math.round(i * step),
+    }));
+    const ids = new Set(entries.map((g) => g.item.user_id));
+    const total = COMPLETE_ANIM_MS + (entries[entries.length - 1].delay ?? 0);
+
+    setGhosts((prev) => [...prev, ...entries]);
+    const timer = setTimeout(() => {
+      batchClearTimersRef.current.delete(timer);
+      setGhosts((prev) => prev.filter((g) => !ids.has(g.item.user_id)));
+      setUndoStack((prev) => [
+        ...prev,
+        { entries: ordered.map((r) => ({ item: r.item, index: r.index })) },
+      ]);
+    }, total + 20);
+    batchClearTimersRef.current.add(timer);
+  };
+
+  /**
    * 批量清理：整批一次删除（后端 `dequeue_many` 只落盘一次、只广播一次），
    * 被删条目连同删除时下标原样压入撤销栈，供整批撤销逆序插回。
-   * 这条路不走 handleComplete，因此不产生逐行钤印幽灵行 ——
-   * 连续清理原先正是被「幽灵行占位 980ms 点不动 + 特效盖住下一行」卡住的。
+   * 这条路不走 handleComplete（连续清理原先正是被「幽灵行占位 980ms 点不动」卡住的），
+   * 钤印由 spawnBatchClearGhosts 整批错峰补播。
    */
   const handleBatchClear = () => {
     if (locked) return;
     const userIds = [...selectedIds];
     if (userIds.length === 0) return;
+    // 特效坐标与行序下标都在删除前取：回执到达时行还没被移除（批量不做乐观删除）
+    const rects = measureRowRects(userIds);
+    const indices = new Map(renderRows.map((r, i) => [r.item.user_id, i]));
     serial(async () => {
       try {
         const res = await invoke<BatchDequeueResult>("dequeue_many", { userIds });
         applyQueue(res.snapshot);
         if (res.removed.length > 0) {
-          setUndoStack((prev) => [
-            ...prev,
-            { entries: res.removed.map((r) => ({ item: r.item, index: r.index })) },
-          ]);
+          spawnBatchClearGhosts(res.removed, rects, indices);
           pushMarquee(`已清理 ${res.removed.length} 单`);
         }
         exitBatchMode();
@@ -1137,6 +1227,8 @@ export const OverlayWindow: React.FC = () => {
         data-priority={item.is_priority ? "1" : "0"}
         data-uid={item.user_id}
         data-no-window-drag
+        /* 幽灵行退场与印面按同一延迟错峰（批量清点级联），单条完成不设变量走 CSS 默认 0 */
+        style={ghost && row.fxDelay ? ({ "--fx-delay": `${row.fxDelay}ms` } as React.CSSProperties) : undefined}
         onClick={
           placeholder
             ? undefined
@@ -1409,20 +1501,28 @@ export const OverlayWindow: React.FC = () => {
             必裁行内上溢内容（第一行的 2× 印面曾被列表顶边裁掉），列表外渲染才能
             盖过顶栏；absolute 定位随窗口整体移动。z 压过顶栏/气泡/拖拽浮起，
             播放期间（980ms）为悬浮窗最上层 */}
-        {ghosts.map((g) => (
-          <div
-            key={g.item.user_id}
-            className="queue-clear-fx"
-            style={{ left: g.rect.left, top: g.rect.top, width: g.rect.width, height: g.rect.height }}
-          >
-            <span className="queue-ring" />
-            <span className="queue-flare">
-              <i />
-              <i />
-            </span>
-            <span className="queue-stamp">QUEST CLEAR</span>
-          </div>
-        ))}
+        {ghosts.map((g) =>
+          g.rect ? (
+            <div
+              key={g.item.user_id}
+              className="queue-clear-fx"
+              style={{
+                left: g.rect.left,
+                top: g.rect.top,
+                width: g.rect.width,
+                height: g.rect.height,
+                ...(g.delay ? { "--fx-delay": `${g.delay}ms` } : null),
+              } as React.CSSProperties}
+            >
+              <span className="queue-ring" />
+              <span className="queue-flare">
+                <i />
+                <i />
+              </span>
+              <span className="queue-stamp">QUEST CLEAR</span>
+            </div>
+          ) : null,
+        )}
 
         {/* 受理特效层：点怪成功金印（QUEST ACCEPTED）。层叠与 queue-clear-fx 同为 z60 面板根
             （顶栏/气泡/拖拽浮起之上），渲染顺序在其后 —— 同 z-index 时后来者居上，

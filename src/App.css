@@ -696,12 +696,14 @@ body {
 
 /* 完成：钤印 560ms 与离场 420ms（延迟 560ms）重叠，总时长 980ms。
    钤印特效在面板根的 .queue-clear-fx 层播放（虚拟列表滚动容器会裁切行内上溢，
-   行内只保留内容压暗与离场），行身与特效层共用同一套下沉/离场节奏 */
+   行内只保留内容压暗与离场），行身与特效层共用同一套下沉/离场节奏。
+   --fx-delay 为整批清点的错峰起点（单条完成不设变量，走此处默认 0） */
 .queue-row-completing {
   pointer-events: none;
+  --fx-delay: 0ms;
   animation:
-    queueRowOut 0.42s 0.56s ease forwards,
-    queueStampHit 0.26s 0.24s ease-in-out;
+    queueRowOut 0.42s calc(0.56s + var(--fx-delay)) ease forwards,
+    queueStampHit 0.26s calc(0.24s + var(--fx-delay)) ease-in-out;
 }
 
 .queue-row-completing .queue-sheen { display: none; }
@@ -766,7 +768,7 @@ body {
 
 /* 特效层挂在面板根（.queue-clear-fx），不再位于完成行内 —— 动画触发选择器随之改挂 */
 .queue-clear-fx .queue-stamp {
-  animation: queueStampIn 0.56s cubic-bezier(0.2, 1.5, 0.4, 1) forwards;
+  animation: queueStampIn 0.56s cubic-bezier(0.2, 1.5, 0.4, 1) var(--fx-delay) forwards;
 }
 
 /* 缩砸急停 + 落定回弹：3.2× 砸至 0.94 再弹回 1 */
@@ -793,7 +795,7 @@ body {
 }
 
 .queue-clear-fx .queue-ring {
-  animation: queueRingOut 0.6s 0.05s ease-out forwards;
+  animation: queueRingOut 0.6s calc(0.05s + var(--fx-delay)) ease-out forwards;
 }
 
 @keyframes queueRingOut {
@@ -833,7 +835,7 @@ body {
 }
 
 .queue-clear-fx .queue-flare {
-  animation: queueFlareOut 0.34s 0.24s ease-out forwards;
+  animation: queueFlareOut 0.34s calc(0.24s + var(--fx-delay)) ease-out forwards;
 }
 
 @keyframes queueFlareOut {
@@ -846,19 +848,22 @@ body {
 .queue-row-completing > :not(.queue-sheen):not(.queue-hint) {
   opacity: 0.38;
   filter: saturate(0.55);
-  transition: opacity 0.3s 0.12s, filter 0.3s 0.12s;
+  transition: opacity 0.3s calc(0.12s + var(--fx-delay)), filter 0.3s calc(0.12s + var(--fx-delay));
 }
 
 /* 钤印特效层：面板根直挂、矩形对齐完成行，播放期间为悬浮窗最上层
    （顶栏 z2 / 拖拽浮起 z30 / 业务气泡 z50 之上）。
-   行身下沉与离场和完成行同曲线同时点，钤印与行同步沉、同步淡出 */
+   行身下沉与离场和完成行同曲线同时点，钤印与行同步沉、同步淡出。
+   --fx-delay 由行内样式注入（批量清点整批错峰），单条完成走默认 0，
+   四段动画（印面/环/十字光/行身）读同一个变量，级联时才不会各走各的 */
 .queue-clear-fx {
   position: absolute;
   z-index: 60;
   pointer-events: none;
+  --fx-delay: 0ms;
   animation:
-    queueRowOut 0.42s 0.56s ease forwards,
-    queueStampHit 0.26s 0.24s ease-in-out;
+    queueRowOut 0.42s calc(0.56s + var(--fx-delay)) ease forwards,
+    queueStampHit 0.26s calc(0.24s + var(--fx-delay)) ease-in-out;
 }
 
 /* =============================================================================
