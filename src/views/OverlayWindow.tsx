@@ -34,6 +34,9 @@ const BUBBLE_TTL_MS = 15000;
 const QUEUE_ROW_HEIGHT = 60;
 /** 完成动效总时长：钤印 560ms 与离场 420ms（延迟 560ms）重叠 */
 const COMPLETE_ANIM_MS = 980;
+/** 完成收束冷却：连续完成/清点时每次刷新（最后一击起算），到期幽灵行一次撤除、列表只上移一次。
+ *  连点期间幽灵行持续占位不改行序 —— 否则每单击一次就上缩一格，正在瞄准的下一行会被挪走点错 */
+const SETTLE_CD_MS = 1500;
 /** 受理动效总时长（QUEST ACCEPTED 金印）：0.3s 起 + 0.56s 落定 + 余韵，1.22s 起收印，1550ms 全收 */
 const ORDER_FX_MS = 1550;
 /** 受理行内容压暗恢复时刻：金印开始收走时让行回归常态 */
@@ -195,10 +198,12 @@ export const OverlayWindow: React.FC = () => {
   });
   /** 队列写操作串行链：不依赖 Tauri 同步命令跑主线程这一实现细节 */
   const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
-  /** 完成动画定时器（按 user_id），卸载时统一清理 */
-  const completeTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  /** 批量清点钤印的收尾定时器（整批共一个：幽灵行同时撤除，列表只收束一次） */
-  const batchClearTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+  /** 完成收束定时器（全局共一个）：连点/连续清点刷新计时，最后一击后 SETTLE_CD_MS 一次收尾 */
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 在播幽灵行动画结束时刻上限（epoch ms）：CD 被调短到动画时长以下时兜底，收尾不截断钤印 */
+  const settleAnimEndRef = useRef(0);
+  /** 待随收尾一次压栈的撤销记录（按完成顺序），与幽灵行同生命周期 */
+  const pendingUndoRef = useRef<UndoRecord[]>([]);
   const enterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 受理特效在播的 user_id：同用户连点不叠印 */
   const orderFxActiveRef = useRef<Set<string>>(new Set());
@@ -627,10 +632,9 @@ export const OverlayWindow: React.FC = () => {
       unlistenMoved.then((f) => f());
       bubbleTimersRef.current.forEach((timer) => clearTimeout(timer));
       bubbleTimersRef.current.clear();
-      completeTimersRef.current.forEach((timer) => clearTimeout(timer));
-      completeTimersRef.current.clear();
-      batchClearTimersRef.current.forEach((timer) => clearTimeout(timer));
-      batchClearTimersRef.current.clear();
+      if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = null;
+      pendingUndoRef.current = [];
       if (enterTimerRef.current) clearTimeout(enterTimerRef.current);
       orderFxTimersRef.current.forEach((timer) => clearTimeout(timer));
       orderFxTimersRef.current.clear();
@@ -922,19 +926,46 @@ export const OverlayWindow: React.FC = () => {
     if (el && geom) el.style.transform = `translate3d(0, ${geom.y}px, 0)`;
   });
 
+  /**
+   * 完成收束：撤除当轮全部幽灵行 → 列表一次性上移（FLIP 补间），撤销记录一次压栈。
+   * 与「每条各自 980ms 撤除」的区别：连点期间幽灵行持续占位、行序不漂移，
+   * 最后一击 SETTLE_CD_MS 后一次收束 —— 连续点击不会因列表逐格上缩而点错。
+   */
+  const settleGhosts = () => {
+    settleTimerRef.current = null;
+    settleAnimEndRef.current = 0;
+    setGhosts([]);
+    const pending = pendingUndoRef.current;
+    pendingUndoRef.current = [];
+    if (pending.length > 0) setUndoStack((prev) => [...prev, ...pending]);
+    completingRef.current.clear();
+  };
+
+  /** 排定/刷新收束时刻：完成与批量清点共用，每次刷新即整体推后（连点防抖），
+   *  延迟取 CD 与该批动画结束时刻的较大者 —— 调短 CD 也不会截断在播的钤印 */
+  const scheduleSettle = (animEndAt: number) => {
+    settleAnimEndRef.current = Math.max(settleAnimEndRef.current, animEndAt);
+    if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+    settleTimerRef.current = setTimeout(
+      settleGhosts,
+      Math.max(SETTLE_CD_MS, settleAnimEndRef.current - Date.now()),
+    );
+  };
+
   /** 完成一单：整行点击 → 钤印 → 离场，可撤销。
    *  钤印特效不渲染在行内：虚拟列表滚动容器 overflow-y:auto 必裁行内上溢内容，
    *  第一行的 2× 印面会被列表顶边裁掉 —— 特效层挂面板根（见渲染处 queue-clear-fx），
    *  此处只捕获行完成瞬间的面板坐标 */
   const handleComplete = (item: QueueItem, index: number, rect: PanelRect) => {
     if (locked || batchMode) return;
-    if (completingRef.current.has(item.user_id)) return; // 行级锁：连点同一行只删一次
+    // 行级锁按条目 id：同一行被连点只删一次；同一用户重新入队的新条目不受此锁
+    if (completingRef.current.has(item.id)) return;
 
-    completingRef.current.add(item.user_id);
+    completingRef.current.add(item.id);
     // 乐观移除 + 幽灵行插回原位：同一 key 就地复用 DOM，动画不会被打断。
     // 此处只改本地渲染 state，authoritativeRef 保持后端权威快照，等命令回执再更新
     setGhosts((prev) => [...prev, { item, index, rect }]);
-    setQueue((prev) => prev.filter((i) => i.user_id !== item.user_id));
+    setQueue((prev) => prev.filter((i) => i.id !== item.id));
 
     // 串行链保证回执按序到达；版本检查会丢弃任何迟到的旧快照
     serial(async () => {
@@ -945,14 +976,11 @@ export const OverlayWindow: React.FC = () => {
       }
     });
 
-    const timer = setTimeout(() => {
-      completeTimersRef.current.delete(item.user_id);
-      completingRef.current.delete(item.user_id);
-      setGhosts((prev) => prev.filter((g) => g.item.user_id !== item.user_id));
-      // 单条撤销同样压整批结构（长度 1），与批量清点共用撤销链路
-      setUndoStack((prev) => [...prev, { entries: [{ item, index }] }]);
-    }, COMPLETE_ANIM_MS);
-    completeTimersRef.current.set(item.user_id, timer);
+    // 撤销下标取「后端队列下标」：幽灵行的渲染下标含在播幽灵行，撤销按它插回会落到后一条之后。
+    // 单条撤销同样压整批结构（长度 1），与批量清点共用撤销链路
+    const backendIndex = Math.max(0, queue.findIndex((i) => i.id === item.id));
+    pendingUndoRef.current.push({ entries: [{ item, index: backendIndex }] });
+    scheduleSettle(Date.now() + COMPLETE_ANIM_MS);
   };
 
   /** 批量清点：勾选/取消勾选一行（只改选中态，不改变布局、不播任何特效） */
@@ -1008,9 +1036,9 @@ export const OverlayWindow: React.FC = () => {
 
   /**
    * 批量清点的钤印：整批被清条目各留一个幽灵行占位、各挂一处钤印特效层，印面按行序
-   * 自上而下错峰落定，最后一个印落定后整批幽灵行一次撤除 —— 列表只收束一次，不会像
-   * 逐行删除那样删一个往上缩一格。幽灵行不参与点击（.queue-row-completing 已关指针），
-   * 撤销记录与单条完成同一时刻压栈（动画收尾），避免动画期间撤销与幽灵行重叠。
+   * 自上而下错峰落定；幽灵行与单条完成共用一次收束（scheduleSettle 刷新收尾时刻），
+   * 列表只上移一次，不会像逐行删除那样删一个往上缩一格。幽灵行不参与点击
+   * （.queue-row-completing 已关指针），撤销记录收尾时一次压栈，避免动画期间撤销与幽灵行重叠。
    */
   const spawnBatchClearGhosts = (
     removed: BatchRemovedEntry[],
@@ -1033,24 +1061,19 @@ export const OverlayWindow: React.FC = () => {
       rect: rects.get(r.item.user_id) ?? null,
       delay: Math.round(i * step),
     }));
-    const ids = new Set(entries.map((g) => g.item.user_id));
-    const total = COMPLETE_ANIM_MS + (entries[entries.length - 1].delay ?? 0);
+    const maxDelay = entries[entries.length - 1].delay ?? 0;
 
     setGhosts((prev) => [...prev, ...entries]);
-    const timer = setTimeout(() => {
-      batchClearTimersRef.current.delete(timer);
-      setGhosts((prev) => prev.filter((g) => !ids.has(g.item.user_id)));
-      setUndoStack((prev) => [
-        ...prev,
-        { entries: ordered.map((r) => ({ item: r.item, index: r.index })) },
-      ]);
-    }, total + 20);
-    batchClearTimersRef.current.add(timer);
+    // 撤销下标用后端返回的删除下标（BatchRemovedEntry.index），与幽灵行的渲染下标不同口径
+    pendingUndoRef.current.push({
+      entries: ordered.map((r) => ({ item: r.item, index: r.index })),
+    });
+    scheduleSettle(Date.now() + COMPLETE_ANIM_MS + maxDelay);
   };
 
   /**
    * 批量清理：整批一次删除（后端 `dequeue_many` 只落盘一次、只广播一次），
-   * 被删条目连同删除时下标原样压入撤销栈，供整批撤销逆序插回。
+   * 被删条目连同删除时下标随统一收尾一次压入撤销栈，供整批撤销逆序插回。
    * 这条路不走 handleComplete（连续清理原先正是被「幽灵行占位 980ms 点不动」卡住的），
    * 钤印由 spawnBatchClearGhosts 整批错峰补播。
    */
