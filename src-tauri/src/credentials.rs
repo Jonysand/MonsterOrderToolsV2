@@ -13,7 +13,8 @@ pub const SALT: &str = "@M0nst3r$Alt@";
 /// 加密配置文件凭据。
 ///
 /// 除开播身份码（注册表）外的全部凭据均由发行方填写 `scripts/credentials.json`
-/// 后生成 credentials.dat 并随安装包打包；终端用户不可在界面输入这些字段。
+/// 后生成 credentials.dat 并随安装包打包。Manbo 语音 Key 另提供 TTS 设置里的
+/// 应急入口（仅写注册表），用于打包凭据缺失或轮换后的现场修复。
 /// 旧文件中的遗留字段（minimax_tts_api_key 等）由 serde 默认忽略，读取兼容。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Credentials {
@@ -35,6 +36,30 @@ fn default_chat_provider() -> String {
     "deepseek".to_string()
 }
 
+/// 识别 `scripts/credentials.example.json` 里的模板占位文本。
+///
+/// 占位值一旦被当成真实密钥：Manbo 会返回 401 并静默降级到本地 SAPI，
+/// 让"只有默认语音"这种故障几乎没有线索可查。加载时一律按"未配置"处理，
+/// 交给注册表 / 配置镜像兜底。
+pub fn is_placeholder_value(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    if v.to_ascii_uppercase().contains("REPLACE_ME") {
+        return true;
+    }
+    const CN_MARKERS: [&str; 6] = [
+        "在此填写",
+        "在此输入",
+        "在此輸入",
+        "请填写",
+        "請填寫",
+        "模板占位",
+    ];
+    CN_MARKERS.iter().any(|m| v.contains(m))
+}
+
 /// 凭据状态摘要（用于前端安全脱敏展示）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialsStatus {
@@ -48,6 +73,24 @@ pub struct CredentialsStatus {
 }
 
 impl Credentials {
+    /// 可选密钥字段的占位值清洗：Manbo / 对话 Key 都有注册表/配置兜底，
+    /// 不能拿模板说明文字去请求服务端。B 站三件套不在此处理 —— 它们没有兜底，
+    /// 占位值应在打包生成 credentials.dat 时直接拦截（见 scripts/generate_credentials.py）。
+    fn normalize_optional_placeholders(&mut self) {
+        if is_placeholder_value(&self.manbo_api_key) {
+            crate::log_warn!(
+                "[Credentials] manbo_api_key 是模板占位值，按未配置处理（回退注册表/配置镜像）"
+            );
+            self.manbo_api_key.clear();
+        }
+        if is_placeholder_value(&self.chat_api_key) {
+            crate::log_warn!(
+                "[Credentials] chat_api_key 是模板占位值，按未配置处理（回退配置镜像）"
+            );
+            self.chat_api_key.clear();
+        }
+    }
+
     pub fn to_status(&self, loaded: bool, path: &str) -> CredentialsStatus {
         let access_key_masked = mask_access_key(&self.access_key_id);
 
@@ -154,8 +197,9 @@ pub fn load_credentials(path: Option<&Path>) -> Result<Credentials, String> {
         return Err("凭据校验失败：文件可能已损坏或被非法篡改！".to_string());
     }
 
-    let creds: Credentials = serde_json::from_str(json_data)
+    let mut creds: Credentials = serde_json::from_str(json_data)
         .map_err(|e| format!("解析凭据 JSON 失败: {}", e))?;
+    creds.normalize_optional_placeholders();
 
     Ok(creds)
 }
@@ -195,8 +239,57 @@ mod tests {
         assert!(!cred.access_key_id.is_empty(), "access_key_id 不应为空");
         assert!(!cred.access_key_secret.is_empty(), "access_key_secret 不应为空");
         assert_eq!(cred.chat_provider, "deepseek");
-        assert!(!cred.chat_api_key.is_empty(), "chat_api_key 不应为空");
-        println!("[PASS] test_load_real_credentials_dat passed (source: {:?})", p);
+        // 可选密钥允许为空：模板占位值在加载时已按"未配置"清洗，不能断言非空
+        println!(
+            "[PASS] test_load_real_credentials_dat passed (source: {:?}, chat_key={}, manbo_key={})",
+            p,
+            !cred.chat_api_key.is_empty(),
+            !cred.manbo_api_key.is_empty()
+        );
+    }
+
+    /// 占位文本识别：模板说明文字绝不能当成真实密钥
+    #[test]
+    fn test_is_placeholder_value() {
+        assert!(is_placeholder_value(
+            "REPLACE_ME_Manbo语音接口密钥_留空则回退本机注册表历史值"
+        ));
+        assert!(is_placeholder_value("在此填写B站开放平台AccessKey ID"));
+        assert!(is_placeholder_value("请填写真实的密钥"));
+        assert!(!is_placeholder_value(""));
+        assert!(!is_placeholder_value("   "));
+        assert!(!is_placeholder_value("a1b2c3d4e5f6a7b8c9d0"));
+        assert!(!is_placeholder_value("sk-proj-ABC123xyz"));
+
+        println!("[PASS] test_is_placeholder_value passed");
+    }
+
+    /// 加载时占位密钥 → 空（注册表/配置兜底才有机会生效）；B 站三件套原样保留
+    #[test]
+    fn test_placeholder_keys_normalized_on_load() {
+        let dir = std::env::temp_dir().join("mh_cred_placeholder");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("credentials.dat");
+
+        let creds = Credentials {
+            app_id: "1751077177719".into(),
+            access_key_id: "AKIDEXAMPLE1234".into(),
+            access_key_secret: "SECRETEXAMPLE".into(),
+            manbo_api_key: "REPLACE_ME_Manbo语音接口密钥_留空则回退本机注册表历史值".into(),
+            chat_provider: "deepseek".into(),
+            chat_api_key: "在此填写DeepSeek对话模型密钥".into(),
+        };
+        save_credentials(&creds, &path).unwrap();
+
+        let loaded = load_credentials(Some(&path)).unwrap();
+        assert_eq!(loaded.manbo_api_key, "", "占位 Manbo Key 应按未配置处理");
+        assert_eq!(loaded.chat_api_key, "", "占位对话 Key 应按未配置处理");
+        assert_eq!(loaded.app_id, creds.app_id, "必填三件套原样保留");
+        assert_eq!(loaded.access_key_id, creds.access_key_id);
+        assert_eq!(loaded.access_key_secret, creds.access_key_secret);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[PASS] test_placeholder_keys_normalized_on_load passed");
     }
 
     /// 格式往返：V2 生成的文件必须能被 V2 读回（原工程算法逐步骤对齐，故亦与原工程互通）

@@ -61,10 +61,12 @@ jobs:
         run: npm ci
 
       # credentials.dat 为加密凭据不入库，但 tauri.conf.json 将其声明为随包资源，
-      # 打包前须先生成：配置 Secret CREDENTIALS_JSON_B64 则随包预置真实凭据，缺省占位
+      # 打包前须先生成：配置 Secret CREDENTIALS_JSON_B64 则随包预置真实凭据；
+      # 发布构建要求真实凭据（REQUIRE_REAL_CREDENTIALS=1），缺失即失败而非静默占位
       - name: 生成随包预置凭据
         env:
           CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+          REQUIRE_REAL_CREDENTIALS: "1"
         run: python scripts/ci_credentials.py
 
       # beforeBuildCommand(npm run build) 先产前端，再按 bundle.targets="all" 生成 msi + nsis
@@ -128,10 +130,11 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      # 同 bundle-windows-full：Secret 注入真实凭据，缺省占位
+      # 同 bundle-windows-full：Secret 注入真实凭据，缺失即失败
       - name: 生成随包预置凭据
         env:
           CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+          REQUIRE_REAL_CREDENTIALS: "1"
         run: python scripts/ci_credentials.py
 
       # Lite 纯排队版：Cargo feature `lite` + tauri.conf.lite.json（产物名 *-Lite）。
@@ -196,10 +199,11 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
-      # 同 Windows job：Secret 注入真实凭据，缺省占位
+      # 同 Windows job：Secret 注入真实凭据，缺失即失败
       - name: 生成随包预置凭据
         env:
           CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+          REQUIRE_REAL_CREDENTIALS: "1"
         run: python scripts/ci_credentials.py
 
       # macos-latest 为 Apple Silicon，bundle.targets="all" 在此产出 .app + aarch64 .dmg。
@@ -263,6 +267,7 @@ jobs:
       - name: 生成随包预置凭据
         env:
           CREDENTIALS_JSON_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+          REQUIRE_REAL_CREDENTIALS: "1"
         run: python scripts/ci_credentials.py
 
       # 与完整版同口径的 Lite 纯排队版（tauri.conf.lite.json，产物名 *-Lite）

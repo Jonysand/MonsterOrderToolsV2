@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -901,6 +902,11 @@ pub const MAX_CONCURRENT_TTS: usize = 2;
 pub struct TTSManager {
     config: Mutex<TTSConfig>,
     manbo_health: Mutex<EngineHealth>,
+    /// Manbo 连续失败次数（成功即清零）：用于指数退避。
+    /// 冷却结束后仍保留，若探活再次失败则继续升档；成功时清零并恢复 Manbo。
+    /// **所有写入都在 `manbo_health` 锁内完成**，保证计数与熔断状态一致
+    /// （两个并发播报一成一败时不会留下"健康但计数未清"的错位）。
+    manbo_failures: AtomicU32,
     special_health: Mutex<SpecialEngineHealth>,
     gift_tracker: Mutex<GiftComboTracker>,
     /// 普通弹幕朗读队列（原工程 NormalMsgQueue）
@@ -920,13 +926,34 @@ impl Default for TTSManager {
 }
 
 impl TTSManager {
-    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-    pub const COOLDOWN_SECS: u64 = 10;
+    /// 单跳生成请求超时。
+    /// Manbo 冷生成实测 2.0–4.6s（2026-10-22 复测），旧的 3s 会在服务端稍慢时
+    /// 于读取响应体阶段被掐断，表现为 `error decoding response body` 并静默降级 SAPI。
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+    /// 第二跳音频下载超时：CDN 正常 1s 内；给 5s 足够，晚了就说明链路异常，早点降级
+    pub const AUDIO_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Manbo 退避首档：网络瞬断后 5s 就重试，避免长时间卡在本地语音
+    pub const MANBO_BACKOFF_BASE_SECS: u64 = 5;
+    /// 退避上限：持续故障时最多 30s 探活一次；网络恢复后下一次播报即回到 Manbo
+    pub const MANBO_BACKOFF_MAX_SECS: u64 = 30;
+
+    /// 连续失败 n 次后的冷却秒数：5 → 10 → 20 → 30（封顶）。
+    /// 网络抖动通常是短时的，首档要快恢复；持续断网时拉长间隔，避免每条播报都
+    /// 白等 10s 生成超时。
+    pub fn manbo_backoff_secs(failures: u32) -> u64 {
+        match failures {
+            0 | 1 => Self::MANBO_BACKOFF_BASE_SECS,
+            2 => 10,
+            3 => 20,
+            _ => Self::MANBO_BACKOFF_MAX_SECS,
+        }
+    }
 
     pub fn new(config: TTSConfig) -> Self {
         Self {
             config: Mutex::new(config),
             manbo_health: Mutex::new(EngineHealth::Healthy),
+            manbo_failures: AtomicU32::new(0),
             special_health: Mutex::new(SpecialEngineHealth {
                 failures: 0,
                 cooldown_until: None,
@@ -1068,10 +1095,32 @@ impl TTSManager {
         self.normal_queue.lock().unwrap().len() + self.priority_queue.lock().unwrap().len()
     }
 
-    /// 更新 TTS 配置
+    /// 更新 TTS 配置。
+    ///
+    /// 引擎、音色或 Manbo Key 变化时**重置 Manbo 熔断与退避**：这些都是主播的显式
+    /// 修复动作，不该被上一次故障留下的冷却期挡住 —— 否则观感就是"所有曼波音色都失效了"。
     pub fn update_config(&self, new_cfg: TTSConfig) {
-        let mut cfg = self.config.lock().unwrap();
-        *cfg = new_cfg;
+        let (engine_changed, voice_changed, key_changed) = {
+            let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            let changed = (
+                cfg.engine != new_cfg.engine,
+                cfg.manbo_voice != new_cfg.manbo_voice,
+                cfg.manbo_api_key != new_cfg.manbo_api_key,
+            );
+            *cfg = new_cfg;
+            changed
+        };
+        if engine_changed || voice_changed || key_changed {
+            self.reset_manbo_health();
+        }
+    }
+
+    /// 清除 Manbo 熔断与退避计数（保存新 Key / 切换引擎或音色后立即重试）
+    pub fn reset_manbo_health(&self) {
+        // 与 mark_engine_degraded/success 同序：先拿状态锁，再改计数
+        let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
+        self.manbo_failures.store(0, Ordering::SeqCst);
+        *h = EngineHealth::Healthy;
     }
 
     /// 当前 TTS 配置快照（用于局部字段更新，如保存 Manbo Key）
@@ -1085,7 +1134,7 @@ impl TTSManager {
             // 「自动」不参与降级判定（由 select_active_engine 级联解析为具体引擎）
             TTSEngineType::Auto => true,
             TTSEngineType::Manbo => {
-                let mut h = self.manbo_health.lock().unwrap();
+                let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
                 match *h {
                     EngineHealth::Healthy => true,
                     EngineHealth::Degraded {
@@ -1093,7 +1142,10 @@ impl TTSManager {
                         cooldown_secs,
                     } => {
                         if failed_at.elapsed() >= Duration::from_secs(cooldown_secs) {
-                            *h = EngineHealth::Healthy; // 冷却结束，自动恢复重试
+                            // 冷却结束，允许下一次播报探活。失败计数**不**清零：
+                            // 若探活仍失败，退避档位继续上升；成功时由
+                            // mark_engine_success 清零并立即恢复 Manbo。
+                            *h = EngineHealth::Healthy;
                             true
                         } else {
                             false
@@ -1106,20 +1158,54 @@ impl TTSManager {
         }
     }
 
-    /// 标记引擎故障降级
+    /// 标记引擎故障降级（连续失败按指数退避，封顶 30s）
     pub fn mark_engine_degraded(&self, engine: TTSEngineType) {
         let now = Instant::now();
         match engine {
             // 「自动」无独立健康度，实际降级由其解析出的具体引擎承担
             TTSEngineType::Auto => {}
             TTSEngineType::Manbo => {
-                let mut h = self.manbo_health.lock().unwrap();
+                // 状态与计数在同一把锁内更新：并发失败按到达顺序累计，后者写入更高档位
+                let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
+                let failures = self.manbo_failures.fetch_add(1, Ordering::SeqCst) + 1;
+                let cooldown_secs = Self::manbo_backoff_secs(failures);
                 *h = EngineHealth::Degraded {
                     failed_at: now,
-                    cooldown_secs: Self::COOLDOWN_SECS,
+                    cooldown_secs,
                 };
+                drop(h);
+                crate::log_warn!(
+                    "[TTS] Manbo 熔断：连续失败 {} 次，{}s 后自动重试（期间使用本地 SAPI）",
+                    failures,
+                    cooldown_secs
+                );
             }
             TTSEngineType::Sapi => {}
+        }
+    }
+
+    /// 标记引擎请求成功：清零连续失败计数并立即恢复健康。
+    /// 网络恢复后的第一次成功播报会走这里，后续播报马上回到 Manbo。
+    pub fn mark_engine_success(&self, engine: TTSEngineType) {
+        match engine {
+            TTSEngineType::Auto => {}
+            TTSEngineType::Manbo => {
+                // 与失败路径同序：先拿状态锁，再清零计数并恢复健康。
+                // 若成功与失败并发，最终状态由后拿到锁的一方决定，不会出现
+                // "显示健康但计数未清"或"计数为 0 却仍在熔断"的错位。
+                let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
+                let previous_failures = self.manbo_failures.swap(0, Ordering::SeqCst);
+                *h = EngineHealth::Healthy;
+                drop(h);
+                self.mark_active_engine(TTSEngineType::Manbo);
+                if previous_failures > 0 {
+                    crate::log_info!(
+                        "[TTS] Manbo 已恢复（此前连续失败 {} 次），后续播报回到云端音色",
+                        previous_failures
+                    );
+                }
+            }
+            TTSEngineType::Sapi => self.mark_active_engine(TTSEngineType::Sapi),
         }
     }
 
@@ -1248,9 +1334,16 @@ impl TTSManager {
         }
     }
 
+    /// 该音色是否必须携带 Manbo API Key。
+    /// 只有「曼波」走付费端点 `/apis/mbAIscvip`（key 参数）；其余音色走 `/apis/AIvoice`
+    /// 不需要 Key —— 因此缺 Key 时只应影响「曼波」，不能把整个 Manbo 引擎判死。
+    pub fn manbo_voice_requires_key(voice: &str) -> bool {
+        voice == "曼波"
+    }
+
     /// Manbo 通用引擎请求地址构建（对齐原工程 ManboTTSProvider::BuildRequestUrl）
     pub fn build_manbo_url(cfg: &TTSConfig, text: &str) -> String {
-        if cfg.manbo_voice == "曼波" {
+        if Self::manbo_voice_requires_key(&cfg.manbo_voice) {
             format!(
                 "https://api.milorapart.top/apis/mbAIscvip?text={}&format=mp3&speed={}&key={}",
                 url_encode(text),
@@ -1277,7 +1370,8 @@ impl TTSManager {
     /// 进程级共享 HTTP 客户端（对齐原工程 `Network.cpp` 的 `GetSharedSession` 共享
     /// WinHTTP 会话：会话级连接缓存使后续请求复用已建立的 TCP/TLS 连接）。
     /// reqwest Client 内置连接池，逐条播报重建会随消息丢弃池，导致每跳都重新握手。
-    /// 超时口径不变：[`Self::REQUEST_TIMEOUT`] 作用于每个请求（两跳各 3s）。
+    /// 客户端默认超时 [`Self::REQUEST_TIMEOUT`]（生成跳 10s）；音频跳在
+    /// [`Self::request_audio_bytes`] 内单独收紧到 5s。
     /// 构建失败（仅 TLS 后端初始化异常，几乎不会发生）返回 `None`，调用方降级本地 SAPI。
     fn shared_http_client() -> Option<&'static reqwest::Client> {
         static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -1289,6 +1383,36 @@ impl TTSManager {
             .build()
             .ok()?;
         Some(CLIENT.get_or_init(|| built))
+    }
+
+    /// 生成可安全写入日志的 HTTP 错误描述。
+    ///
+    /// **不要用 `reqwest::Error::to_string()`**：发送失败时它会把完整 URL 拼进消息，
+    /// 而 Manbo URL 的 `key=` 查询参数就是密钥 —— 日志会直接泄露 Key。
+    /// 这里只保留错误类别与底层错误链（底层错误不含 URL）。
+    fn describe_http_error(e: &reqwest::Error) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if e.is_timeout() {
+            parts.push("超时".into());
+        }
+        if e.is_connect() {
+            parts.push("连接失败".into());
+        }
+        if e.is_body() {
+            parts.push("响应体读取失败".into());
+        }
+        if e.is_decode() {
+            parts.push("响应解码失败".into());
+        }
+        if parts.is_empty() {
+            parts.push("网络请求失败".into());
+        }
+        let mut src = std::error::Error::source(e);
+        while let Some(c) = src {
+            parts.push(c.to_string());
+            src = std::error::Error::source(c);
+        }
+        parts.join("：")
     }
 
     /// 请求 TTS 并下载音频字节；`auth` 为可选 Bearer 令牌
@@ -1303,13 +1427,34 @@ impl TTSManager {
                 req = req.header("Authorization", format!("Bearer {}", token));
             }
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| Self::describe_http_error(&e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // 带上响应体：Manbo 的 401 会明确回 {"code":400,"msg":"无效的API密钥"}，
+            // 只记 "HTTP 401" 排查时看不出是密钥问题还是服务故障
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "HTTP {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ));
         }
-        let json_val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let json_val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("JSON 解析失败（{}）", Self::describe_http_error(&e)))?;
         if json_val.get("code").and_then(|c| c.as_i64()) != Some(200) {
-            return Err("API error".into());
+            return Err(format!(
+                "API code={:?} msg={}",
+                json_val.get("code"),
+                json_val
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("(无消息)")
+            ));
         }
         let audio_url = json_val
             .get("url")
@@ -1317,17 +1462,24 @@ impl TTSManager {
             .ok_or_else(|| "missing url".to_string())?;
         let audio_resp = client
             .get(audio_url)
+            .timeout(Self::AUDIO_TIMEOUT)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-        let bytes = audio_resp.bytes().await.map_err(|e| e.to_string())?;
+            .map_err(|e| format!("音频下载失败（{}）", Self::describe_http_error(&e)))?;
+        if !audio_resp.status().is_success() {
+            return Err(format!("音频下载 HTTP {}", audio_resp.status()));
+        }
+        let bytes = audio_resp
+            .bytes()
+            .await
+            .map_err(|e| format!("音频读取失败（{}）", Self::describe_http_error(&e)))?;
         if bytes.is_empty() {
             return Err("empty audio".into());
         }
         Ok(bytes.to_vec())
     }
 
-    /// 多引擎智能文本语音播报（特殊用户引擎、三级降级、3s 超时与故障熔断）。
+    /// 多引擎智能文本语音播报（特殊用户引擎、三级降级、生成超时 10s 与故障熔断）。
     /// `user_id` 为空表示无用户上下文（如连击结算/模拟通道）；命中特殊用户时走专属引擎。
     /// 注意：本地特殊音效不在本入口拦截（对齐原工程仅在弹幕文本路径 `HandleSpeekDm` 匹配）。
     pub async fn speak_text(&self, text: &str, user_id: &str) -> Result<(), String> {
@@ -1383,7 +1535,8 @@ impl TTSManager {
                         self.special_mark_success();
                         return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        crate::log_warn!("[TTS] 特殊用户 Manbo 请求失败：{}；回落通用引擎", e);
                         self.special_mark_failure();
                     }
                 }
@@ -1391,14 +1544,33 @@ impl TTSManager {
 
             // 3. 选择当前最优健康引擎并尝试（Manbo 失败即降级，落到本地 SAPI 兜底）
             if self.select_active_engine() == TTSEngineType::Manbo {
-                let url = Self::build_manbo_url(&cfg, trimmed);
-                match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
-                    Ok(bytes) => {
-                        self.mark_active_engine(TTSEngineType::Manbo);
-                        return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
-                    }
-                    Err(_) => {
-                        self.mark_engine_degraded(TTSEngineType::Manbo);
+                let key_missing = Self::manbo_voice_requires_key(&cfg.manbo_voice)
+                    && (cfg.manbo_api_key.trim().is_empty()
+                        || crate::credentials::is_placeholder_value(&cfg.manbo_api_key));
+                if key_missing {
+                    // 缺 Key 是配置问题，不是服务故障：不去请求（避免每次都吃 401），
+                    // 也不熔断 Manbo —— 其它不需要 Key 的音色仍应立即可用
+                    crate::log_warn!(
+                        "[TTS] 音色「{}」需要 Manbo API Key，当前未配置：本次降级本地 SAPI（可在设置中填写 Key，或改选其他音色）",
+                        cfg.manbo_voice
+                    );
+                } else {
+                    let url = Self::build_manbo_url(&cfg, trimmed);
+                    match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
+                        Ok(bytes) => {
+                            self.mark_engine_success(TTSEngineType::Manbo);
+                            return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
+                        }
+                        Err(e) => {
+                            // 必须留痕：此前这里是 Err(_) 静默吞掉，只能看到"只有默认语音"
+                            // 却没有任何排查线索
+                            crate::log_warn!(
+                                "[TTS] Manbo 请求失败（音色={}）：{}；降级本地 SAPI",
+                                cfg.manbo_voice,
+                                e
+                            );
+                            self.mark_engine_degraded(TTSEngineType::Manbo);
+                        }
                     }
                 }
             }
@@ -1423,6 +1595,8 @@ impl TTSManager {
 
     /// 试听指定参数的测试句（设置面板「试听」按钮）。
     /// 引擎选择与实际播报一致（首选引擎健康则用之，Manbo 失败自动降级 SAPI）；
+    /// **试听是显式探活动作**：即使 Manbo 正处于退避窗口，也绕过冷却直接试一次 ——
+    /// 成功会立即恢复 Manbo，失败则按正常规则继续退避。
     /// 音量/语速/音调用传入即时值（绕开配置自动保存防抖），
     /// 不受语音总开关限制（试听语义 = 配置阶段听当前参数效果）
     pub async fn speak_test_sample(
@@ -1438,7 +1612,12 @@ impl TTSManager {
         }
         let cfg = self.config.lock().unwrap().clone();
 
-        let preferred = self.select_active_engine();
+        // 试听绕过熔断冷却：按配置偏好直接探活 Manbo（Auto 等价于首选 Manbo）。
+        // 网络修好后主播点一次试听即可确认恢复，不必等退避窗口结束。
+        let preferred = match cfg.engine {
+            TTSEngineType::Auto => TTSEngineType::Manbo,
+            explicit => explicit,
+        };
         crate::log_info!(
             "[TTS] 试听播报: 文本=「{}」, 首选引擎={}, 音量={}, 语速={}, 音调={}",
             trimmed,
@@ -1449,7 +1628,15 @@ impl TTSManager {
         );
 
         if preferred == TTSEngineType::Manbo {
-            if let Some(client) = Self::shared_http_client() {
+            let key_missing = Self::manbo_voice_requires_key(&cfg.manbo_voice)
+                && (cfg.manbo_api_key.trim().is_empty()
+                    || crate::credentials::is_placeholder_value(&cfg.manbo_api_key));
+            if key_missing {
+                crate::log_warn!(
+                    "[TTS] 试听：音色「{}」需要 Manbo API Key，当前未配置，降级本地 SAPI",
+                    cfg.manbo_voice
+                );
+            } else if let Some(client) = Self::shared_http_client() {
                 // 曼波默认音色的 speed 参数按试听即时语速覆盖（其余音色无此参数，
                 // 音调/音量对 Manbo 云端无效，音量在本地播放端应用）
                 let url = Self::build_manbo_url(
@@ -1461,7 +1648,7 @@ impl TTSManager {
                 );
                 match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
                     Ok(bytes) => {
-                        self.mark_active_engine(TTSEngineType::Manbo);
+                        self.mark_engine_success(TTSEngineType::Manbo);
                         crate::log_info!(
                             "[TTS] 试听走 Manbo 引擎（音量 {} 由本地播放端增益应用）",
                             volume
@@ -1615,7 +1802,7 @@ mod tests {
     /// 的连续多条播报，逐阶段计时：客户端构建 / 一跳（API+合成）/ 二跳（音频下载），
     /// 另以「GET / 无合成探测」单独分离 DNS+TCP+TLS 握手开销。
     /// 两轮同字数文本逐条交替以抵消服务端波动；文本逐条唯一以排除服务端缓存干扰；
-    /// 超时放宽为 10s（生产 3s）以完整观测服务端耗时。需要网络；日常 CI 不跑（#[ignore]）。
+    /// 超时与生产口径一致（生成跳 10s；音频跳由请求端收紧到 5s）。需要网络；日常 CI 不跑（#[ignore]）。
     #[test]
     #[ignore = "手动基准工具：需要网络，日常 CI 不跑"]
     fn test_manbo_consecutive_latency_benchmark() {
@@ -2486,6 +2673,134 @@ mod tests {
         assert!(special.contains("/apis/mbAIsc?"), "special: {}", special);
         assert!(!special.contains("key="), "special 端点不得携带 key: {}", special);
         println!("[PASS] test_manbo_url_building passed");
+    }
+
+    /// 只有「曼波」音色需要 Key：其余音色走 /apis/AIvoice，缺 Key 不应影响它们
+    #[test]
+    fn test_manbo_voice_requires_key() {
+        assert!(TTSManager::manbo_voice_requires_key("曼波"));
+        assert!(!TTSManager::manbo_voice_requires_key("撒娇学妹"));
+        assert!(!TTSManager::manbo_voice_requires_key(""));
+        println!("[PASS] test_manbo_voice_requires_key passed");
+    }
+
+    /// 切换引擎 / 音色 / Key 必须重置 Manbo 熔断与退避；无关配置变更不得重置
+    #[test]
+    fn test_update_config_resets_manbo_health_on_engine_voice_or_key_change() {
+        let mgr = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Manbo,
+            manbo_voice: "曼波".into(),
+            manbo_api_key: "old-key".into(),
+            ..Default::default()
+        });
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
+
+        // 音量变化与引擎/音色/Key 无关：熔断保持
+        let mut cfg = mgr.config_snapshot();
+        cfg.speech_volume = 55;
+        mgr.update_config(cfg);
+        assert!(
+            !mgr.is_engine_available(TTSEngineType::Manbo),
+            "无关配置变更不应清熔断"
+        );
+
+        // 换音色 → 立即恢复重试
+        let mut cfg = mgr.config_snapshot();
+        cfg.manbo_voice = "撒娇学妹".into();
+        mgr.update_config(cfg);
+        assert!(mgr.is_engine_available(TTSEngineType::Manbo), "换音色应清熔断");
+
+        // 再熔断后换 Key → 同样立即恢复
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
+        let mut cfg = mgr.config_snapshot();
+        cfg.manbo_api_key = "new-key".into();
+        mgr.update_config(cfg);
+        assert!(mgr.is_engine_available(TTSEngineType::Manbo), "换 Key 应清熔断");
+
+        // 再熔断后切换播报引擎 → 同样立即恢复，并清零退避计数
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 1);
+        let mut cfg = mgr.config_snapshot();
+        cfg.engine = TTSEngineType::Auto;
+        mgr.update_config(cfg);
+        assert!(
+            mgr.is_engine_available(TTSEngineType::Manbo),
+            "切换播报引擎应清熔断"
+        );
+        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 0);
+
+        println!("[PASS] test_update_config_resets_manbo_health_on_engine_voice_or_key_change passed");
+    }
+
+    /// 生成跳超时必须覆盖 Manbo 冷生成（2026-10-22 实测 2.0–4.6s）。
+    /// 旧 3s 会在服务端稍慢时于读响应体阶段被掐断，表现为
+    /// `error decoding response body` 并静默降级本地语音 —— 用测试钉死预算。
+    #[test]
+    fn test_manbo_timeout_budget_covers_cold_generation() {
+        assert!(
+            TTSManager::REQUEST_TIMEOUT >= Duration::from_secs(10),
+            "生成跳超时不得低于 10s"
+        );
+        assert!(
+            TTSManager::AUDIO_TIMEOUT >= Duration::from_secs(5),
+            "音频跳超时不得低于 5s"
+        );
+        assert!(
+            TTSManager::AUDIO_TIMEOUT <= TTSManager::REQUEST_TIMEOUT,
+            "音频跳不应比生成跳更宽松"
+        );
+        println!("[PASS] test_manbo_timeout_budget_covers_cold_generation passed");
+    }
+
+    /// 网络波动恢复策略：连续失败按 5/10/20/30s 指数退避；
+    /// 任意一次成功立即清零并恢复 Manbo，换 Key/音色/引擎也立即清零。
+    #[test]
+    fn test_manbo_backoff_and_success_recovery() {
+        assert_eq!(TTSManager::manbo_backoff_secs(1), 5);
+        assert_eq!(TTSManager::manbo_backoff_secs(2), 10);
+        assert_eq!(TTSManager::manbo_backoff_secs(3), 20);
+        assert_eq!(TTSManager::manbo_backoff_secs(4), 30);
+        assert_eq!(TTSManager::manbo_backoff_secs(99), 30, "退避必须封顶");
+
+        let mgr = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Manbo,
+            ..Default::default()
+        });
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 1);
+        assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
+        {
+            let h = mgr.manbo_health.lock().unwrap();
+            match *h {
+                EngineHealth::Degraded { cooldown_secs, .. } => {
+                    assert_eq!(cooldown_secs, 5, "首次失败应只冷却 5s 以便快速恢复")
+                }
+                _ => panic!("首次失败后应处于熔断状态"),
+            }
+        }
+
+        // 连续失败：退避升档
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 2);
+        assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
+
+        // 网络恢复：一次成功立即清零退避并回到 Manbo（不等冷却走完）
+        mgr.mark_engine_success(TTSEngineType::Manbo);
+        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 0);
+        assert!(mgr.is_engine_available(TTSEngineType::Manbo));
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Manbo);
+
+        // 显式重置（换 Key/音色/引擎）同样清零
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 2);
+        mgr.reset_manbo_health();
+        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 0);
+        assert!(mgr.is_engine_available(TTSEngineType::Manbo));
+
+        println!("[PASS] test_manbo_backoff_and_success_recovery passed");
     }
 
     #[test]

@@ -30,6 +30,21 @@ DEFAULT_OUTPUT = REPO_ROOT / "MonsterOrderWilds_configs" / "credentials.dat"
 # 必填：缺任一项 B 站开播连接即不可用（连接签名三件套）
 REQUIRED_KEYS = ("APP_ID", "ACCESS_KEY_ID", "ACCESS_KEY_SECRET")
 
+# 与 Rust 侧 credentials::is_placeholder_value 同口径的模板占位标记
+PLACEHOLDER_MARKERS = ("在此填写", "在此输入", "在此輸入", "请填写", "請填寫", "模板占位")
+
+
+def is_placeholder(value: object) -> bool:
+    """模板占位文本识别：占位值绝不能写进 credentials.dat 当真实凭据。"""
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if not v:
+        return False
+    if "REPLACE_ME" in v.upper():
+        return True
+    return any(m in v for m in PLACEHOLDER_MARKERS)
+
 
 def write_info_file(json_plain: str, out_path: Path) -> None:
     """Base64( MAGIC + HMAC_hex + JSON ) 写盘，与 Rust save_credentials 完全同构。"""
@@ -65,12 +80,23 @@ def main() -> int:
         print(f"[ERROR] 必填字段缺失或为空: {', '.join(missing)}（缺少则 B 站开播连接不可用）")
         return 1
 
-    placeholders = [
-        k for k, v in data.items()
-        if isinstance(v, str) and ("REPLACE_ME" in v or "在此填写" in v)
-    ]
-    if placeholders:
-        print(f"[WARN] 以下字段仍为模板占位值: {', '.join(placeholders)}（对应能力将不可用）")
+    # 必填字段是模板占位值时直接中止：打包出来的凭据在运行时一定连不上，
+    # 不如在构建阶段就停下（与 Rust 侧 TTS 占位清洗同口径）
+    bad_required = [k for k in REQUIRED_KEYS if is_placeholder(data.get(k))]
+    if bad_required:
+        print(f"[ERROR] 必填字段仍是模板占位值: {', '.join(bad_required)}")
+        print("        请先在 scripts/credentials.json 中填入真实凭据。")
+        return 1
+
+    # 可选密钥的占位值**从产物中移除**：留空会让运行时回退注册表/配置；
+    # 而把“在此填写…”当密钥发给 Manbo 会得到 401 并静默降级本地语音，极难排查
+    for k in ("manbo_api_key", "chat_api_key"):
+        if is_placeholder(data.get(k)):
+            data.pop(k, None)
+            print(
+                f"[WARN] {k} 仍是模板占位值：已从 credentials.dat 移除，"
+                "运行时回退注册表/配置镜像（对应能力需另行配置）"
+            )
 
     # 与 V2 Rust save_credentials 一致采用紧凑 JSON；验签对原文进行，格式差异不影响互通
     json_plain = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
@@ -81,9 +107,15 @@ def main() -> int:
     print(f"       APP_ID            = {data.get('APP_ID', '')}")
     print(f"       ACCESS_KEY_ID     = {mask(str(data.get('ACCESS_KEY_ID', '')))}")
     print(f"       ACCESS_KEY_SECRET = {mask(str(data.get('ACCESS_KEY_SECRET', '')))}")
-    print(f"       manbo_api_key     = {mask(str(data.get('manbo_api_key', '')))}")
+    print(
+        f"       manbo_api_key     = "
+        f"{mask(str(data.get('manbo_api_key', ''))) if 'manbo_api_key' in data else '(已移除，运行时回退注册表)'}"
+    )
     print(f"       chat_provider     = {data.get('chat_provider', '')}")
-    print(f"       chat_api_key      = {mask(str(data.get('chat_api_key', '')))}")
+    print(
+        f"       chat_api_key      = "
+        f"{mask(str(data.get('chat_api_key', ''))) if 'chat_api_key' in data else '(已移除，运行时回退配置)'}"
+    )
     print("提示: scripts/credentials.json 为明文敏感文件，请勿提交或外发。")
     return 0
 
