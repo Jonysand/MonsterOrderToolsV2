@@ -256,6 +256,9 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
     [saveSettings]
   );
 
+  /** 设置是否已从后端加载完成：加载前不响应弹幕指令，避免用默认设置覆盖真实配置 */
+  const settingsLoadedRef = useRef(false);
+
   /** 设置只在挂载时拉一次：依赖里放任何不稳定引用都会让它变成"每次父渲染都重拉" */
   useEffect(() => {
     warnOnCatalogDrift();
@@ -263,7 +266,13 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
     void (async () => {
       try {
         const s = await invoke<DrawSettings>("get_draw_settings");
-        if (alive) setSettings(s);
+        if (alive) {
+          // 同步镜像也一起更新：settingsRef 的 effect 要等一次渲染，指令监听若在这之前
+          // 收到弹幕，会拿默认设置当底稿（尤其自动填入会覆盖掉真实的昵称/开关）
+          settingsRef.current = s;
+          setSettings(s);
+          settingsLoadedRef.current = true;
+        }
       } catch (e) {
         toastRef.current(`抽选设置读取失败，按默认值运行: ${e}`);
       }
@@ -532,20 +541,39 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
   });
 
   /**
-   * 弹幕抽选指令（后端已按"开开关 + 昵称精确匹配 + 整条指令词"过滤后才广播）：
+   * 弹幕抽选指令（后端已按"开开关 + 昵称/待指定匹配 + 整条指令词"过滤后才广播）：
    * 「开始」开抽、「停」快进。抽选演出只有本页签可见，故指令也只在本页签
    * 挂载期间响应 —— 跑弹幕控制抽选的主播应停留在本页签。
+   *
+   * 昵称框为空 = 待指定：首位**真正开抽**的「开始」发送者会被自动填入昵称框并落盘，
+   * 此后只有 TA 的指令生效。指定用户不会自动释放 —— 关闭开关、发送「停」、重启
+   * 都保持，只有主播手动清空昵称框才解除。
    */
   useEffect(() => {
     const unlisten = listen<DrawCommandPayload>("draw-command", (ev) => {
+      // 设置未加载完时不响应：此刻 settingsRef 还是默认值，自动填入会把
+      // 真实的昵称/开关一并覆盖成默认（加载通常只需几毫秒，漏响应可忽略）
+      if (!settingsLoadedRef.current) return;
       const { action, user_name } = ev.payload;
       if (action === "start") {
         if (rollingRef.current) {
           toastRef.current(`收到 ${user_name} 的「开始」，已在抽选中，已忽略`);
           return;
         }
-        toastRef.current(`收到 ${user_name} 的「开始」指令，开始抽选`);
+        // 待指定 = 昵称框为空：把首位开抽者写进昵称框（走正常设置通道落盘）
+        const designated = !settingsRef.current.command_user.trim();
         void drawRef.current();
+        // draw() 在首个 await 之前就置起 rollingRef；池子空等早退不算「开抽」，
+        // 此时不做指定（否则会指定一个其实没能开抽的观众）
+        if (!rollingRef.current) return;
+        if (designated) {
+          mutate((p) => ({ ...p, command_user: user_name }));
+        }
+        toastRef.current(
+          designated
+            ? `收到 ${user_name} 的「开始」，已指定为指令用户并开始抽选`
+            : `收到 ${user_name} 的「开始」指令，开始抽选`
+        );
       } else {
         if (!rollingRef.current) {
           toastRef.current(`收到 ${user_name} 的「停」，当前没有进行中的抽选`);
@@ -558,7 +586,7 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
     return () => {
       void unlisten.then((f) => f());
     };
-  }, [skipToEnd]);
+  }, [skipToEnd, mutate]);
 
   /**
    * 首屏给两个盘一张静止的开场图，避免空白框 —— **只铺一次**。
@@ -705,6 +733,9 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
     [entries, games, excludedM]
   );
 
+  /** 指令卡当前指定的指令用户（昵称框为空 = 待指定，首位【开始】会自动填入） */
+  const commandName = settings.command_user.trim();
+
   return (
     <div className="rd-scope">
       <header className="rd-head">
@@ -764,12 +795,14 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
           <div className="rd-card">
             <div className="rd-card-hd">
               <span className="t">弹幕指令</span>
-              <span className="n">
-                {settings.command_enabled
-                  ? settings.command_user.trim()
-                    ? "已开启"
-                    : "未生效"
-                  : "未开启"}
+              <span className="n" title={commandName}>
+                {!settings.command_enabled
+                  ? commandName
+                    ? `未开启 · 指定：${commandName}`
+                    : "未开启"
+                  : commandName
+                    ? `指定：${commandName}`
+                    : "待指定"}
               </span>
             </div>
             <label className="rd-cmd-toggle">
@@ -783,30 +816,49 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
               <span>允许弹幕触发抽选</span>
               <Radio className="w-3 h-3" />
             </label>
-            {/* 指令词提示**常驻一行**：关着的时候主播也得知道有哪两条指令可发。
-                输入框与完整玩法提示仍只在开启后展开 —— 这张卡未开启时是左栏里最「虚」的
+            {/* 指令词提示**常驻**：关着的时候主播也得知道有哪两条指令可发。
+                输入框与玩法说明仍只在开启后展开 —— 这张卡未开启时是左栏里最「虚」的
                 一块，整段常驻会把左栏撑得远高于舞台，页面右下留出一大块空背景 */}
             {settings.command_enabled && (
               <input
                 className="rd-cmd-user"
                 value={settings.command_user}
                 onChange={(e) => mutate((p) => ({ ...p, command_user: e.target.value }))}
-                placeholder="触发用户昵称（精确匹配）"
+                placeholder="指定用户昵称（留空 = 首位【开始】自动指定）"
               />
             )}
-            <p className="rd-cmd-hint">
-              {settings.command_enabled && settings.command_user.trim() ? (
-                <>
-                  收到 <b>{settings.command_user.trim()}</b> 的整条弹幕 <b>【开始】</b> →
-                  开抽；<b>【停】</b> → 收束揭晓（持续档的唯一出口）。仅在本页签打开时响应。
-                </>
-              ) : (
-                <>
-                  指令词：整条弹幕 <b>【开始】</b> 开抽 · <b>【停】</b> 收束揭晓
-                  {settings.command_enabled ? " —— 填好触发昵称后才会生效" : "（勾选开启后生效）"}
-                </>
-              )}
-            </p>
+            {!settings.command_enabled ? (
+              <p className="rd-cmd-hint">
+                指令词：整条弹幕 <b>【开始】</b> 开抽 · <b>【停】</b> 收束揭晓。
+                勾选后生效：填昵称 = 只认该用户；留空 = 首位【开始】自动填入。
+                {commandName && (
+                  <>
+                    {" "}已指定 <b>{commandName}</b>（关闭期间保留）。
+                  </>
+                )}
+              </p>
+            ) : (
+              <>
+                <p className="rd-cmd-hint">
+                  {commandName ? (
+                    <>
+                      只响应 <b>{commandName}</b> 的整条弹幕：
+                      <b>【开始】</b> 开抽 · <b>【停】</b> 收束揭晓（持续档的唯一出口）。
+                    </>
+                  ) : (
+                    <>
+                      尚未指定用户：第一位发送整条 <b>【开始】</b> 的观众会被自动填入
+                      上方昵称框并开抽。
+                    </>
+                  )}
+                </p>
+                <ul className="rd-cmd-steps">
+                  <li>指令要<b>整条精确</b>：「开始吧」「停下」都只是聊天。</li>
+                  <li>仅在<b>本页签打开</b>时响应，切页签前请先收束揭晓。</li>
+                  <li>指定后<b>不会自动解除</b>：只有手动清空昵称框才会释放。</li>
+                </ul>
+              </>
+            )}
           </div>
 
           <div className="rd-card">
@@ -940,8 +992,8 @@ export const RandomDrawTab: React.FC<Props> = ({ dict, roster, onSendToOrder, to
               ) : rolling && sustain ? (
                 <div className="rd-hint">
                   持续滚动中 —— 点「结束 · 揭晓」
-                  {settings.command_enabled && settings.command_user.trim()
-                    ? `，或等 ${settings.command_user.trim()} 的弹幕【停】`
+                  {settings.command_enabled && commandName
+                    ? `，或等 ${commandName} 的弹幕【停】`
                     : ""}
                   收束演出
                 </div>

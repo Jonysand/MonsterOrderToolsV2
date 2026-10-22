@@ -70,10 +70,13 @@ pub struct DrawSettings {
     pub mode: String,
     #[serde(default = "default_pace")]
     pub pace: String,
-    /// 弹幕指令控制开关：开启后指定观众的整条「开始」/「停」弹幕可远程控制抽选
+    /// 弹幕指令控制开关：开启后观众/指定用户的整条「开始」/「停」弹幕可远程控制抽选
     #[serde(default)]
     pub command_enabled: bool,
-    /// 弹幕指令触发用户的昵称（与弹幕 `user_name` 精确匹配；开启但留空 = 指令不生效）
+    /// 弹幕指令触发用户的昵称（与弹幕 `user_name` 精确匹配）。
+    /// **留空 = 待指定**：开启后第一位发送整条「开始」的观众会被前端自动填入此框并落盘；
+    /// 指定后只能由主播手动清空此框解除（关闭开关/发送「停」/重启都不会自动清除）。
+    /// 见 `match_draw_command`。
     #[serde(default)]
     pub command_user: String,
 }
@@ -110,15 +113,30 @@ impl DrawCommand {
     }
 }
 
+/// 抽出整条指令词对应的动作。句中带词 / 带标点都不算（与「优先」提权指令同口径，
+/// 旧指令词「结束」不再命中）。
+fn parse_command_word(message: &str) -> Option<DrawCommand> {
+    match message.trim() {
+        "开始" => Some(DrawCommand::Start),
+        "停" => Some(DrawCommand::End),
+        _ => None,
+    }
+}
+
 /// 判定一条弹幕是否命中抽选指令。
 ///
 /// 全部条件必须同时满足：
-/// - `command_enabled` 为真且 `command_user` 归一化后非空（留空的"开着"不生效，
-///   避免往上追溯到"开启但没填昵称"的中间态时把开关抹掉——归一化只管 trim）；
-/// - 弹幕发送者昵称与 `command_user` **整条精确一致**（非包含、非前缀）；
-/// - 弹幕原文去空白后整条精确等于「开始」或「停」——与「优先」提权指令同口径，
-///   句中带词不触发（"开始吧"/"停下"都只是聊天）。旧指令词「结束」**不再命中**：
-///   单字「停」与点怪语境零冲突，主播读起来也更顺口。
+/// - `command_enabled` 为真；
+/// - 弹幕发送者昵称非空（空昵称不能触发，也不能被指定）；
+/// - 弹幕原文去空白后整条精确等于「开始」或「停」—— 与「优先」提权指令同口径，
+///   句中带词不触发（"开始吧"/"停下"都只是聊天）。旧指令词「结束」不再命中；
+/// - **已指定用户**（`command_user` 非空）时，发送者昵称必须与它整条精确一致
+///   （非包含、非前缀）。
+///
+/// `command_user` 留空 = **待指定**：此时只放行「开始」，由前端把首位发送者的昵称
+/// 自动填入昵称框并落盘（见 `RandomDrawTab` 的弹幕指令监听）；「停」没有可收束的
+/// 对象，故不命中。指定用户**只能由主播手动清空昵称框解除** —— 关闭开关、发送「停」、
+/// 重启程序都不会自动清除（本轮需求明确取消自动释放）。
 ///
 /// 指令弹幕**不独占语义**：命中后调用方只旁路广播事件，弹幕仍照常走
 /// 点怪匹配与朗读链路（与「优先」的处理姿态一致）。
@@ -127,16 +145,26 @@ pub fn match_draw_command(
     user_name: &str,
     message: &str,
 ) -> Option<DrawCommand> {
-    if !settings.command_enabled || settings.command_user.is_empty() {
+    if !settings.command_enabled {
         return None;
     }
-    if user_name.trim() != settings.command_user {
+    let action = parse_command_word(message)?;
+    let user = user_name.trim();
+    if user.is_empty() {
         return None;
     }
-    match message.trim() {
-        "开始" => Some(DrawCommand::Start),
-        "停" => Some(DrawCommand::End),
-        _ => None,
+
+    if !settings.command_user.is_empty() {
+        if user != settings.command_user {
+            return None;
+        }
+        return Some(action);
+    }
+
+    // 待指定：首位「开始」放行，由前端自动填入昵称框；「停」尚无对象
+    match action {
+        DrawCommand::Start => Some(DrawCommand::Start),
+        DrawCommand::End => None,
     }
 }
 
@@ -267,6 +295,9 @@ impl DrawSettingsManager {
     /// 整表替换：先落盘、成功后才提交内存。
     /// 内容未变化时既不写盘也不报错（重复提交不该让文件时间戳漂移）。
     /// 返回落盘后的权威设置，供前端纠正自己的乐观状态。
+    ///
+    /// **不会自动清除 `command_user`**：指定用户只能由前端（主播手动清空昵称框）
+    /// 显式写回空串来解除，关闭开关、发送「停」、重启程序都保持原指定。
     pub fn replace(&self, next: DrawSettings) -> Result<DrawSettings, String> {
         let _guard = self.lock_edit();
         let next = next.normalized();
@@ -282,7 +313,15 @@ impl DrawSettingsManager {
             next.excluded_weapons.len(),
             next.mode,
             next.pace,
-            if next.command_enabled { format!("开·{}", next.command_user) } else { "关".to_string() }
+            if next.command_enabled {
+                if next.command_user.is_empty() {
+                    "开·待指定".to_string()
+                } else {
+                    format!("开·{}", next.command_user)
+                }
+            } else {
+                "关".to_string()
+            }
         );
         Ok(next)
     }
@@ -405,7 +444,7 @@ mod tests {
         println!("[PASS] test_games_normalized_to_known_ids passed");
     }
 
-    /// 弹幕指令命中矩阵：开启 + 昵称精确匹配 + 消息整条精确等于指令词，三者缺一不可
+    /// 指令命中矩阵：开启 + 昵称精确匹配 + 消息整条精确等于指令词，三者缺一不可
     #[test]
     fn test_draw_command_matching() {
         let mk = |enabled: bool, user: &str| DrawSettings {
@@ -423,9 +462,6 @@ mod tests {
 
         // 关闭：永不命中
         assert_eq!(match_draw_command(&mk(false, "猎人甲"), "猎人甲", "开始"), None);
-        // 开启但没填昵称：同样不命中（避免"任何人都能触发"的空配置事故）
-        assert_eq!(match_draw_command(&mk(true, ""), "猎人甲", "开始"), None);
-        assert_eq!(match_draw_command(&mk(true, "   "), "猎人甲", "开始"), None);
 
         // 其他用户：不命中；昵称要求整条精确（非包含、非前缀）
         assert_eq!(match_draw_command(&s, "猎人乙", "开始"), None);
@@ -446,6 +482,98 @@ mod tests {
         assert_eq!(match_draw_command(&s, "猎人甲", "结束"), None);
 
         println!("[PASS] test_draw_command_matching passed");
+    }
+
+    /// 待指定（昵称留空）：只放行「开始」，由前端自动填入昵称框并落盘；
+    /// 「停」没有对象；填入后转为只认该用户
+    #[test]
+    fn test_draw_command_pending_designation() {
+        let pending = DrawSettings {
+            command_enabled: true,
+            command_user: "".into(),
+            ..DrawSettings::default()
+        };
+
+        // 尚未指定：任何人的整条「开始」都命中，前端据此把 TA 自动填进昵称框
+        assert_eq!(match_draw_command(&pending, "猎人甲", "开始"), Some(DrawCommand::Start));
+        assert_eq!(match_draw_command(&pending, "猎人乙", "开始"), Some(DrawCommand::Start));
+        // 尚未指定时「停」没有可收束的对象
+        assert_eq!(match_draw_command(&pending, "猎人甲", "停"), None);
+        // 空昵称既不能触发也不能被指定；指令词仍须整条精确
+        assert_eq!(match_draw_command(&pending, "   ", "开始"), None);
+        assert_eq!(match_draw_command(&pending, "猎人甲", "开始吧"), None);
+
+        // 前端已把首位发送者填入昵称框并落盘：此后只认该用户（可连续「开始」）
+        let designated = DrawSettings {
+            command_enabled: true,
+            command_user: "猎人甲".into(),
+            ..DrawSettings::default()
+        };
+        assert_eq!(match_draw_command(&designated, "猎人甲", "开始"), Some(DrawCommand::Start));
+        assert_eq!(match_draw_command(&designated, "猎人甲", "停"), Some(DrawCommand::End));
+        assert_eq!(match_draw_command(&designated, "猎人乙", "开始"), None);
+        assert_eq!(match_draw_command(&designated, "猎人乙", "停"), None);
+
+        // 关闭开关：待指定状态也不会触发
+        let off = DrawSettings {
+            command_enabled: false,
+            command_user: "".into(),
+            ..DrawSettings::default()
+        };
+        assert_eq!(match_draw_command(&off, "猎人甲", "开始"), None);
+
+        println!("[PASS] test_draw_command_pending_designation passed");
+    }
+
+    /// 指定用户不会自动清除：关闭开关、重新加载（重启）都保持；
+    /// 只有前端写回空昵称（主播手动清空）才解除
+    #[test]
+    fn test_designated_user_not_auto_cleared() {
+        let path = temp_path("designated");
+        let mgr = DrawSettingsManager::load(Some(&path));
+        let cfg = |enabled: bool, user: &str| DrawSettings {
+            command_enabled: enabled,
+            command_user: user.into(),
+            ..DrawSettings::default()
+        };
+
+        // 前端自动填入首位「开始」发送者并落盘
+        mgr.replace(cfg(true, "猎人甲")).unwrap();
+        assert_eq!(mgr.snapshot().command_user, "猎人甲");
+
+        // 关闭开关不释放指定（本轮需求：取消自动释放机制）
+        mgr.replace(cfg(false, "猎人甲")).unwrap();
+        assert_eq!(
+            mgr.snapshot().command_user,
+            "猎人甲",
+            "关闭开关不得清除指定用户"
+        );
+
+        // 重新开启、重新加载（模拟进程重启）都保持指定
+        mgr.replace(cfg(true, "猎人甲")).unwrap();
+        let reloaded = DrawSettingsManager::load(Some(&path));
+        assert_eq!(
+            reloaded.snapshot().command_user,
+            "猎人甲",
+            "重启后指定用户仍生效"
+        );
+        assert_eq!(
+            match_draw_command(&reloaded.snapshot(), "猎人甲", "停"),
+            Some(DrawCommand::End)
+        );
+        assert_eq!(match_draw_command(&reloaded.snapshot(), "猎人乙", "停"), None);
+
+        // 主播手动清空昵称框：唯一解除方式
+        reloaded.replace(cfg(true, "")).unwrap();
+        assert_eq!(reloaded.snapshot().command_user, "");
+        assert_eq!(
+            match_draw_command(&reloaded.snapshot(), "猎人乙", "开始"),
+            Some(DrawCommand::Start),
+            "清空后回到待指定，谁都可以用「开始」重新指定"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        println!("[PASS] test_designated_user_not_auto_cleared passed");
     }
 
     /// 弹幕指令设置：旧版本文件缺字段回默认值；昵称 trim；往返一致
@@ -492,8 +620,11 @@ mod tests {
             .unwrap();
         assert!(trimmed_empty.command_enabled, "开关原样保留");
         assert_eq!(trimmed_empty.command_user, "", "昵称只被 trim");
-        // 空昵称 + 开 = 匹配层不生效
-        assert_eq!(match_draw_command(&trimmed_empty, "猎人甲", "开始"), None);
+        // 空昵称 + 开 = 待指定：首位「开始」放行，前端会把它自动填进昵称框
+        assert_eq!(
+            match_draw_command(&trimmed_empty, "猎人甲", "开始"),
+            Some(DrawCommand::Start)
+        );
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
         println!("[PASS] test_command_settings_roundtrip_and_legacy passed");

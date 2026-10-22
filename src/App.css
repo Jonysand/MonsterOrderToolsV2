@@ -3127,6 +3127,11 @@ body {
   font-size: 10px;
   color: var(--w-ink-3);
   font-family: var(--font-num);
+  /* 开放认领会把观众昵称放进卡头：长昵称必须省略而不是把卡头撑破 */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .rd-card-hd .mini {
@@ -3223,6 +3228,18 @@ body {
 
 .rd-cmd-hint { margin: 5px 0 0; font-size: 10px; color: var(--w-ink-4); line-height: 1.55; }
 .rd-cmd-hint b { color: var(--amber-2); font-weight: 700; }
+
+/* 操作说明：三条以内的短句，缩进对齐提示文字；列表符号用暗色小点，不抢戏 */
+.rd-cmd-steps {
+  margin: 4px 0 0;
+  padding-left: 14px;
+  font-size: 10px;
+  color: var(--w-ink-4);
+  line-height: 1.55;
+}
+.rd-cmd-steps li { margin: 1px 0; }
+.rd-cmd-steps li::marker { color: var(--w-ink-4); }
+.rd-cmd-steps b { color: var(--amber-2); font-weight: 700; }
 
 .rd-wgrid {
   display: grid;

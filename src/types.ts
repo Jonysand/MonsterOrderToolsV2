@@ -203,9 +203,11 @@ export interface DrawSettings {
   excluded_weapons: string[];
   mode: DrawMode;
   pace: DrawPace;
-  /** 弹幕指令控制开关：开启后指定观众的整条「开始」/「停」弹幕可远程控制抽选 */
+  /** 弹幕指令控制开关：开启后观众/指定用户的整条「开始」/「停」弹幕可远程控制抽选 */
   command_enabled: boolean;
-  /** 弹幕指令触发用户昵称（后端与弹幕 user_name 精确匹配；开启但留空 = 指令不生效） */
+  /** 弹幕指令触发用户昵称（后端与弹幕 user_name 精确匹配）。
+   *  **留空 = 待指定**：开启后第一位发送整条【开始】的观众会被自动填入此框并落盘；
+   *  指定后只有主播手动清空此框才解除（关闭开关 / 发送【停】/ 重启都不会自动清除）。 */
   command_user: string;
 }
 

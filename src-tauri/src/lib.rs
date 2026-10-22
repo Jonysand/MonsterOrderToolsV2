@@ -1690,7 +1690,9 @@ pub fn handle_incoming_danmu(
         record_business_history_probe(&entry);
     }
 
-    // 1.2 随机抽选弹幕指令：指定观众的整条「开始」/「停」→ 通知前端开抽或快进。
+    // 1.2 随机抽选弹幕指令：整条「开始」/「停」→ 通知前端开抽或快进。
+    //     昵称留空 = 待指定：首位「开始」放行，由前端把发送者自动填入昵称框并落盘；
+    //     此后只认该用户。指定用户不会自动释放，只有主播手动清空昵称框才解除。
     //     放在 IS_LITE 段之外：抽选本身完整版与 Lite 版均支持（见 draw.rs 模块注释），
     //     指令走的又是普通弹幕管道。只旁路广播、**不 return**：指令弹幕继续走
     //     点怪匹配与朗读链路（与「优先」提权指令同一姿态）。昵称不进普通 Logs。
@@ -1699,7 +1701,11 @@ pub fn handle_incoming_danmu(
         &danmu.user_name,
         &danmu.message,
     ) {
-        crate::log_info!("[Draw] 弹幕抽选指令命中（{}）", action.as_str());
+        crate::log_info!(
+            "[Draw] 弹幕抽选指令命中（{}·发送者={}）",
+            action.as_str(),
+            danmu.user_name
+        );
         if let Some(handle) = app_handle {
             let _ = handle.emit(
                 "draw-command",
@@ -3750,8 +3756,9 @@ mod tests {
         println!("[PASS] test_draw_settings_available_in_both_build_flavors passed");
     }
 
-    /// 弹幕抽选指令走 AppState 的设置快照判定（与 handle_incoming_danmu 1.2 同一数据源）：
-    /// 配好昵称后「开始/停」命中、未配置不命中；Lite 同样生效（不设 ensure_not_lite 守卫）
+    /// 弹幕抽选指令走 AppState 的权威设置判定（与 handle_incoming_danmu 1.2 同一数据源）：
+    /// 指定昵称时只认该用户；昵称留空时首位「开始」放行（由前端自动填入昵称框）。
+    /// Lite 同样生效（不设 ensure_not_lite 守卫）
     #[test]
     fn test_draw_command_via_app_state() {
         let state = AppState::new_test();
@@ -3768,6 +3775,26 @@ mod tests {
         assert_eq!(draw::match_draw_command(&s, "猎人甲", "停"), Some(draw::DrawCommand::End));
         assert_eq!(draw::match_draw_command(&s, "猎人乙", "开始"), None);
         assert_eq!(draw::match_draw_command(&s, "猎人甲", "开始吧"), None);
+
+        // 昵称留空 = 待指定：首位「开始」放行，「停」无对象
+        state.draw_settings.replace(DrawSettings {
+            command_enabled: true,
+            command_user: "".into(),
+            ..DrawSettings::default()
+        }).expect("待指定状态应可写入");
+        let s = state.draw_settings.snapshot();
+        assert_eq!(draw::match_draw_command(&s, "猎人乙", "开始"), Some(draw::DrawCommand::Start));
+        assert_eq!(draw::match_draw_command(&s, "猎人丙", "停"), None);
+
+        // 关闭开关后不再响应；但指定昵称保持（不再自动清除）
+        state.draw_settings.replace(DrawSettings {
+            command_enabled: false,
+            command_user: "猎人乙".into(),
+            ..DrawSettings::default()
+        }).expect("关闭指令开关应可写入");
+        let s = state.draw_settings.snapshot();
+        assert_eq!(s.command_user, "猎人乙", "关闭开关不得清除指定用户");
+        assert_eq!(draw::match_draw_command(&s, "猎人乙", "开始"), None);
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         println!("[PASS] test_draw_command_via_app_state passed");
