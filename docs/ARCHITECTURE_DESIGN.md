@@ -161,8 +161,7 @@
                                    ▼
                      播报泵（150ms 逐条出队，对齐原工程 Tick 语义）
                                    ▼
-          speak_text(text, uid)  ├─► 本地语音包命中（zip 优先）→ 直接播放
-                                 ├─► 特殊用户专属引擎 /apis/mbAIsc（3 次失败/30s 熔断）
+          speak_task(task)       ├─► 本地语音包命中（zip 优先）→ 直接播放
                                  ├─► Manbo（曼波音色走 /apis/mbAIscvip，speed=rate×5）
                                  └─► Windows SAPI（中文音色 + SSML rate/volume/pitch）
                                    ▼

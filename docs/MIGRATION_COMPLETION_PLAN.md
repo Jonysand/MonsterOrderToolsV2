@@ -282,10 +282,13 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **验收**：`test_manbo_url_building`、`test_manbo_voice_list_data`、`test_tts_circuit_breaker_and_cooldown_recovery`。
 - **Lite**：不支持。
 
-### B6 特殊用户专属 TTS 引擎 ✅
+### B6 特殊用户专属 TTS 引擎 ✅ → ❌ 已于 2026-11-07 移除
+> ⚠️ **该功能已下线**：服务方下架了免 Key 试用端点 `/apis/mbAIsc`（API 404「曼波配音生成试用版已下架」）。
+> 已移除专属引擎、`SpecialEngineHealth` 熔断（3 次失败 / 30s 冷却）与 `build_special_manbo_url`；
+> 特殊用户不再有专属云端语音，播报与普通用户走同一引擎链（Manbo → 本地 SAPI）。
+> 特殊用户的 GM 排队置前（`queue.rs`）与本地特殊音效（`bilibili.rs`）不受影响。
 - **原实现**：`SpecialManboTTSProvider`（`/apis/mbAIsc`，无 key/无 Authorization）+ 3 次失败 / 30s 熔断 + 失败后回落通用链。
-- **实施**：`speak_text_for_user(text, user_id)` 命中 `SPECIAL_OPEN_ID` 且未熔断时优先专属引擎；失败累计 3 次触发 30s 冷却（`special_engine_available / special_mark_failure / special_mark_success`），冷却期内回落通用链（Manbo → MiMo → SAPI），成功即清零并解除冷却。
-- **验收**：`test_special_engine_circuit_breaker`、`build_special_manbo_url` 断言（无 key 参数）。
+- **移除验收**：`test_manbo_url_building`（原 special 断言删除）、`test_special_engine_circuit_breaker` 删除。
 - **Lite**：不支持。
 
 ### B7 TTS 音频留档与清理 ✅

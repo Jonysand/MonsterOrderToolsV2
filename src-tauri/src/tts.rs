@@ -1,6 +1,9 @@
 ﻿//! 多引擎 TTS 语音域。
 //! 对照原工程实现：`TextToSpeech.cpp` / `ManboTTSProvider.cpp` /
-//! `SpecialManboTTSProvider.cpp` / `TTSCacheManager.cpp` / `LocalVoiceManager.cpp`。
+//! `TTSCacheManager.cpp` / `LocalVoiceManager.cpp`。
+//! 原工程的 `SpecialManboTTSProvider.cpp`（特殊用户专属曼波）已于 2026-11-07 移除：
+//! 服务方下架了免 Key 试用端点 `/apis/mbAIsc`（API 404「试用版已下架」），
+//! 特殊用户不再有专属云端语音，与普通用户走同一引擎链（排队置前与本地特殊音效不受影响）。
 
 #[cfg(not(test))]
 use rodio::{Decoder, OutputStream, Sink};
@@ -866,16 +869,6 @@ impl GiftComboTracker {
 // 多引擎 TTS 状态机
 // ---------------------------------------------------------------------------
 
-/// 特殊用户专属引擎健康状态（对齐原工程 3 次失败 / 30s 熔断）
-#[derive(Debug, Clone)]
-struct SpecialEngineHealth {
-    failures: u32,
-    cooldown_until: Option<Instant>,
-}
-
-pub const SPECIAL_MAX_FAILURES: u32 = 3;
-pub const SPECIAL_COOLDOWN_SECS: u64 = 30;
-
 /// 待播报任务（对应原工程 NormalMsgQueue / GiftMsgQueue 的队列元素）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeakTask {
@@ -907,7 +900,6 @@ pub struct TTSManager {
     /// **所有写入都在 `manbo_health` 锁内完成**，保证计数与熔断状态一致
     /// （两个并发播报一成一败时不会留下"健康但计数未清"的错位）。
     manbo_failures: AtomicU32,
-    special_health: Mutex<SpecialEngineHealth>,
     gift_tracker: Mutex<GiftComboTracker>,
     /// 普通弹幕朗读队列（原工程 NormalMsgQueue）
     normal_queue: Mutex<VecDeque<SpeakTask>>,
@@ -954,10 +946,6 @@ impl TTSManager {
             config: Mutex::new(config),
             manbo_health: Mutex::new(EngineHealth::Healthy),
             manbo_failures: AtomicU32::new(0),
-            special_health: Mutex::new(SpecialEngineHealth {
-                failures: 0,
-                cooldown_until: None,
-            }),
             gift_tracker: Mutex::new(GiftComboTracker::new()),
             normal_queue: Mutex::new(VecDeque::new()),
             priority_queue: Mutex::new(VecDeque::new()),
@@ -1242,34 +1230,6 @@ impl TTSManager {
             .to_string()
     }
 
-    /// 特殊用户引擎是否可用（冷却期内不可用，到期自动恢复并清零失败计数）
-    pub fn special_engine_available(&self) -> bool {
-        let mut h = self.special_health.lock().unwrap();
-        if let Some(until) = h.cooldown_until {
-            if Instant::now() >= until {
-                h.cooldown_until = None;
-                h.failures = 0;
-                return true;
-            }
-            return false;
-        }
-        true
-    }
-
-    fn special_mark_success(&self) {
-        let mut h = self.special_health.lock().unwrap();
-        h.failures = 0;
-        h.cooldown_until = None;
-    }
-
-    fn special_mark_failure(&self) {
-        let mut h = self.special_health.lock().unwrap();
-        h.failures += 1;
-        if h.failures >= SPECIAL_MAX_FAILURES {
-            h.cooldown_until = Some(Instant::now() + Duration::from_secs(SPECIAL_COOLDOWN_SECS));
-        }
-    }
-
     /// 接收礼物连击事件，返回需立即播报的文案
     pub fn process_gift(&self, ev: &GiftEvent) -> Vec<ComboReport> {
         let mut tracker = self.gift_tracker.lock().unwrap();
@@ -1357,14 +1317,6 @@ impl TTSManager {
                 url_encode(text)
             )
         }
-    }
-
-    /// 特殊用户专属引擎地址（对齐 SpecialManboTTSProvider：无 key、无 Authorization）
-    pub fn build_special_manbo_url(text: &str) -> String {
-        format!(
-            "https://api.milorapart.top/apis/mbAIsc?text={}&format=mp3",
-            url_encode(text)
-        )
     }
 
     /// 进程级共享 HTTP 客户端（对齐原工程 `Network.cpp` 的 `GetSharedSession` 共享
@@ -1479,30 +1431,26 @@ impl TTSManager {
         Ok(bytes.to_vec())
     }
 
-    /// 多引擎智能文本语音播报（特殊用户引擎、三级降级、生成超时 10s 与故障熔断）。
-    /// `user_id` 为空表示无用户上下文（如连击结算/模拟通道）；命中特殊用户时走专属引擎。
-    /// 注意：本地特殊音效不在本入口拦截（对齐原工程仅在弹幕文本路径 `HandleSpeekDm` 匹配）。
-    pub async fn speak_text(&self, text: &str, user_id: &str) -> Result<(), String> {
-        self.speak_text_inner(text, user_id, None, None).await
-    }
-
     /// 播报队列任务入口：按任务类型决定是否留档签到音频。
     /// 随行气泡交由本函数托管：真正出声时由音频线程投递；本次必不出声
     /// （语音开关关闭/空文本）时在此立即回退投递，合成入队失败则由调用方兜底。
+    /// 注意：本地特殊音效不在本入口拦截（对齐原工程仅在弹幕文本路径 `HandleSpeekDm` 匹配）。
     pub async fn speak_task(&self, task: &SpeakTask) -> Result<(), String> {
         let checkin = if task.is_checkin && !task.checkin_username.is_empty() {
             Some(task.checkin_username.as_str())
         } else {
             None
         };
-        self.speak_text_inner(&task.text, &task.user_id, checkin, task.bubble.as_ref())
+        self.speak_text_inner(&task.text, checkin, task.bubble.as_ref())
             .await
     }
 
+    /// 多引擎智能文本语音播报（Manbo→本地 SAPI 两级降级、生成超时 10s 与故障熔断）。
+    /// 原特殊用户专属引擎已于 2026-11-07 随服务方下架试用端点 `/apis/mbAIsc` 一并移除，
+    /// 特殊用户与普通用户走同一引擎链。
     async fn speak_text_inner(
         &self,
         text: &str,
-        user_id: &str,
         checkin_username: Option<&str>,
         notice: Option<&BubbleNotice>,
     ) -> Result<(), String> {
@@ -1524,25 +1472,9 @@ impl TTSManager {
             return Ok(());
         }
 
-        // 共享 HTTP 客户端（构建失败几乎不会发生；此时跳过 2/3 段，直接落第 4 段 SAPI 兜底）
+        // 共享 HTTP 客户端（构建失败几乎不会发生；此时跳过第 2 段，直接落第 3 段 SAPI 兜底）
         if let Some(client) = Self::shared_http_client() {
-            // 2. 特殊用户专属引擎（失败后回落通用链，不直接跳 SAPI）
-            if !user_id.is_empty() && user_id == crate::bilibili::SPECIAL_OPEN_ID && self.special_engine_available()
-            {
-                let url = Self::build_special_manbo_url(trimmed);
-                match Self::request_audio_bytes(client, &url, None).await {
-                    Ok(bytes) => {
-                        self.special_mark_success();
-                        return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
-                    }
-                    Err(e) => {
-                        crate::log_warn!("[TTS] 特殊用户 Manbo 请求失败：{}；回落通用引擎", e);
-                        self.special_mark_failure();
-                    }
-                }
-            }
-
-            // 3. 选择当前最优健康引擎并尝试（Manbo 失败即降级，落到本地 SAPI 兜底）
+            // 2. 选择当前最优健康引擎并尝试（Manbo 失败即降级，落到本地 SAPI 兜底）
             if self.select_active_engine() == TTSEngineType::Manbo {
                 let key_missing = Self::manbo_voice_requires_key(&cfg.manbo_voice)
                     && (cfg.manbo_api_key.trim().is_empty()
@@ -1576,7 +1508,7 @@ impl TTSManager {
             }
         }
 
-        // 4. 本地离线兜底（Windows SAPI / macOS say），全参数按平台映射
+        // 3. 本地离线兜底（Windows SAPI / macOS say），全参数按平台映射
         self.mark_active_engine(TTSEngineType::Sapi);
         let params = SapiParams {
             rate: cfg.speech_rate,
@@ -2071,30 +2003,6 @@ mod tests {
         // 最终降级至 SAPI 离线兜底
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
         println!("[PASS] test_tts_circuit_breaker_and_cooldown_recovery passed");
-    }
-
-    #[test]
-    fn test_special_engine_circuit_breaker() {
-        let mgr = TTSManager::new(TTSConfig::default());
-        assert!(mgr.special_engine_available());
-
-        // 2 次失败仍可用，第 3 次触发 30s 熔断
-        mgr.special_mark_failure();
-        mgr.special_mark_failure();
-        assert!(mgr.special_engine_available());
-        mgr.special_mark_failure();
-        assert!(!mgr.special_engine_available());
-
-        // 成功一次后失败计数清零（人工重置冷却以验证计数逻辑）
-        {
-            let mut h = mgr.special_health.lock().unwrap();
-            h.cooldown_until = None;
-        }
-        mgr.special_mark_failure();
-        mgr.special_mark_success();
-        mgr.special_mark_failure();
-        assert!(mgr.special_engine_available());
-        println!("[PASS] test_special_engine_circuit_breaker passed");
     }
 
     #[test]
@@ -2669,9 +2577,6 @@ mod tests {
         assert!(url2.contains("/apis/AIvoice"), "url2: {}", url2);
         assert!(url2.contains("speaker="), "url2: {}", url2);
 
-        let special = TTSManager::build_special_manbo_url("你好");
-        assert!(special.contains("/apis/mbAIsc?"), "special: {}", special);
-        assert!(!special.contains("key="), "special 端点不得携带 key: {}", special);
         println!("[PASS] test_manbo_url_building passed");
     }
 
