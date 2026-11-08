@@ -6,7 +6,6 @@ pub mod config;
 pub mod credentials;
 pub mod draw;
 pub mod logging;
-pub mod manbo_voices;
 pub mod monster;
 pub mod paths;
 pub mod queue;
@@ -154,23 +153,6 @@ pub struct AppState {
     pub checkin_ai_retry: Arc<Mutex<HashMap<String, CheckinAiRetryContext>>>,
 }
 
-/// 选取生效的 Manbo API Key。
-///
-/// 优先级：**用户现场填写的注册表/配置值 > 随包凭据文件**。
-/// 随包 Key 是发行方默认值；一旦过期或被服务端判无效，必须能被设置页覆盖，
-/// 否则重启后又被旧 Key 顶回去（本问题的现场修复就失效了）。
-/// 占位值在两侧都视为不可用。
-fn pick_manbo_key(creds: &Credentials, cfg: &AppConfig) -> String {
-    let usable = |v: &str| !v.trim().is_empty() && !credentials::is_placeholder_value(v);
-    if usable(&cfg.manbo_api_key) {
-        cfg.manbo_api_key.clone()
-    } else if usable(&creds.manbo_api_key) {
-        creds.manbo_api_key.clone()
-    } else {
-        String::new()
-    }
-}
-
 impl Default for AppState {
     fn default() -> Self {
         let app_cfg = AppConfig::load(None);
@@ -225,17 +207,15 @@ impl Default for AppState {
         };
 
         // 4. 初始化 TTS 管理器
-        // Manbo Key：用户现场填写的注册表/配置值优先，其次随包凭据（占位值视为空）
-        let manbo_key = pick_manbo_key(&creds, &app_cfg);
-
+        // 曼波引擎为局域网 GPT-SoVITS（部署包见 F:\ManboTTS\package\MamboTTS-Engine），
+        // 无需任何 Key；参考音频已引擎侧固化，配置仅引擎地址一项
         let tts_mgr = TTSManager::new(TTSConfig {
             engine: parse_tts_engine(&app_cfg.tts_engine),
             enable_voice: app_cfg.enable_voice,
             speech_rate: app_cfg.speech_rate,
             speech_volume: app_cfg.speech_volume,
             speech_pitch: app_cfg.speech_pitch,
-            manbo_api_key: manbo_key,
-            manbo_voice: app_cfg.manbo_voice.clone(),
+            lan_engine_base_url: app_cfg.lan_engine_base_url.clone(),
         });
 
         // 5. 初始化 AI 思考模块 (优先注入加密凭证中的 API Key)
@@ -1165,16 +1145,6 @@ fn sanitize_incoming_config(state: &AppState, mut new_cfg: AppConfig) -> AppConf
     keep_cred!(access_key_id, access_key_id);
     keep_cred!(access_key_secret, access_key_secret);
     keep_cred!(deepseek_api_key, chat_api_key);
-    // Manbo Key 与其它凭据不同：**用户现场填写的值优先于随包凭据**。
-    // 若沿用 keep_cred 的无条件覆盖，主播在设置页保存新 Key 后，任意一次配置保存
-    // 都会把内存值打回随包旧 Key，现场修复立即失效。
-    new_cfg.manbo_api_key = if !prev.manbo_api_key.trim().is_empty() {
-        prev.manbo_api_key.clone()
-    } else if !creds.manbo_api_key.trim().is_empty() {
-        creds.manbo_api_key.clone()
-    } else {
-        String::new()
-    };
 
     // 悬浮窗位置由拖动链路（pending_pos + 3s 防抖）独占维护，前端设置面板不提供该字段，
     // 故此处忽略前端回传的 top_pos，避免用陈旧副本覆盖真实位置（P1-6）
@@ -1215,8 +1185,7 @@ fn apply_config_to_state(
         speech_rate: new_cfg.speech_rate,
         speech_volume: new_cfg.speech_volume,
         speech_pitch: new_cfg.speech_pitch,
-        manbo_api_key: new_cfg.manbo_api_key,
-        manbo_voice: new_cfg.manbo_voice,
+        lan_engine_base_url: new_cfg.lan_engine_base_url,
     });
     Ok(sanitized)
 }
@@ -2773,37 +2742,18 @@ fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) ->
         cfg.app_id = creds.app_id.clone();
         cfg.access_key_id = creds.access_key_id.clone();
         cfg.access_key_secret = creds.access_key_secret.clone();
-        // 凭据里的 Manbo Key 为空（含占位值清洗后）时保留注册表/配置镜像，
-        // 不能用空串把用户现场填好的 Key 抹掉
-        if !creds.manbo_api_key.trim().is_empty()
-            && !credentials::is_placeholder_value(&creds.manbo_api_key)
-        {
-            cfg.manbo_api_key = creds.manbo_api_key.clone();
-        }
         cfg.deepseek_api_key = creds.chat_api_key.clone();
     }
 
     sync_credential_consumers(state)
 }
 
-/// 把当前凭据快照同步到 AI Provider 与 TTS 引擎。
-/// 单独成函数是为了让"磁盘已提交 B、内存/引擎发布失败"这一中间态可被显式检测与补偿。
+/// 把当前凭据快照同步到 AI Provider。
+/// 单独成函数是为了让"磁盘已提交 B、内存发布失败"这一中间态可被显式检测与补偿。
+/// （TTS 已于 2026-11-07 改用局域网曼波引擎，不再消费任何凭据，无需在此同步）
 fn sync_credential_consumers(state: &AppState) -> Result<(), String> {
     let snap = state.credentials_snapshot();
     state.ai_provider.set_api_key(snap.creds.chat_api_key.clone());
-
-    let cfg = state.config.lock().map_err(|e| e.to_string())?.clone();
-    // Manbo Key：用户现场值优先，其次随包凭据（见 pick_manbo_key）
-    let manbo_key = pick_manbo_key(&snap.creds, &cfg);
-    state.tts_mgr.update_config(TTSConfig {
-        engine: parse_tts_engine(&cfg.tts_engine),
-        enable_voice: cfg.enable_voice,
-        speech_rate: cfg.speech_rate,
-        speech_volume: cfg.speech_volume,
-        speech_pitch: cfg.speech_pitch,
-        manbo_api_key: manbo_key,
-        manbo_voice: cfg.manbo_voice.clone(),
-    });
     Ok(())
 }
 
@@ -2993,49 +2943,6 @@ fn gm_export_checkin_records(
     };
 
     save_text_file_with_dialog(&app_handle, &default_name, &format, &content)
-}
-
-/// 获取 Manbo 全量音色列表（供语音设置下拉，对齐原工程 ToolsMain.ManboVoiceList）
-#[tauri::command]
-fn get_manbo_voice_list() -> Vec<String> {
-    manbo_voices::MANBO_VOICE_LIST
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// 校验并归一化 Manbo API Key 输入（纯逻辑，便于单测）。
-/// 模板占位文本必须拒绝：把它写进注册表会重现"401 → 静默降级 SAPI"的故障。
-fn validate_manbo_key_input(key: &str) -> Result<String, String> {
-    let trimmed = key.trim();
-    if trimmed.is_empty() {
-        return Err("Manbo API Key 不能为空".into());
-    }
-    if credentials::is_placeholder_value(trimmed) {
-        return Err("请填写真实的 Manbo API Key（当前内容仍是模板占位文本）".into());
-    }
-    Ok(trimmed.to_string())
-}
-
-/// 保存 Manbo API Key（仅写本机注册表，不回传明文）。
-///
-/// 打包凭据缺失 / 轮换后的现场修复入口：保存后立即热更新 TTS 并清除 Manbo 熔断，
-/// 下一次播报即重试 Manbo。也用于「曼波」音色（付费端点）单独配置 Key。
-#[tauri::command]
-fn save_manbo_api_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
-    ensure_not_lite(&state, "TTS语音模块")?;
-    let key = validate_manbo_key_input(&key)?;
-    registry::write_manbo_api_key(&key)?;
-    {
-        let mut cfg = state.config.lock().map_err(|e| e.to_string())?;
-        cfg.manbo_api_key = key.clone();
-    }
-    let mut tts_cfg = state.tts_mgr.config_snapshot();
-    tts_cfg.manbo_api_key = key;
-    state.tts_mgr.update_config(tts_cfg);
-    state.tts_mgr.reset_manbo_health();
-    crate::log_info!("[TTS] Manbo API Key 已更新（仅写注册表），Manbo 熔断已重置");
-    Ok(())
 }
 
 /// 配置字符串 → TTS 引擎类型（"auto" 走自动级联；未知值按原工程默认 Manbo）
@@ -3310,10 +3217,9 @@ fn get_credentials_status(state: State<'_, AppState>) -> Result<CredentialsStatu
     let snap = state.credentials_snapshot();
     let loaded = snap.loaded && !snap.creds.app_id.is_empty();
     let mut status = snap.creds.to_status(loaded, &p.to_string_lossy());
-    // 展示"运行期实际生效"的密钥状态：Manbo Key 可经注册表/设置页兜底，
-    // 只看凭据文件会出现"文件里是占位值 → 明明能在界面填 Key 却一直显示未绑定"
+    // 展示"运行期实际生效"的密钥状态：对话 Key 可经配置镜像兜底，
+    // 只看凭据文件会出现"文件里是占位值 → 明明配置了 Key 却一直显示未绑定"
     if let Ok(cfg) = state.config.lock() {
-        status.has_manbo_key = !pick_manbo_key(&snap.creds, &cfg).is_empty();
         let chat_key = if !snap.creds.chat_api_key.trim().is_empty() {
             snap.creds.chat_api_key.clone()
         } else {
@@ -3624,8 +3530,6 @@ pub fn run() {
             get_checkin_status,
             get_missing_resources,
             confirm_action,
-            get_manbo_voice_list,
-            save_manbo_api_key,
             get_current_tts_engine,
             test_speech_volume,
             get_recent_logs,
@@ -3669,8 +3573,7 @@ impl AppState {
             speech_rate: 0,
             speech_volume: 100,
             speech_pitch: 0,
-            manbo_api_key: String::new(),
-            manbo_voice: String::new(),
+            ..Default::default()
         });
         let ai_provider = DeepSeekAIChatProvider::new(String::new());
         let danmu_processor = bilibili::DanmuProcessor::new();
@@ -4651,24 +4554,12 @@ mod tests {
         hostile.app_id = "9999".into();
         hostile.access_key_secret = "HACKED".into();
         hostile.deepseek_api_key = "sk-hacked".into();
-        hostile.manbo_api_key = "manbo-hacked".into();
 
         let new_cfg = sanitize_incoming_config(&state, hostile);
 
         assert_eq!(new_cfg.app_id, "4004", "前端 app_id 不得覆盖凭据文件");
         assert_eq!(new_cfg.access_key_secret, "TRUSTED_SECRET", "密钥不得被前端覆盖");
         assert_eq!(new_cfg.deepseek_api_key, "sk-trusted");
-        assert_eq!(new_cfg.manbo_api_key, "manbo-trusted", "Manbo Key 不得被前端覆盖");
-
-        // 用户现场保存的 Manbo Key 优先于随包凭据：配置保存不得把它打回旧值
-        state.config.lock().unwrap().manbo_api_key = "manbo-from-user".into();
-        let mut hostile2 = AppConfig::default();
-        hostile2.manbo_api_key = "manbo-hacked".into();
-        let new_cfg2 = sanitize_incoming_config(&state, hostile2);
-        assert_eq!(
-            new_cfg2.manbo_api_key, "manbo-from-user",
-            "用户现场 Key 必须优先于随包凭据与前端回传"
-        );
         println!("[PASS] test_config_save_ignores_frontend_secrets passed");
     }
 
@@ -4723,74 +4614,7 @@ mod tests {
         println!("[PASS] test_update_config_memory_applies_without_disk_write passed");
     }
 
-    /// Manbo Key 注入优先级：用户现场填写的注册表/配置值 > 随包凭据文件。
-    /// 随包 Key 过期或被判无效时，设置页保存的 Key 必须能覆盖它并在重启后保持。
-    #[test]
-    fn test_manbo_key_registry_overrides_packaged_credentials() {
-        let state = AppState::new_test();
-        state.config.lock().unwrap().manbo_api_key = "manbo-from-registry".into();
-
-        let mut builtin = fake_creds("6006", "S", "k");
-        builtin.manbo_api_key = "manbo-builtin".into();
-        state.publish_credentials(CredentialState {
-            creds: builtin.clone(),
-            loaded: true,
-            blocked_reason: None,
-        });
-        sync_credential_consumers(&state).unwrap();
-        assert_eq!(
-            state.tts_mgr.config_snapshot().manbo_api_key,
-            "manbo-from-registry",
-            "用户现场填写的 Key 必须优先于随包凭据"
-        );
-
-        // 注册表/配置为空（新安装）→ 使用随包凭据里的 Key
-        state.config.lock().unwrap().manbo_api_key = "".into();
-        state.publish_credentials(CredentialState {
-            creds: builtin,
-            loaded: true,
-            blocked_reason: None,
-        });
-        sync_credential_consumers(&state).unwrap();
-        assert_eq!(
-            state.tts_mgr.config_snapshot().manbo_api_key,
-            "manbo-builtin",
-            "没有用户 Key 时应使用随包凭据"
-        );
-        println!("[PASS] test_manbo_key_registry_overrides_packaged_credentials passed");
-    }
-
-    /// 占位 Key 与空 Key 都不得生效：凭据占位时回退配置镜像；两边都不可用则为空
-    #[test]
-    fn test_placeholder_manbo_key_falls_back() {
-        let mut cfg = AppConfig::default();
-        cfg.manbo_api_key = "manbo-from-registry".into();
-
-        let mut creds = Credentials::default();
-        creds.manbo_api_key = "REPLACE_ME_Manbo语音接口密钥_留空则回退本机注册表历史值".into();
-        assert_eq!(
-            pick_manbo_key(&creds, &cfg),
-            "manbo-from-registry",
-            "凭据占位值必须回退注册表/配置镜像"
-        );
-
-        creds.manbo_api_key = "".into();
-        cfg.manbo_api_key = "".into();
-        assert_eq!(pick_manbo_key(&creds, &cfg), "", "两边都不可用时为空");
-
-        // 输入校验：空 / 占位一律拒绝，合法 Key 去空白
-        assert!(validate_manbo_key_input("   ").is_err());
-        assert!(validate_manbo_key_input("在此填写Manbo密钥").is_err());
-        assert!(validate_manbo_key_input("REPLACE_ME_xxx").is_err());
-        assert_eq!(
-            validate_manbo_key_input("  real-key-123  ").unwrap(),
-            "real-key-123"
-        );
-
-        println!("[PASS] test_placeholder_manbo_key_falls_back passed");
-    }
-
-    /// 网络恢复信号：B 站长连重连成功时清除 Manbo 退避，让下一条播报立即重试云端音色
+    /// 网络恢复信号：B 站长连重连成功时清除曼波退避，让下一条播报立即重试曼波语音
     #[test]
     fn test_bili_reconnect_resets_manbo_backoff() {
         let state = AppState::new_test();

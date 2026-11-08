@@ -70,8 +70,6 @@
 * `set_overlay_locked(locked)` / `get_overlay_locked()`: 悬浮窗鼠标穿透 + 置顶（D2，运行时状态不持久化）。
 * `save_overlay_position(x, y)`: 悬浮窗拖动位置防抖落盘（→ `top_pos_x/y`，D2）。
 * `get_current_tts_engine()`: 当前实际引擎名 `manbo / sapi`（D1）。
-* `save_manbo_api_key(key)`: Manbo Key 仅写注册表，不落 JSON、不回传（D1）。
-* `get_manbo_voice_list()`: 185 项音色列表（D1）。
 * `get_recent_logs(limit, minLevel)` / `clear_recent_logs()`: 运行日志内存环读取/清空（D5）。
 * `end_app()`: 退出程序（E3）。与主窗口 `CloseRequested` 共用 `shutdown_app()` 清理链路：
   待写悬浮窗位置落盘（等价原工程 `WriteQueue::Flush`）→ 停止长连（`set_running(false)`，等价 `Disconnect/Destroy`）
@@ -162,7 +160,8 @@
                      播报泵（150ms 逐条出队，对齐原工程 Tick 语义）
                                    ▼
           speak_task(task)       ├─► 本地语音包命中（zip 优先）→ 直接播放
-                                 ├─► Manbo（曼波音色走 /apis/mbAIscvip，speed=rate×5）
+                                 ├─► 曼波引擎（局域网 GPT-SoVITS：GET /control 探测 → POST / UTF-8 JSON → WAV，
+                                 │   speed=1+rate×5%；部署包见 MamboTTS-Engine/README-部署说明.md）
                                  └─► Windows SAPI（中文音色 + SSML rate/volume/pitch）
                                    ▼
               AudioQueue（单播放线程 + mpsc，全部音频串行，防叠音）

@@ -69,7 +69,6 @@ pub struct CredentialsStatus {
     pub access_key_masked: String,
     pub chat_provider: String,
     pub has_chat_key: bool,
-    pub has_manbo_key: bool,
 }
 
 impl Credentials {
@@ -102,7 +101,6 @@ impl Credentials {
             access_key_masked,
             chat_provider: self.chat_provider.clone(),
             has_chat_key: !self.chat_api_key.is_empty(),
-            has_manbo_key: !self.manbo_api_key.is_empty(),
         }
     }
 }
@@ -402,7 +400,6 @@ mod tests {
         assert!(status.loaded);
         assert_eq!(status.app_id, "test_app_888");
         assert!(status.access_key_masked.contains("***"));
-        assert!(status.has_manbo_key);
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&temp_dir);

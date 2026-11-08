@@ -57,7 +57,7 @@ const DEFAULT_CONNECTION: ConnectionStatusPayload = {
 
 /** 引擎名 → 展示文案（对齐原工程 UpdateCurrentTTSEngineLabel） */
 const ENGINE_LABELS: Record<string, string> = {
-  manbo: "Manbo",
+  manbo: "曼波（局域网）",
   sapi: "Windows 本地语音",
 };
 
@@ -131,7 +131,6 @@ export const MainWindow: React.FC = () => {
   const [recentCheckins, setRecentCheckins] = useState<UserProfile[]>([]);
 
   // 语音设置（D1）
-  const [manboVoices, setManboVoices] = useState<string[]>([]);
   const [currentEngine, setCurrentEngine] = useState<string>("");
 
   // 悬浮窗锁定（D2）
@@ -273,9 +272,6 @@ export const MainWindow: React.FC = () => {
     fetchOverlayLocked();
     fetchMonsterDict();
     fetchRoster();
-    invoke<string[]>("get_manbo_voice_list")
-      .then(setManboVoices)
-      .catch((e) => console.error(e));
 
     const interval = setInterval(() => {
       fetchQueue();
@@ -1496,9 +1492,9 @@ export const MainWindow: React.FC = () => {
                       </div>
 
                       <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
-                        <span className="text-[10px] text-neutral-500 block">多引擎语音</span>
-                        <span className={`text-xs font-bold ${credStatus?.has_manbo_key ? "text-emerald-300" : "text-neutral-500"}`}>
-                          {credStatus?.has_manbo_key ? "Manbo 已绑定" : "本地语音"}
+                        <span className="text-[10px] text-neutral-500 block">曼波语音</span>
+                        <span className={`text-xs font-bold ${config.lan_engine_base_url ? "text-emerald-300" : "text-neutral-500"}`}>
+                          {config.lan_engine_base_url ? "局域网引擎已配置" : "本地语音"}
                         </span>
                       </div>
                     </>
@@ -1564,7 +1560,7 @@ export const MainWindow: React.FC = () => {
                 </div>
 
                 {/* 引擎与当前实际引擎 */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 pt-3 border-t border-neutral-800">
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3 pt-3 border-t border-neutral-800">
                   <div>
                     <label className="block text-[11px] text-neutral-400 mb-1">播报引擎</label>
                     <select
@@ -1573,7 +1569,7 @@ export const MainWindow: React.FC = () => {
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
                       <option value="auto">自动（按优先级依次尝试）</option>
-                      <option value="manbo">Manbo</option>
+                      <option value="manbo">曼波（局域网引擎）</option>
                       <option value="sapi">Windows 本地语音</option>
                     </select>
                   </div>
@@ -1597,26 +1593,25 @@ export const MainWindow: React.FC = () => {
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     />
                   </div>
-                  <div>
-                    <label className="block text-[11px] text-neutral-400 mb-1">
-                      音色选择（{manboVoices.length || 184} 种）
-                    </label>
-                    <select
-                      value={config.manbo_voice}
-                      onChange={(e) => applyConfigPatch({ manbo_voice: e.target.value })}
-                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
-                    >
-                      {(manboVoices.length > 0 ? manboVoices : [config.manbo_voice || "曼波"]).map((voice) => (
-                        <option key={voice} value={voice}>
-                          {voice === "曼波" ? "曼波（付费）" : voice}
-                        </option>
-                      ))}
-                      {manboVoices.length > 0 && !manboVoices.includes(config.manbo_voice) && (
-                        <option value={config.manbo_voice}>{config.manbo_voice}</option>
-                      )}
-                    </select>
-                  </div>
                 </div>
+
+                {/* 局域网曼波引擎（GPT-SoVITS 部署包，部署见包内 README.md 与对接契约变更-20261107）：
+                    地址为空时曼波播报自动降级本地语音；选 Windows 本地语音时无需配置。
+                    参考音频已引擎侧固化，无需（也无法）在工具侧配置 */}
+                {config.tts_engine !== "sapi" && (
+                  <div className="pt-3 border-t border-neutral-800">
+                    <label className="block text-[11px] text-neutral-400 mb-1">
+                      曼波引擎地址（局域网 GPT-SoVITS）
+                    </label>
+                    <input
+                      type="text"
+                      value={config.lan_engine_base_url}
+                      placeholder="http://引擎机IP:9880"
+                      onChange={(e) => applyConfigPatch({ lan_engine_base_url: e.target.value })}
+                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
+                    />
+                  </div>
+                )}
 
                 {/* 语速 / 音量 / 音高 */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">

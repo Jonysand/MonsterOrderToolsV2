@@ -29,9 +29,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub volume_scale: i32,
     pub speech_pitch: i32,
-    #[serde(skip_serializing)]
-    pub manbo_api_key: String,
-    pub manbo_voice: String,
+    /// 局域网曼波引擎（GPT-SoVITS）基础地址，如 `http://192.168.1.50:9880`；
+    /// 空 = 未配置，曼波播报降级本地 SAPI。
+    /// 参考音频已引擎侧固化（2026-11-07 契约变更），工具侧无对应配置
+    #[serde(default)]
+    pub lan_engine_base_url: String,
     pub tts_cache_days_to_keep: i32,
 
     // 3. 弹幕与播报过滤配置
@@ -74,9 +76,7 @@ impl Default for AppConfig {
             speech_volume: 50,
             volume_scale: 2,
             speech_pitch: 0,
-            manbo_api_key: String::new(),
-            // 原工程默认音色为「曼波」（专用端点 /apis/mbAIscvip，speed = speech_rate × 5）
-            manbo_voice: "曼波".into(),
+            lan_engine_base_url: String::new(),
             tts_cache_days_to_keep: 7,
 
             only_medal_order: true,
@@ -184,7 +184,7 @@ impl AppConfig {
     }
 
     /// 把原工程 MainConfig.cfg 的旧格式映射到 V2 配置。
-    /// 旧文件键为 SCREAMING_SNAKE；idCode / manboApiKey 不落 JSON（走注册表）。
+    /// 旧文件键为 SCREAMING_SNAKE；idCode 不落 JSON（走注册表）。
     fn from_legacy(v: &serde_json::Value) -> Self {
         let mut cfg = Self::default();
         // 原工程配置为旧音量刻度：标记归零，交由 load 出口统一减半换算；
@@ -235,7 +235,6 @@ impl AppConfig {
 
         set_str!("DEFAULT_MARQUEE_TEXT", default_marquee_text);
         set_str!("TTS_ENGINE", tts_engine);
-        set_str!("MANBO_VOICE", manbo_voice);
         set_int!("TTS_CACHE_DAYS_TO_KEEP", tts_cache_days_to_keep);
         set_bool!("ENABLE_CAPTAIN_CHECKIN_AI", enable_captain_checkin_ai);
         set_str!("CHECKIN_TRIGGER_WORDS", checkin_trigger_words);
@@ -279,16 +278,6 @@ impl AppConfig {
             }
         }
 
-        // Manbo API Key 同样以注册表为权威来源（与 idCode 同级）
-        let reg_manbo_key = crate::registry::read_manbo_api_key().unwrap_or_default();
-        if !reg_manbo_key.trim().is_empty() {
-            cfg.manbo_api_key = reg_manbo_key;
-        } else if !cfg.manbo_api_key.trim().is_empty() {
-            if let Err(e) = crate::registry::write_manbo_api_key(&cfg.manbo_api_key) {
-                crate::log_warn!("[Config] ManboApiKey 迁移写入注册表失败: {}", e);
-            }
-        }
-
         cfg
     }
 
@@ -316,7 +305,6 @@ impl AppConfig {
         c.app_id.clear();
         c.access_key_id.clear();
         c.access_key_secret.clear();
-        c.manbo_api_key.clear();
         c.deepseek_api_key.clear();
         c
     }
@@ -375,11 +363,6 @@ impl AppConfig {
                 crate::log_warn!("[Config] IdCode 写入注册表失败: {}", e);
             }
         }
-        if !self.manbo_api_key.trim().is_empty() {
-            if let Err(e) = crate::registry::write_manbo_api_key(&self.manbo_api_key) {
-                crate::log_warn!("[Config] ManboApiKey 写入注册表失败: {}", e);
-            }
-        }
     }
 }
 
@@ -428,7 +411,6 @@ mod tests {
     #[test]
     fn test_save_with_empty_credentials_keeps_registry_untouched() {
         let before_id = crate::registry::read_id_code().unwrap_or_default();
-        let before_key = crate::registry::read_manbo_api_key().unwrap_or_default();
 
         let temp_dir = std::env::temp_dir().join("mh_test_config_registry");
         let _ = fs::create_dir_all(&temp_dir);
@@ -436,18 +418,12 @@ mod tests {
 
         let mut cfg = AppConfig::default();
         cfg.id_code.clear();
-        cfg.manbo_api_key.clear();
         cfg.save(Some(&path)).expect("空凭据时文件保存应成功");
 
         assert_eq!(
             crate::registry::read_id_code().unwrap_or_default(),
             before_id,
             "空 id_code 不得改写注册表"
-        );
-        assert_eq!(
-            crate::registry::read_manbo_api_key().unwrap_or_default(),
-            before_key,
-            "空 manbo_api_key 不得改写注册表"
         );
 
         let _ = fs::remove_file(&path);
@@ -466,17 +442,16 @@ mod tests {
         cfg.app_id = "SECRET_APP_ID".into();
         cfg.access_key_id = "SECRET_AK_ID".into();
         cfg.access_key_secret = "SECRET_AK_SECRET".into();
-        cfg.manbo_api_key = "SECRET_MANBO".into();
         cfg.deepseek_api_key = "SECRET_DEEPSEEK".into();
         cfg.opacity = 77;
 
         let secret_keys = [
             "id_code", "app_id", "access_key_id", "access_key_secret",
-            "manbo_api_key", "deepseek_api_key",
+            "deepseek_api_key",
         ];
         let secret_values = [
             "SECRET_ID_CODE", "SECRET_APP_ID", "SECRET_AK_ID", "SECRET_AK_SECRET",
-            "SECRET_MANBO", "SECRET_DEEPSEEK",
+            "SECRET_DEEPSEEK",
         ];
 
         // 1. 序列化结果（返回前端 / 落盘的同一来源）不含敏感键与明文
@@ -490,12 +465,11 @@ mod tests {
         assert!(json_text.contains("opacity") && json_text.contains("77"), "常规字段必须保留: {}", json_text);
 
         // 2. save() 落盘文件同样不含敏感键与明文。
-        //    注：id_code / manbo_api_key 非空时 save() 会同步写注册表（测试下为隔离子键），
+        //    注：id_code 非空时 save() 会同步写注册表（测试下为隔离子键），
         //    为避免与 registry roundtrip 测试在同一隔离子键上并行竞争，
         //    落盘路径改用空值（其"键不出现"由同一 skip_serializing 机制保证），值断言由非注册表字段承担
         let mut save_cfg = cfg.clone();
         save_cfg.id_code = String::new();
-        save_cfg.manbo_api_key = String::new();
         save_cfg.save(Some(&path)).unwrap();
         let file_text = fs::read_to_string(&path).unwrap();
         for key in secret_keys {
@@ -505,8 +479,8 @@ mod tests {
             assert!(!file_text.contains(secret), "落盘文件不应包含明文凭据 {}: {}", secret, file_text);
         }
 
-        // 3. 反序列化兼容：历史配置中的敏感键/已移除键（如 mimo_api_key）仍可读取，未知键被忽略不报错
-        let legacy = r#"{"id_code":"LEGACY_ID","mimo_api_key":"LEGACY_MIMO","opacity":60}"#;
+        // 3. 反序列化兼容：历史配置中的敏感键/已移除键（如 mimo_api_key / manbo_voice）仍可读取，未知键被忽略不报错
+        let legacy = r#"{"id_code":"LEGACY_ID","mimo_api_key":"LEGACY_MIMO","manbo_voice":"曼波","manbo_api_key":"LEGACY_MANBO","opacity":60}"#;
         let parsed = AppConfig::parse_content(legacy, None);
         assert_eq!(parsed.id_code, "LEGACY_ID");
         assert_eq!(parsed.opacity, 60);
@@ -515,7 +489,7 @@ mod tests {
         let s = cfg.sanitized();
         assert_eq!(s.id_code, "SECRET_ID_CODE");
         assert!(s.app_id.is_empty() && s.access_key_id.is_empty() && s.access_key_secret.is_empty());
-        assert!(s.manbo_api_key.is_empty() && s.deepseek_api_key.is_empty());
+        assert!(s.deepseek_api_key.is_empty());
         assert_eq!(s.opacity, 77);
 
         let _ = fs::remove_file(&path);
@@ -683,7 +657,6 @@ mod tests {
         assert_eq!(cfg.opacity, 80);
         assert_eq!(cfg.penetrating_mode_opacity, 50);
         assert_eq!(cfg.tts_engine, "sapi");
-        assert_eq!(cfg.manbo_voice, "曼波");
         assert_eq!(cfg.checkin_trigger_words, "打卡,签到");
         assert_eq!(cfg.default_marquee_text, "发送'点怪 xxx'进行点怪");
         assert_eq!(cfg.top_pos_x, 913.0);

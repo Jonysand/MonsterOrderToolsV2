@@ -276,20 +276,30 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 - **验收**：`test_sapi_ssml_and_command`（SSML 转义/符号、rate 钳制、volume 减半、中文音色与 SpeakSsml 调用）。
 - **Lite**：不支持。
 
-### B5 Manbo 默认音色与端点映射 ✅
-- **实施**：默认音色改回 `"曼波"`（`TTSConfig::default` 与 `AppConfig::default` 同步）；MiMo 默认值对齐原工程（`mimo_default` / 空 style）；`build_manbo_url` 端点选择与参数对齐原工程（`曼波` → `/apis/mbAIscvip`，`speed = speech_rate × 5`，`key` 参数 + `Authorization: Bearer`；其它音色 → `/apis/AIvoice`）。
-- **音色列表**：新增 `src-tauri/src/manbo_voices.rs`（原工程 `ToolsMain.ManboVoiceList` 全量 185 项，已校验无重复），新增 `get_manbo_voice_list` 命令供前端下拉（UI 落地见 D1）。
-- **验收**：`test_manbo_url_building`、`test_manbo_voice_list_data`、`test_tts_circuit_breaker_and_cooldown_recovery`。
+### B5 Manbo 默认音色与端点映射 ✅ → ♻️ 已于 2026-11-07 被局域网引擎替代
+> ⚠️ **云端 Manbo 链路整体退场**（`/apis/mbAIscvip` 付费端点 + `/apis/AIvoice` 通用音色端点）：
+> 免 Key 试用端点被服务方下架后，选定局域网自建 GPT-SoVITS（Tsukimisaka/MamboTTS，自带曼波模型）
+> 作为唯一合成音源。`build_manbo_url` / `manbo_voices.rs`（185 音色列表）/ Manbo Key 全链路
+> （TTSConfig、AppConfig、注册表镜像、`save_manbo_api_key`）一并移除，音色下拉收起。
+- ~~原实施：默认音色 `"曼波"`；`build_manbo_url` 端点映射（`曼波` → `/apis/mbAIscvip`，其余 → `/apis/AIvoice`）；185 项音色列表与 `get_manbo_voice_list` 命令。~~
+- **现实施**：局域网引擎 `synthesize_lan`（`tts.rs`）：GET `/control` 就绪探测（2s 快速失败）→ POST `/`
+  UTF-8 JSON（**定稿最小契约：仅 `text` / `text_language=zh` / `speed`；参考音频已引擎侧固化
+  `-dr/-dt/-dl` 预设，refer 三字段整段省略**）→ WAV 二进制（实测契约 `Content-Type: audio/wav` +
+  chunked，体即完整 WAV 流；`audio/*` 前缀校验 + RIFF 头校验双兜底）→ 复用既有熔断退避与 SAPI 兜底。
+  语速映射 `speed = 1 + rate×5%`（钳制 0.5~1.5）；音量沿用播放端增益。配置仅 `lan_engine_base_url`
+  一项（`lan_engine_refer_path` 已随契约变更删除）。部署包与接口契约见
+  `MamboTTS-Engine/README.md` 与 `F:\ManboTTS\package\对接契约变更-20261107.md`
+  （引擎机 `0.0.0.0:9880`，防火墙放行 9880/TCP）。
+- **验收**：`test_lan_engine_urls_and_payload`、`test_lan_engine_timeout_budget`、
+  `test_update_config_resets_manbo_health_on_engine_or_lan_change`。
 - **Lite**：不支持。
 
 ### B6 特殊用户专属 TTS 引擎 ✅ → ❌ 已于 2026-11-07 移除
-> ⚠️ **该功能已下线**：服务方下架了免 Key 试用端点 `/apis/mbAIsc`（API 404「曼波配音生成试用版已下架」）。
-> 已移除专属引擎、`SpecialEngineHealth` 熔断（3 次失败 / 30s 冷却）与 `build_special_manbo_url`；
-> 特殊用户不再有专属云端语音，播报与普通用户走同一引擎链（Manbo → 本地 SAPI）。
+> ⚠️ **该功能已下线**：服务方下架了免 Key 试用端点 `/apis/mbAIsc`（API 404「曼波配音生成试用版已下架」），
+> 同日云端 Manbo 整体被局域网引擎替代（见 B5），特殊用户与普通用户走同一引擎链。
 > 特殊用户的 GM 排队置前（`queue.rs`）与本地特殊音效（`bilibili.rs`）不受影响。
 - **原实现**：`SpecialManboTTSProvider`（`/apis/mbAIsc`，无 key/无 Authorization）+ 3 次失败 / 30s 熔断 + 失败后回落通用链。
-- **移除验收**：`test_manbo_url_building`（原 special 断言删除）、`test_special_engine_circuit_breaker` 删除。
-- **Lite**：不支持。
+- **移除验收**：`test_special_engine_circuit_breaker` 删除。
 
 ### B7 TTS 音频留档与清理 ✅
 > ⚠️ **本条的「原实现修正」结论已于 2026-09-19 全量审计中更正，见 [AUDIT_FIX_REPORT.md](AUDIT_FIX_REPORT.md) 第四节「更正 2」。**
@@ -411,10 +421,11 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 > 对照实现：`ConfigWindow.xaml(.cs)`、`OrderedMonsterWindow.xaml(.cs)`、`AIBubbleControl.xaml`、`DanmuManager.cs:48-63`、`BliveManager.h/.cpp`（连接状态机）、`WriteLog.cpp`（日志）
 
 ### D1 语音设置区补全 ✅
-- **引擎「自动」**：`TTSEngineType::Auto`（`tts.rs`）+ `select_active_engine` 级联 Manbo → MiMo → SAPI，对齐原工程 `TTSProviderFactory::Create` 的 AUTO 模式；`parse_tts_engine` 统一字符串映射（未知值按原工程默认 Manbo）。
-- **当前实际引擎实时显示**：`TTSManager.active_engine` 在每次播报成功路径记录；命令 `get_current_tts_engine` 返回 `manbo/xiaomi/sapi`（对齐 `TTSManager_GetCurrentProviderName` 命名），前端每 2.5s 刷新并映射为 `Manbo / 小米MiMo / Windows SAPI / 未知`。
-- **Manbo API Key**：密码框 + `save_manbo_api_key` 命令（**仅写注册表，不落 JSON、不回传明文**；空值不覆盖）；占位文案随凭据状态切换。
-- **184 音色下拉**：`get_manbo_voice_list`（185 项）驱动，保留历史配置中不在列表内的音色。
+- **引擎「自动」**：`TTSEngineType::Auto`（`tts.rs`）+ `select_active_engine` 级联 曼波引擎（局域网） → SAPI，对齐原工程 `TTSProviderFactory::Create` 的 AUTO 模式；`parse_tts_engine` 统一字符串映射（未知值按原工程默认 Manbo）。
+- **当前实际引擎实时显示**：`TTSManager.active_engine` 在每次播报成功路径记录；命令 `get_current_tts_engine` 返回 `manbo/sapi`（对齐 `TTSManager_GetCurrentProviderName` 命名），前端每 2.5s 刷新并映射为 `曼波（局域网） / Windows 本地语音 / 未知`。
+- **局域网引擎设置**（2026-11-07 起，替代原 Manbo API Key 密码框与 184 音色下拉）：引擎地址
+  `lan_engine_base_url`（如 `http://引擎机IP:9880`，空 = 曼波降级本地语音）与参考音频路径
+  `lan_engine_refer_path`（引擎机侧 `models\refer.wav` 绝对路径），均为普通配置项随 configs.json 持久化。
 - **语速/音量/音高**：语音音量终案 **`0~100` 直通**（100 = SAPI 满档 / rodio 满量增益；SAPI 侧经 `sapi_volume_from` 对数曲线反补偿，与 Manbo 任意档位响度对齐。历史沿革：原工程为 0~200 滑块 + SAPI `Volume 减半`，V2 曾短暂改回 0~200 两倍刻度随 0.1.10 发布，后收口为 0~100 并对旧值减半迁移）；音高、语速 ±10。
 - **MiMo 角色/风格**：`mimo_voice`（默认/中文/英文）、`mimo_style`（默认 + 5 种）下拉，与原工程 `MimoVoiceComboBox / MimoStyleComboBox` 选项逐项一致。
 - **缓存天数 / 过滤开关 / 总开关**：`tts_cache_days_to_keep`（1~365 钳制）、`enable_voice` 总开关、`only_speek_wearing_medal`、`only_speek_paid_gift`、`only_speek_guard_level`（所有人/舰长/提督/总督）、舰长打卡 AI 开关与触发词。

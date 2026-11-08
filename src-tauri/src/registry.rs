@@ -1,7 +1,6 @@
 ﻿/// 注册表持久化模块：遵循原工程规范存储在 HKCU\Software\MonsterOrderWilds\IdCode
 pub const REG_SUBKEY: &str = "Software\\MonsterOrderWilds";
 pub const REG_VALUE_ID_CODE: &str = "IdCode";
-pub const REG_VALUE_MANBO_API_KEY: &str = "ManboApiKey";
 
 /// 实际生效的注册表子键。
 ///
@@ -379,23 +378,6 @@ pub fn delete_id_code() -> Result<(), String> {
     platform::delete_reg_value(registry_subkey(), REG_VALUE_ID_CODE)
 }
 
-/// 读取 Manbo API Key。
-/// 遵循原工程规范：ManboApiKey 与 IdCode 同级独立持久化，不落入常规 JSON 配置
-pub fn read_manbo_api_key() -> Result<String, String> {
-    platform::read_reg_string(registry_subkey(), REG_VALUE_MANBO_API_KEY)
-}
-
-/// 写入 Manbo API Key
-/// （Windows：HKCU\Software\MonsterOrderWilds；其他平台：加密的 registry.dat）
-pub fn write_manbo_api_key(key: &str) -> Result<(), String> {
-    platform::write_reg_string(registry_subkey(), REG_VALUE_MANBO_API_KEY, key)
-}
-
-/// 删除持久化的 ManboApiKey（主要用于单元测试与环境清理）
-pub fn delete_manbo_api_key() -> Result<(), String> {
-    platform::delete_reg_value(registry_subkey(), REG_VALUE_MANBO_API_KEY)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,26 +501,5 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         println!("[PASS] test_registry_store_rejects_tampered_content passed");
-    }
-
-    #[test]
-    fn test_registry_manbo_api_key_roundtrip() {
-        // 同 test_registry_id_code_roundtrip：读写发生在隔离子键，真实注册表不受影响
-        let original = read_manbo_api_key().unwrap_or_default();
-
-        let test_key = "TEST_MANBO_API_KEY_123456";
-        let write_res = write_manbo_api_key(test_key);
-        assert!(write_res.is_ok(), "写入 ManboApiKey 失败: {:?}", write_res);
-
-        let read_back = read_manbo_api_key().unwrap_or_default();
-        assert_eq!(read_back, test_key, "ManboApiKey 回读值与写入值不匹配");
-
-        if original.is_empty() {
-            let _ = delete_manbo_api_key();
-        } else {
-            let _ = write_manbo_api_key(&original);
-        }
-
-        println!("[PASS] test_registry_manbo_api_key_roundtrip passed");
     }
 }

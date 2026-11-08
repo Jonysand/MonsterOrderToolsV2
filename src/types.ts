@@ -70,7 +70,7 @@ export interface RetroactiveCardData {
   last_earned_date: number;
 }
 
-// 敏感字段（app_id / access_key_* / manbo_api_key / deepseek_api_key）
+// 敏感字段（app_id / access_key_* / deepseek_api_key）
 // 运行时恒为空串：权威来源为 credentials.dat（应用凭据状态走 get_credentials_status）；
 // 保存配置时回传空值不会清空已有凭据。id_code 权威来源为 Windows 注册表。
 export interface AppConfig {
@@ -87,8 +87,9 @@ export interface AppConfig {
   /** 音量刻度版本（2 = 新刻度），前端原样回传即可 */
   volume_scale: number;
   speech_pitch: number;
-  manbo_api_key: string;
-  manbo_voice: string;
+  /** 局域网曼波引擎（GPT-SoVITS）基础地址，如 http://192.168.1.50:9880；空 = 未配置。
+   *  参考音频已引擎侧固化（2026-11-07 契约变更），工具侧无对应配置 */
+  lan_engine_base_url: string;
   tts_cache_days_to_keep: number;
 
   only_medal_order: boolean;
@@ -127,7 +128,6 @@ export interface CredentialsStatus {
   access_key_masked: string;
   chat_provider: string;
   has_chat_key: boolean;
-  has_manbo_key: boolean;
 }
 
 // ---------- D7 连接状态机（五态 + 断连原因） ----------

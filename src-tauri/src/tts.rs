@@ -1,9 +1,14 @@
 ﻿//! 多引擎 TTS 语音域。
-//! 对照原工程实现：`TextToSpeech.cpp` / `ManboTTSProvider.cpp` /
-//! `TTSCacheManager.cpp` / `LocalVoiceManager.cpp`。
-//! 原工程的 `SpecialManboTTSProvider.cpp`（特殊用户专属曼波）已于 2026-11-07 移除：
-//! 服务方下架了免 Key 试用端点 `/apis/mbAIsc`（API 404「试用版已下架」），
-//! 特殊用户不再有专属云端语音，与普通用户走同一引擎链（排队置前与本地特殊音效不受影响）。
+//! 合成音源为**局域网曼波引擎**（GPT-SoVITS 图形客户端自带曼波模型，部署于局域网另一台
+//! 机器，部署包与接口契约见 `F:\ManboTTS\package\MamboTTS-Engine\README.md`
+//! 与 `对接契约变更-20261107.md`，zip 定稿 SHA256 见后者）；本地离线兜底为 Windows SAPI / macOS say。
+//! 对照原工程实现：`TextToSpeech.cpp` / `TTSCacheManager.cpp` / `LocalVoiceManager.cpp`。
+//! 迁移史：原云端 Manbo（api.milorapart.top）已于 2026-11-07 移除 —— 免 Key 试用端点
+//! `/apis/mbAIsc` 被服务方下架（API 404），通用音色端点 `/apis/AIvoice` 与付费端点
+//! `/apis/mbAIscvip` 一并退场，由局域网引擎整体替代（原工程 `SpecialManboTTSProvider.cpp`
+//! / `ManboTTSProvider.cpp` 对应能力由本地 GPT-SoVITS 部署包承接）。
+//! 引擎包定稿后参考音频已引擎侧固化（启动参数 `-dr/-dt/-dl` 预设），请求体只发
+//! `text / text_language / speed`，refer 三字段整段省略（2026-11-07 契约变更）。
 
 #[cfg(not(test))]
 use rodio::{Decoder, OutputStream, Sink};
@@ -59,8 +64,11 @@ pub struct TTSConfig {
     pub speech_rate: i32,
     pub speech_volume: i32,
     pub speech_pitch: i32,
-    pub manbo_api_key: String,
-    pub manbo_voice: String,
+    /// 局域网曼波引擎（GPT-SoVITS）基础地址，如 `http://192.168.1.50:9880`。
+    /// 空 = 未配置：曼波播报直接降级本地 SAPI（不熔断，属配置问题而非服务故障）。
+    /// 参考音频已引擎侧固化（2026-11-07 契约变更），工具侧无对应配置
+    #[serde(default)]
+    pub lan_engine_base_url: String,
 }
 
 impl Default for TTSConfig {
@@ -72,9 +80,7 @@ impl Default for TTSConfig {
             // 50 = 原工程默认 100（旧满量 200 的一半）的等效响度
             speech_volume: 50,
             speech_pitch: 0,
-            manbo_api_key: String::new(),
-            // 原工程默认音色为「曼波」，走 /apis/mbAIscvip 专用端点
-            manbo_voice: "曼波".into(),
+            lan_engine_base_url: String::new(),
         }
     }
 }
@@ -132,7 +138,7 @@ pub(crate) fn fire_play_notice(notice: &BubbleNotice) {
 enum AudioJob {
     /// 本地音效：增益 = volume_gain（不做语音响度校准）
     Bytes { bytes: Vec<u8>, volume: i32 },
-    /// 云端 TTS 语音（Manbo）：增益 = volume_gain × MANBO_LOUDNESS_GAIN（响度与 SAPI 对齐）
+    /// 曼波引擎语音（局域网 GPT-SoVITS WAV）：增益 = volume_gain × MANBO_LOUDNESS_GAIN（响度与 SAPI 对齐）
     TtsBytes {
         bytes: Vec<u8>,
         volume: i32,
@@ -293,14 +299,13 @@ pub fn volume_gain(speech_volume: i32) -> f32 {
     (speech_volume.clamp(0, 100) as f32) / 100.0
 }
 
-/// Manbo 云端语音响度校准增益：实测「佩奇猪」音色原始输出 RMS 与
-/// Windows SAPI 满档（$s.Volume=100，Huihui）对齐所得（三次测量 0.748/0.741/0.724，
-/// 中位数取 0.74，即佩奇猪原始输出比 SAPI 满档约响 2.6 dB，需衰减对齐），
-/// 测量工具见 `test_manbo_peiqi_loudness_calibration`（#[ignore]，可复跑）。
-/// 仅应用于云端 TTS 流；本地音效保持各自原始响度，不受此系数影响。
+/// 曼波引擎语音响度校准增益：按原云端 Manbo「佩奇猪」实测校准（中位数 0.74），
+/// 局域网 GPT-SoVITS 引擎输出响度未单独标定，沿用同一系数避免切换后音量突跳；
+/// 如需精调可参照旧测量方法对引擎输出重新标定后回填。
+/// 仅应用于曼波引擎 TTS 流；本地音效保持各自原始响度，不受此系数影响。
 pub const MANBO_LOUDNESS_GAIN: f32 = 0.74;
 
-/// 云端 TTS 流的 rodio 增益 = 用户刻度增益 × 响度校准系数
+/// 曼波引擎 TTS 流的 rodio 增益 = 用户刻度增益 × 响度校准系数
 pub fn tts_stream_gain(speech_volume: i32) -> f32 {
     volume_gain(speech_volume) * MANBO_LOUDNESS_GAIN
 }
@@ -557,8 +562,9 @@ pub fn content_prefix(text: &str) -> String {
     }
 }
 
-/// 将播放成功的签到/补签音频留档（对齐原工程 `TTSCacheManager::SaveCheckinAudio`：`打卡_{用户名}_{时间戳}.mp3`）。
+/// 将播放成功的签到/补签音频留档（对齐原工程 `TTSCacheManager::SaveCheckinAudio`）。
 /// 原工程仅对签到 AI 回复音频留档，一般弹幕 TTS 播完即丢（v24 决策）。
+/// 扩展名按内容探测：曼波引擎返回 WAV（RIFF 头）存 `.wav`，其余存 `.mp3`。
 pub fn save_checkin_audio(username: &str, bytes: &[u8]) -> Option<PathBuf> {
     let safe_name: String = username
         .chars()
@@ -567,7 +573,8 @@ pub fn save_checkin_audio(username: &str, bytes: &[u8]) -> Option<PathBuf> {
     let dir = cache_base_dir().join(chrono::Local::now().format("%Y%m%d").to_string());
     std::fs::create_dir_all(&dir).ok()?;
     let ts = chrono::Local::now().timestamp_millis();
-    let path = dir.join(format!("打卡_{}_{}.mp3", safe_name, ts));
+    let ext = if bytes.starts_with(b"RIFF") { "wav" } else { "mp3" };
+    let path = dir.join(format!("打卡_{}_{}.{}", safe_name, ts, ext));
     std::fs::write(&path, bytes).ok()?;
     Some(path)
 }
@@ -918,13 +925,11 @@ impl Default for TTSManager {
 }
 
 impl TTSManager {
-    /// 单跳生成请求超时。
-    /// Manbo 冷生成实测 2.0–4.6s（2026-10-22 复测），旧的 3s 会在服务端稍慢时
-    /// 于读取响应体阶段被掐断，表现为 `error decoding response body` 并静默降级 SAPI。
+    /// 单跳合成请求超时。
+    /// 局域网 GPT-SoVITS FP32 实测短句 0.6s / 中句 1.2s / 长句 2.0s（1080 Ti），
+    /// 10s 足够覆盖偶发慢合成；就绪探测在 [`Self::LAN_PROBE_TIMEOUT`] 内单独收紧到 2s。
     pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-    /// 第二跳音频下载超时：CDN 正常 1s 内；给 5s 足够，晚了就说明链路异常，早点降级
-    pub const AUDIO_TIMEOUT: Duration = Duration::from_secs(5);
-    /// Manbo 退避首档：网络瞬断后 5s 就重试，避免长时间卡在本地语音
+    /// Manbo 退避首档：引擎瞬断后 5s 就重试，避免长时间卡在本地语音
     pub const MANBO_BACKOFF_BASE_SECS: u64 = 5;
     /// 退避上限：持续故障时最多 30s 探活一次；网络恢复后下一次播报即回到 Manbo
     pub const MANBO_BACKOFF_MAX_SECS: u64 = 30;
@@ -1085,20 +1090,17 @@ impl TTSManager {
 
     /// 更新 TTS 配置。
     ///
-    /// 引擎、音色或 Manbo Key 变化时**重置 Manbo 熔断与退避**：这些都是主播的显式
-    /// 修复动作，不该被上一次故障留下的冷却期挡住 —— 否则观感就是"所有曼波音色都失效了"。
+    /// 引擎或局域网引擎地址变化时**重置曼波熔断与退避**：这些都是主播的显式
+    /// 修复动作，不该被上一次故障留下的冷却期挡住 —— 否则改完配置还得等退避窗口才生效。
     pub fn update_config(&self, new_cfg: TTSConfig) {
-        let (engine_changed, voice_changed, key_changed) = {
+        let changed = {
             let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-            let changed = (
-                cfg.engine != new_cfg.engine,
-                cfg.manbo_voice != new_cfg.manbo_voice,
-                cfg.manbo_api_key != new_cfg.manbo_api_key,
-            );
+            let changed = cfg.engine != new_cfg.engine
+                || cfg.lan_engine_base_url != new_cfg.lan_engine_base_url;
             *cfg = new_cfg;
             changed
         };
-        if engine_changed || voice_changed || key_changed {
+        if changed {
             self.reset_manbo_health();
         }
     }
@@ -1173,7 +1175,7 @@ impl TTSManager {
     }
 
     /// 标记引擎请求成功：清零连续失败计数并立即恢复健康。
-    /// 网络恢复后的第一次成功播报会走这里，后续播报马上回到 Manbo。
+    /// 引擎恢复后的第一次成功播报会走这里，后续播报马上回到曼波语音。
     pub fn mark_engine_success(&self, engine: TTSEngineType) {
         match engine {
             TTSEngineType::Auto => {}
@@ -1188,7 +1190,7 @@ impl TTSManager {
                 self.mark_active_engine(TTSEngineType::Manbo);
                 if previous_failures > 0 {
                     crate::log_info!(
-                        "[TTS] Manbo 已恢复（此前连续失败 {} 次），后续播报回到云端音色",
+                        "[TTS] 曼波引擎已恢复（此前连续失败 {} 次），后续播报回到曼波语音",
                         previous_failures
                     );
                 }
@@ -1294,36 +1296,125 @@ impl TTSManager {
         }
     }
 
-    /// 该音色是否必须携带 Manbo API Key。
-    /// 只有「曼波」走付费端点 `/apis/mbAIscvip`（key 参数）；其余音色走 `/apis/AIvoice`
-    /// 不需要 Key —— 因此缺 Key 时只应影响「曼波」，不能把整个 Manbo 引擎判死。
-    pub fn manbo_voice_requires_key(voice: &str) -> bool {
-        voice == "曼波"
+    /// 就绪探测超时：引擎冷启动约 20s~1 分钟，未就绪必须快速失败交给熔断退避，
+    /// 不能拖住正常播报（合成跳另有 [`Self::REQUEST_TIMEOUT`] 兜底）。
+    pub const LAN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// 规范化引擎基础地址：去首尾空白与结尾 `/`（拼接探测/合成路径用）
+    pub fn normalize_lan_base_url(base: &str) -> String {
+        base.trim().trim_end_matches('/').to_string()
     }
 
-    /// Manbo 通用引擎请求地址构建（对齐原工程 ManboTTSProvider::BuildRequestUrl）
-    pub fn build_manbo_url(cfg: &TTSConfig, text: &str) -> String {
-        if Self::manbo_voice_requires_key(&cfg.manbo_voice) {
-            format!(
-                "https://api.milorapart.top/apis/mbAIscvip?text={}&format=mp3&speed={}&key={}",
-                url_encode(text),
-                cfg.speech_rate * 5,
-                url_encode(&cfg.manbo_api_key)
-            )
+    /// 就绪探测地址（GPT-SoVITS API：GET /control，200 = 模型加载完毕）
+    pub fn build_lan_control_url(base: &str) -> String {
+        format!("{}/control", Self::normalize_lan_base_url(base))
+    }
+
+    /// 合成请求地址（POST /，UTF-8 JSON，返回 WAV 二进制流）
+    pub fn build_lan_synthesis_url(base: &str) -> String {
+        format!("{}/", Self::normalize_lan_base_url(base))
+    }
+
+    /// 语速滑杆（-10..10）→ GPT-SoVITS `speed` 因子（1.0 = 常速）。
+    /// 每档 ±5%，全档 0.5~1.5 并钳制，避免极端变速导致发音破损。
+    pub fn lan_speed_factor(speech_rate: i32) -> f64 {
+        (1.0 + f64::from(speech_rate) * 0.05).clamp(0.5, 1.5)
+    }
+
+    /// 构建合成请求 JSON 体（2026-11-07 定稿最小契约：仅 `text` + `text_language` 必填，
+    /// 工具侧保留 `speed`；参考音频由引擎启动参数 `-dr/-dt/-dl` 固化预设，refer 三字段
+    /// 整段省略——裸跑 api.py 不带预设时最小请求会被引擎以 400 拒绝，属预期约束）
+    fn build_lan_payload(text: &str, speech_rate: i32) -> serde_json::Value {
+        serde_json::json!({
+            "text": text,
+            "text_language": "zh",
+            "speed": Self::lan_speed_factor(speech_rate),
+        })
+    }
+
+    /// 局域网曼波引擎合成：先探测就绪（2s 快速失败），再 POST 合成返回 WAV 字节。
+    /// 任何失败都由调用方统一降级本地 SAPI 并计入熔断退避。
+    async fn synthesize_lan(
+        client: &reqwest::Client,
+        base_url: &str,
+        text: &str,
+        speech_rate: i32,
+    ) -> Result<Vec<u8>, String> {
+        let base = Self::normalize_lan_base_url(base_url);
+        if base.is_empty() {
+            return Err("未配置局域网引擎地址".into());
+        }
+
+        // 1. 就绪探测：连接失败/非 200 视为引擎未就绪（停机或冷启动中）
+        let control = client
+            .get(Self::build_lan_control_url(&base))
+            .timeout(Self::LAN_PROBE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("引擎未就绪（{}）", Self::describe_http_error(&e)))?;
+        if !control.status().is_success() {
+            return Err(format!("引擎未就绪（HTTP {}）", control.status()));
+        }
+
+        // 2. 合成：POST UTF-8 JSON（最小契约，无 refer 字段），响应为 audio/wav 二进制流
+        //    （Transfer-Encoding: chunked 由 reqwest 透明解包；响应体即完整 WAV 字节流，
+        //    无「先返回 URL 再取文件」二跳）
+        let resp = client
+            .post(Self::build_lan_synthesis_url(&base))
+            .json(&Self::build_lan_payload(text, speech_rate))
+            .timeout(Self::REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| Self::describe_http_error(&e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // 带上响应体前段：引擎侧报错（路径不存在/模型异常）一眼可辨
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "HTTP {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+        // Content-Type 校验（实测契约为 audio/wav）：引擎误返回 JSON/HTML 时给出明确错误；
+        // 宽松放行 audio/* 变体（audio/x-wav 等），头缺失时交由下方 RIFF 头校验兜底
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        Self::validate_lan_content_type(content_type)?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("音频读取失败（{}）", Self::describe_http_error(&e)))?;
+        // RIFF 头校验：拦截"头声明合规但内容异常"的响应（200 + 空 HTML 片段等）
+        if bytes.len() < 12 || &bytes[..4] != b"RIFF" {
+            return Err("返回内容不是 WAV 音频（缺少 RIFF 头）".into());
+        }
+        Ok(bytes.to_vec())
+    }
+
+    /// 校验合成响应的 Content-Type（对齐实测契约 `audio/wav`，GPT-SoVITS api.py 固定
+    /// `StreamingResponse(media_type="audio/"+media_type)`）。
+    /// 只要求 `audio/*` 前缀（兼容 x-wav/wave 等变体）；头缺失视为不确定，交由
+    /// 响应体 RIFF 头校验兜底，不在此拒判。
+    fn validate_lan_content_type(content_type: Option<&str>) -> Result<(), String> {
+        let Some(ct) = content_type else {
+            return Ok(());
+        };
+        let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if mime.starts_with("audio/") {
+            Ok(())
         } else {
-            format!(
-                "https://api.milorapart.top/apis/AIvoice?speaker={}&text={}",
-                url_encode(&cfg.manbo_voice),
-                url_encode(text)
-            )
+            Err(format!("引擎返回的不是音频（Content-Type: {ct}）"))
         }
     }
 
     /// 进程级共享 HTTP 客户端（对齐原工程 `Network.cpp` 的 `GetSharedSession` 共享
     /// WinHTTP 会话：会话级连接缓存使后续请求复用已建立的 TCP/TLS 连接）。
     /// reqwest Client 内置连接池，逐条播报重建会随消息丢弃池，导致每跳都重新握手。
-    /// 客户端默认超时 [`Self::REQUEST_TIMEOUT`]（生成跳 10s）；音频跳在
-    /// [`Self::request_audio_bytes`] 内单独收紧到 5s。
+    /// 客户端默认超时 [`Self::REQUEST_TIMEOUT`]（合成跳）；就绪探测在
+    /// [`Self::synthesize_lan`] 内单独收紧到 2s。
     /// 构建失败（仅 TLS 后端初始化异常，几乎不会发生）返回 `None`，调用方降级本地 SAPI。
     fn shared_http_client() -> Option<&'static reqwest::Client> {
         static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -1365,70 +1456,6 @@ impl TTSManager {
             src = std::error::Error::source(c);
         }
         parts.join("：")
-    }
-
-    /// 请求 TTS 并下载音频字节；`auth` 为可选 Bearer 令牌
-    async fn request_audio_bytes(
-        client: &reqwest::Client,
-        url: &str,
-        auth: Option<&str>,
-    ) -> Result<Vec<u8>, String> {
-        let mut req = client.get(url);
-        if let Some(token) = auth {
-            if !token.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", token));
-            }
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Self::describe_http_error(&e))?;
-        let status = resp.status();
-        if !status.is_success() {
-            // 带上响应体：Manbo 的 401 会明确回 {"code":400,"msg":"无效的API密钥"}，
-            // 只记 "HTTP 401" 排查时看不出是密钥问题还是服务故障
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "HTTP {}: {}",
-                status,
-                body.chars().take(200).collect::<String>()
-            ));
-        }
-        let json_val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("JSON 解析失败（{}）", Self::describe_http_error(&e)))?;
-        if json_val.get("code").and_then(|c| c.as_i64()) != Some(200) {
-            return Err(format!(
-                "API code={:?} msg={}",
-                json_val.get("code"),
-                json_val
-                    .get("msg")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("(无消息)")
-            ));
-        }
-        let audio_url = json_val
-            .get("url")
-            .and_then(|u| u.as_str())
-            .ok_or_else(|| "missing url".to_string())?;
-        let audio_resp = client
-            .get(audio_url)
-            .timeout(Self::AUDIO_TIMEOUT)
-            .send()
-            .await
-            .map_err(|e| format!("音频下载失败（{}）", Self::describe_http_error(&e)))?;
-        if !audio_resp.status().is_success() {
-            return Err(format!("音频下载 HTTP {}", audio_resp.status()));
-        }
-        let bytes = audio_resp
-            .bytes()
-            .await
-            .map_err(|e| format!("音频读取失败（{}）", Self::describe_http_error(&e)))?;
-        if bytes.is_empty() {
-            return Err("empty audio".into());
-        }
-        Ok(bytes.to_vec())
     }
 
     /// 播报队列任务入口：按任务类型决定是否留档签到音频。
@@ -1474,33 +1501,28 @@ impl TTSManager {
 
         // 共享 HTTP 客户端（构建失败几乎不会发生；此时跳过第 2 段，直接落第 3 段 SAPI 兜底）
         if let Some(client) = Self::shared_http_client() {
-            // 2. 选择当前最优健康引擎并尝试（Manbo 失败即降级，落到本地 SAPI 兜底）
+            // 2. 曼波引擎（局域网 GPT-SoVITS）：失败降级本地 SAPI
             if self.select_active_engine() == TTSEngineType::Manbo {
-                let key_missing = Self::manbo_voice_requires_key(&cfg.manbo_voice)
-                    && (cfg.manbo_api_key.trim().is_empty()
-                        || crate::credentials::is_placeholder_value(&cfg.manbo_api_key));
-                if key_missing {
-                    // 缺 Key 是配置问题，不是服务故障：不去请求（避免每次都吃 401），
-                    // 也不熔断 Manbo —— 其它不需要 Key 的音色仍应立即可用
+                if cfg.lan_engine_base_url.trim().is_empty() {
+                    // 缺引擎地址是配置问题，不是服务故障：不去请求，也不熔断
                     crate::log_warn!(
-                        "[TTS] 音色「{}」需要 Manbo API Key，当前未配置：本次降级本地 SAPI（可在设置中填写 Key，或改选其他音色）",
-                        cfg.manbo_voice
+                        "[TTS] 未配置局域网曼波引擎地址：本次降级本地 SAPI（可在设置中填写引擎地址）"
                     );
                 } else {
-                    let url = Self::build_manbo_url(&cfg, trimmed);
-                    match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
+                    match Self::synthesize_lan(
+                        client,
+                        &cfg.lan_engine_base_url,
+                        trimmed,
+                        cfg.speech_rate,
+                    )
+                    .await
+                    {
                         Ok(bytes) => {
                             self.mark_engine_success(TTSEngineType::Manbo);
                             return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
                         }
                         Err(e) => {
-                            // 必须留痕：此前这里是 Err(_) 静默吞掉，只能看到"只有默认语音"
-                            // 却没有任何排查线索
-                            crate::log_warn!(
-                                "[TTS] Manbo 请求失败（音色={}）：{}；降级本地 SAPI",
-                                cfg.manbo_voice,
-                                e
-                            );
+                            crate::log_warn!("[TTS] 曼波引擎请求失败：{}；降级本地 SAPI", e);
                             self.mark_engine_degraded(TTSEngineType::Manbo);
                         }
                     }
@@ -1560,36 +1582,29 @@ impl TTSManager {
         );
 
         if preferred == TTSEngineType::Manbo {
-            let key_missing = Self::manbo_voice_requires_key(&cfg.manbo_voice)
-                && (cfg.manbo_api_key.trim().is_empty()
-                    || crate::credentials::is_placeholder_value(&cfg.manbo_api_key));
-            if key_missing {
-                crate::log_warn!(
-                    "[TTS] 试听：音色「{}」需要 Manbo API Key，当前未配置，降级本地 SAPI",
-                    cfg.manbo_voice
-                );
+            if cfg.lan_engine_base_url.trim().is_empty() {
+                crate::log_warn!("[TTS] 试听：未配置局域网曼波引擎地址，降级本地 SAPI");
             } else if let Some(client) = Self::shared_http_client() {
-                // 曼波默认音色的 speed 参数按试听即时语速覆盖（其余音色无此参数，
-                // 音调/音量对 Manbo 云端无效，音量在本地播放端应用）
-                let url = Self::build_manbo_url(
-                    &TTSConfig {
-                        speech_rate: rate,
-                        ..cfg.clone()
-                    },
+                // 试听语速按即时滑杆值生效；音量在本地播放端应用，音调对局域网引擎无效
+                match Self::synthesize_lan(
+                    client,
+                    &cfg.lan_engine_base_url,
                     trimmed,
-                );
-                match Self::request_audio_bytes(client, &url, Some(&cfg.manbo_api_key)).await {
+                    rate,
+                )
+                .await
+                {
                     Ok(bytes) => {
                         self.mark_engine_success(TTSEngineType::Manbo);
                         crate::log_info!(
-                            "[TTS] 试听走 Manbo 引擎（音量 {} 由本地播放端增益应用）",
+                            "[TTS] 试听走曼波引擎（音量 {} 由本地播放端增益应用）",
                             volume
                         );
                         return AudioQueue::global().play_tts_bytes(bytes, volume);
                     }
                     Err(e) => {
                         self.mark_engine_degraded(TTSEngineType::Manbo);
-                        crate::log_warn!("[TTS] 试听 Manbo 请求失败({}),降级本地 SAPI", e);
+                        crate::log_warn!("[TTS] 试听曼波引擎请求失败({}),降级本地 SAPI", e);
                     }
                 }
             } else {
@@ -1612,347 +1627,11 @@ impl TTSManager {
     }
 }
 
-/// URL 百分比编码辅助函数 (RFC 3986)
-pub fn url_encode(val: &str) -> String {
-    let mut out = String::new();
-    for b in val.bytes() {
-        if (b >= b'a' && b <= b'z')
-            || (b >= b'A' && b <= b'Z')
-            || (b >= b'0' && b <= b'9')
-            || b == b'-'
-            || b == b'_'
-            || b == b'.'
-            || b == b'~'
-        {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rodio::Decoder;
-    use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-
-    /// 手动校准工具（cargo test --release test_manbo_peiqi_loudness_calibration -- --ignored --nocapture）：
-    /// 实测 Manbo「佩奇猪」音色原始输出与 Windows SAPI 满档（$s.Volume=100）的 RMS 差，
-    /// 据此回填 [`MANBO_LOUDNESS_GAIN`]，使相同音量设置下两个引擎听感响度一致。
-    /// 需要网络（Manbo API）与 PowerShell 环境；日常 CI 不跑（#[ignore]）。
-    /// 注意：同一文本多次合成的波动约 ±0.5 dB，回填系数时以多次结果的中位数为准。
-    #[test]
-    #[ignore = "手动校准工具：需要网络，日常 CI 不跑"]
-    fn test_manbo_peiqi_loudness_calibration() {
-        const TEXT: &str = "你好，这是一条响度校准测试语音，用来对齐云端与本地引擎的音量。";
-
-        // 1) Manbo「佩奇猪」（AIvoice 端点，无 key 参数）下载并解码
-        let url = format!(
-            "https://api.milorapart.top/apis/AIvoice?speaker={}&text={}",
-            url_encode("佩奇猪"),
-            url_encode(TEXT)
-        );
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let bytes = rt.block_on(async {
-            let client = reqwest::Client::builder()
-                .timeout(TTSManager::REQUEST_TIMEOUT)
-                .build()
-                .unwrap();
-            let resp = client.get(&url).send().await.unwrap();
-            let json: serde_json::Value = resp.json().await.unwrap();
-            let audio_url = json
-                .get("url")
-                .and_then(|u| u.as_str())
-                .expect("Manbo 响应应含 url 字段")
-                .to_string();
-            let audio = client.get(audio_url).send().await.unwrap();
-            let bytes = audio.bytes().await.unwrap().to_vec();
-            println!("[校准] Manbo 音频大小: {} 字节", bytes.len());
-            bytes
-        });
-
-        // 解码为 f32 采样（symphonia 解 mp3），统计 RMS 与峰值
-        let manbo_samples = decode_all_mp3(bytes).expect("Manbo mp3 应可解码");
-        let (manbo_rms, manbo_peak) = rms_peak(&manbo_samples);
-        println!(
-            "[校准] Manbo 佩奇猪: 采样={} rms={:.5} peak={:.5}",
-            manbo_samples.len(),
-            manbo_rms,
-            manbo_peak
-        );
-
-        // 2) SAPI 满档基准：与 run_local_speech 同构（Huihui，Volume=100）渲染 WAV
-        let dir = std::env::temp_dir().join("mh_sapi_calibration");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let escaped = TEXT
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        let ps = format!(
-            "Add-Type -AssemblyName System.Speech; \
-             $r = New-Object System.Speech.Synthesis.SpeechSynthesizer; \
-             $r.Volume = 100; \
-             $r.SetOutputToWaveFile('{}'); \
-             $r.SpeakSsml('<speak version=\"1.0\" xml:lang=\"zh-CN\"><prosody pitch=\"+0st\">{}</prosody></speak>'); \
-             $r.SetOutputToWaveFile($null); $r.Dispose()",
-            dir.join("sapi_ref.wav").display(),
-            escaped
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-            .status()
-            .expect("应能启动 PowerShell");
-        assert!(status.success(), "SAPI 渲染失败");
-        let wav = std::fs::read(dir.join("sapi_ref.wav")).unwrap();
-        let sapi_samples = read_wav_pcm16(&wav).expect("WAV 应为 16-bit PCM");
-        let (sapi_rms, sapi_peak) = rms_peak(&sapi_samples);
-        println!(
-            "[校准] SAPI 满档: 采样={} rms={:.5} peak={:.5}",
-            sapi_samples.len(),
-            sapi_rms,
-            sapi_peak
-        );
-
-        // 3) 校准系数：使 Manbo 在 gain=校准系数时与 SAPI 满档 RMS 对齐
-        let gain = sapi_rms / manbo_rms;
-        let gain_db = 20.0 * gain.log10();
-        let clipped_peak = manbo_peak * gain;
-        println!(
-            "[校准] 建议系数 = {:.3} ({:+.1} dB)；应用后 Manbo 峰值 = {:.3}（>1.0 有削波风险）",
-            gain, gain_db, clipped_peak
-        );
-        println!("[PASS] test_manbo_peiqi_loudness_calibration passed");
-    }
-
-    /// 手动基准工具（cargo test test_manbo_consecutive_latency_benchmark -- --ignored --nocapture）：
-    /// 用真实 Manbo 请求交替模拟「逐条重建 Client（迁移后旧行为）」与「共享 Client（现行为）」
-    /// 的连续多条播报，逐阶段计时：客户端构建 / 一跳（API+合成）/ 二跳（音频下载），
-    /// 另以「GET / 无合成探测」单独分离 DNS+TCP+TLS 握手开销。
-    /// 两轮同字数文本逐条交替以抵消服务端波动；文本逐条唯一以排除服务端缓存干扰；
-    /// 超时与生产口径一致（生成跳 10s；音频跳由请求端收紧到 5s）。需要网络；日常 CI 不跑（#[ignore]）。
-    #[test]
-    #[ignore = "手动基准工具：需要网络，日常 CI 不跑"]
-    fn test_manbo_consecutive_latency_benchmark() {
-        const ROUNDS: usize = 5;
-        const BENCH_TIMEOUT: Duration = Duration::from_secs(10);
-        const API_ROOT: &str = "https://api.milorapart.top/";
-
-        /// 单条播报两跳计时（与生产 request_audio_bytes 同构）：(一跳ms, 二跳ms, 下载主机, 失败原因)
-        async fn one_message(
-            client: &reqwest::Client,
-            text: &str,
-        ) -> (u128, u128, String, Option<String>) {
-            let url = format!(
-                "https://api.milorapart.top/apis/AIvoice?speaker={}&text={}",
-                url_encode("佩奇猪"),
-                url_encode(text)
-            );
-            let t1 = Instant::now();
-            let json: serde_json::Value = match client.get(&url).send().await {
-                Ok(resp) => match resp.json().await {
-                    Ok(j) => j,
-                    Err(e) => {
-                        return (t1.elapsed().as_millis(), 0, String::new(), Some(format!("JSON 解析失败: {e}")))
-                    }
-                },
-                Err(e) => return (t1.elapsed().as_millis(), 0, String::new(), Some(e.to_string())),
-            };
-            let hop1 = t1.elapsed().as_millis();
-            let Some(audio_url) = json.get("url").and_then(|u| u.as_str()).map(str::to_string) else {
-                return (hop1, 0, String::new(), Some("响应缺少 url 字段".into()));
-            };
-            let host = audio_url
-                .split("://")
-                .nth(1)
-                .and_then(|rest| rest.split('/').next())
-                .unwrap_or("")
-                .to_string();
-            let t2 = Instant::now();
-            let err = match client.get(&audio_url).send().await {
-                Ok(r) => match r.bytes().await {
-                    Ok(b) if !b.is_empty() => None,
-                    _ => Some("音频下载为空".into()),
-                },
-                Err(e) => Some(e.to_string()),
-            };
-            (hop1, t2.elapsed().as_millis(), host, err)
-        }
-
-        fn median(v: &mut Vec<u128>) -> u128 {
-            if v.is_empty() {
-                return 0;
-            }
-            v.sort_unstable();
-            v[v.len() / 2]
-        }
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            // 1) 连接开销分离探测：GET / 不触发合成，冷连接（DNS+TCP+TLS+HTTP）vs 热连接（纯 HTTP 往返）
-            for i in 0..3 {
-                let cold = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
-                let t = Instant::now();
-                let _ = cold.get(API_ROOT).send().await;
-                println!(
-                    "[探测] 冷连接 GET / #{}: {} ms（含 DNS（可能命中系统缓存）+TCP+TLS）",
-                    i + 1,
-                    t.elapsed().as_millis()
-                );
-            }
-            let warm = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
-            let _ = warm.get(API_ROOT).send().await; // 预热建连（不计入计时）
-            for i in 0..3 {
-                let t = Instant::now();
-                let _ = warm.get(API_ROOT).send().await;
-                println!("[探测] 热连接 GET / #{}: {} ms", i + 1, t.elapsed().as_millis());
-            }
-
-            // 2) 连续播报 A/B 交替：A=旧行为（逐条重建 Client），B=现行为（共享 Client）
-            let shared = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
-            let (mut a_build, mut a_h1, mut a_h2, mut a_total) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            let (mut b_h1, mut b_h2, mut b_total) = (Vec::new(), Vec::new(), Vec::new());
-            let mut b_first_total = 0u128;
-            let mut failures = 0usize;
-            for i in 0..ROUNDS {
-                // A：每条新建 Client（构建耗时计入本条，与迁移后旧行为一致）
-                let text = format!("延迟基准第{}号样本甲", i + 1);
-                let tb = Instant::now();
-                let per_msg = reqwest::Client::builder().timeout(BENCH_TIMEOUT).build().unwrap();
-                let build_ms = tb.elapsed().as_millis();
-                let (h1, h2, host, err) = one_message(&per_msg, &text).await;
-                match err {
-                    None => a_build.push(build_ms),
-                    Some(e) => {
-                        failures += 1;
-                        println!("[旧#{}] 失败: {}", i + 1, e);
-                    }
-                }
-                let total = build_ms + h1 + h2;
-                a_h1.push(h1);
-                a_h2.push(h2);
-                a_total.push(total);
-                println!(
-                    "[旧#{}] build={}ms 一跳(API)={}ms 二跳(下载)={}ms 合计={}ms 下载主机={}",
-                    i + 1, build_ms, h1, h2, total, host
-                );
-
-                // B：共享 Client（首条含冷握手，等价生产启动后的第一条）
-                let text = format!("延迟基准第{}号样本乙", i + 1);
-                let (h1, h2, host, err) = one_message(&shared, &text).await;
-                let total = h1 + h2;
-                if i == 0 {
-                    b_first_total = total;
-                }
-                match err {
-                    None => b_h1.push(h1),
-                    Some(e) => {
-                        failures += 1;
-                        println!("[新#{}] 失败: {}", i + 1, e);
-                    }
-                }
-                b_h2.push(h2);
-                b_total.push(total);
-                println!(
-                    "[新#{}] build=0(共享) 一跳(API)={}ms 二跳(下载)={}ms 合计={}ms 下载主机={}",
-                    i + 1, h1, h2, total, host
-                );
-
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-
-            // 3) 汇总（均值/中位只统计成功轮次）
-            let mean = |v: &[u128]| -> u128 {
-                if v.is_empty() {
-                    0
-                } else {
-                    v.iter().sum::<u128>() / v.len() as u128
-                }
-            };
-            let (a_ok, b_ok) = (a_build.len(), b_h1.len());
-            println!("---- 汇总（成功 旧={} 新={}，失败={}）----", a_ok, b_ok, failures);
-            if a_ok > 0 {
-                println!(
-                    "[旧行为] 合计均值={}ms 中位={}ms（build均值={} 一跳均值={} 二跳均值={}）",
-                    mean(&a_total),
-                    median(&mut a_total),
-                    mean(&a_build),
-                    mean(&a_h1),
-                    mean(&a_h2)
-                );
-            }
-            if b_ok > 0 {
-                println!(
-                    "[新行为] 合计均值={}ms 中位={}ms（含首条冷握手；一跳均值={} 二跳均值={}）",
-                    mean(&b_total),
-                    median(&mut b_total),
-                    mean(&b_h1),
-                    mean(&b_h2)
-                );
-            }
-            if b_ok > 1 {
-                println!(
-                    "[新行为] 稳态热连接（去首条）合计均值={}ms；首条（含冷握手）合计={}ms",
-                    mean(&b_total[1..]),
-                    b_first_total
-                );
-            }
-            if a_ok > 0 && b_ok > 1 {
-                let delta = mean(&a_total) as i128 - mean(&b_total[1..]) as i128;
-                println!("[结论] 稳态下共享 Client 每条节省 ≈ {} ms（旧均值 - 新稳态均值）", delta);
-            }
-            assert!(
-                a_ok >= 3 && b_ok >= 3,
-                "成功轮次不足（旧={} 新={}），网络或 API 异常，结果不可信",
-                a_ok,
-                b_ok
-            );
-            println!("[PASS] test_manbo_consecutive_latency_benchmark passed");
-        });
-    }
-
-    /// 解码 mp3 全部采样（rodio 0.19 symphonia 后端输出 i16），归一化为 f32（-1.0..1.0）
-    fn decode_all_mp3(bytes: Vec<u8>) -> Option<Vec<f32>> {
-        let decoder = Decoder::new_mp3(Cursor::new(bytes)).ok()?;
-        let mut out = Vec::new();
-        for s in decoder {
-            out.push(s as f32 / 32768.0);
-        }
-        Some(out)
-    }
-
-    /// 采样序列的 RMS 与峰值
-    fn rms_peak(samples: &[f32]) -> (f32, f32) {
-        let sum_sq: f64 = samples.iter().map(|s| (*s as f64) * (*s as f64)).sum();
-        let rms = (sum_sq / samples.len().max(1) as f64).sqrt() as f32;
-        let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
-        (rms, peak)
-    }
-
-    /// 解析 16-bit PCM WAV 为 f32 采样（按 RIFF 块结构定位 data 块）
-    fn read_wav_pcm16(bytes: &[u8]) -> Option<Vec<f32>> {
-        let mut i = 12usize;
-        while i + 8 <= bytes.len() {
-            let id = &bytes[i..i + 4];
-            let size =
-                u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
-                    as usize;
-            if id == b"data" {
-                let data = &bytes[i + 8..(i + 8 + size).min(bytes.len())];
-                return Some(
-                    data.chunks_exact(2)
-                        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
-                        .collect(),
-                );
-            }
-            i += 8 + size + (size % 2);
-        }
-        None
-    }
 
     #[test]
     fn test_auto_engine_cascade_and_current_engine_name() {
@@ -2559,49 +2238,70 @@ mod tests {
         println!("[PASS] test_parse_zh_voice_from_listing passed");
     }
 
+    /// 局域网引擎地址构建与请求体：地址规范化、探测/合成 URL、payload 字段与语速因子
     #[test]
-    fn test_manbo_url_building() {
-        let mut cfg = TTSConfig {
-            manbo_voice: "曼波".into(),
-            manbo_api_key: "k1".into(),
-            speech_rate: 2,
-            ..Default::default()
-        };
-        let url = TTSManager::build_manbo_url(&cfg, "你好");
-        assert!(url.contains("/apis/mbAIscvip"), "url: {}", url);
-        assert!(url.contains("speed=10"), "url: {}", url); // speech_rate * 5
-        assert!(url.contains("key=k1"), "url: {}", url);
+    fn test_lan_engine_urls_and_payload() {
+        assert_eq!(
+            TTSManager::build_lan_control_url(" http://192.168.1.50:9880/ "),
+            "http://192.168.1.50:9880/control"
+        );
+        assert_eq!(
+            TTSManager::build_lan_synthesis_url("http://192.168.1.50:9880"),
+            "http://192.168.1.50:9880/"
+        );
+        assert_eq!(
+            TTSManager::build_lan_synthesis_url("http://192.168.1.50:9880/"),
+            "http://192.168.1.50:9880/"
+        );
 
-        cfg.manbo_voice = "撒娇学妹".into();
-        let url2 = TTSManager::build_manbo_url(&cfg, "你好");
-        assert!(url2.contains("/apis/AIvoice"), "url2: {}", url2);
-        assert!(url2.contains("speaker="), "url2: {}", url2);
+        let payload = TTSManager::build_lan_payload("你好", 0);
+        assert_eq!(payload["text"], "你好");
+        assert_eq!(payload["text_language"], "zh");
+        assert_eq!(payload["speed"], 1.0);
+        // 2026-11-07 定稿最小契约：参考音频引擎侧固化，refer 三字段不得出现在请求体
+        assert!(
+            payload.get("refer_wav_path").is_none()
+                && payload.get("prompt_text").is_none()
+                && payload.get("prompt_language").is_none(),
+            "请求体不得携带 refer 字段: {}",
+            payload
+        );
 
-        println!("[PASS] test_manbo_url_building passed");
+        // 语速滑杆 -10..10 → 0.5..1.5（每档 ±5%，越界钳制）
+        assert_eq!(TTSManager::lan_speed_factor(0), 1.0);
+        assert_eq!(TTSManager::lan_speed_factor(10), 1.5);
+        assert_eq!(TTSManager::lan_speed_factor(-10), 0.5);
+        assert_eq!(TTSManager::lan_speed_factor(99), 1.5, "越界钳制");
+        println!("[PASS] test_lan_engine_urls_and_payload passed");
     }
 
-    /// 只有「曼波」音色需要 Key：其余音色走 /apis/AIvoice，缺 Key 不应影响它们
+    /// 合成响应 Content-Type 校验：实测契约为 audio/wav（api.py 固定 media_type）。
+    /// audio/* 变体放行、非音频给出明确错误、头缺失不拒判（交 RIFF 头兜底）。
     #[test]
-    fn test_manbo_voice_requires_key() {
-        assert!(TTSManager::manbo_voice_requires_key("曼波"));
-        assert!(!TTSManager::manbo_voice_requires_key("撒娇学妹"));
-        assert!(!TTSManager::manbo_voice_requires_key(""));
-        println!("[PASS] test_manbo_voice_requires_key passed");
+    fn test_lan_content_type_validation() {
+        assert!(TTSManager::validate_lan_content_type(Some("audio/wav")).is_ok());
+        assert!(TTSManager::validate_lan_content_type(Some("audio/x-wav")).is_ok());
+        assert!(TTSManager::validate_lan_content_type(Some("Audio/WAV; charset=binary")).is_ok());
+        assert!(TTSManager::validate_lan_content_type(None).is_ok(), "头缺失交 RIFF 兜底");
+
+        let err = TTSManager::validate_lan_content_type(Some("application/json")).unwrap_err();
+        assert!(err.contains("application/json"), "错误需带实际 Content-Type: {}", err);
+        assert!(TTSManager::validate_lan_content_type(Some("text/html; charset=utf-8")).is_err());
+        println!("[PASS] test_lan_content_type_validation passed");
     }
 
-    /// 切换引擎 / 音色 / Key 必须重置 Manbo 熔断与退避；无关配置变更不得重置
+    /// 切换引擎 / 局域网引擎地址必须重置曼波熔断与退避；无关配置变更不得重置
     #[test]
-    fn test_update_config_resets_manbo_health_on_engine_voice_or_key_change() {
+    fn test_update_config_resets_manbo_health_on_engine_or_lan_change() {
         let mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Manbo,
-            manbo_voice: "曼波".into(),
-            manbo_api_key: "old-key".into(),
+            lan_engine_base_url: "http://192.168.1.50:9880".into(),
             ..Default::default()
         });
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
         assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
 
-        // 音量变化与引擎/音色/Key 无关：熔断保持
+        // 音量变化与引擎/引擎地址无关：熔断保持
         let mut cfg = mgr.config_snapshot();
         cfg.speech_volume = 55;
         mgr.update_config(cfg);
@@ -2610,19 +2310,11 @@ mod tests {
             "无关配置变更不应清熔断"
         );
 
-        // 换音色 → 立即恢复重试
+        // 改引擎地址 → 立即恢复重试
         let mut cfg = mgr.config_snapshot();
-        cfg.manbo_voice = "撒娇学妹".into();
+        cfg.lan_engine_base_url = "http://192.168.1.60:9880".into();
         mgr.update_config(cfg);
-        assert!(mgr.is_engine_available(TTSEngineType::Manbo), "换音色应清熔断");
-
-        // 再熔断后换 Key → 同样立即恢复
-        mgr.mark_engine_degraded(TTSEngineType::Manbo);
-        assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
-        let mut cfg = mgr.config_snapshot();
-        cfg.manbo_api_key = "new-key".into();
-        mgr.update_config(cfg);
-        assert!(mgr.is_engine_available(TTSEngineType::Manbo), "换 Key 应清熔断");
+        assert!(mgr.is_engine_available(TTSEngineType::Manbo), "改引擎地址应清熔断");
 
         // 再熔断后切换播报引擎 → 同样立即恢复，并清零退避计数
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
@@ -2636,31 +2328,30 @@ mod tests {
         );
         assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 0);
 
-        println!("[PASS] test_update_config_resets_manbo_health_on_engine_voice_or_key_change passed");
+        println!("[PASS] test_update_config_resets_manbo_health_on_engine_or_lan_change passed");
     }
 
-    /// 生成跳超时必须覆盖 Manbo 冷生成（2026-10-22 实测 2.0–4.6s）。
-    /// 旧 3s 会在服务端稍慢时于读响应体阶段被掐断，表现为
-    /// `error decoding response body` 并静默降级本地语音 —— 用测试钉死预算。
+    /// 合成跳超时必须覆盖长句合成（1080 Ti FP32 实测长句约 2s，留足余量）；
+    /// 就绪探测必须快速失败（引擎冷启动约 20s~1 分钟，不能拖住播报）。
     #[test]
-    fn test_manbo_timeout_budget_covers_cold_generation() {
+    fn test_lan_engine_timeout_budget() {
         assert!(
             TTSManager::REQUEST_TIMEOUT >= Duration::from_secs(10),
-            "生成跳超时不得低于 10s"
+            "合成跳超时不得低于 10s"
         );
         assert!(
-            TTSManager::AUDIO_TIMEOUT >= Duration::from_secs(5),
-            "音频跳超时不得低于 5s"
+            TTSManager::LAN_PROBE_TIMEOUT <= Duration::from_secs(2),
+            "就绪探测必须快速失败"
         );
         assert!(
-            TTSManager::AUDIO_TIMEOUT <= TTSManager::REQUEST_TIMEOUT,
-            "音频跳不应比生成跳更宽松"
+            TTSManager::LAN_PROBE_TIMEOUT < TTSManager::REQUEST_TIMEOUT,
+            "探测不应比合成更宽松"
         );
-        println!("[PASS] test_manbo_timeout_budget_covers_cold_generation passed");
+        println!("[PASS] test_lan_engine_timeout_budget passed");
     }
 
     /// 网络波动恢复策略：连续失败按 5/10/20/30s 指数退避；
-    /// 任意一次成功立即清零并恢复 Manbo，换 Key/音色/引擎也立即清零。
+    /// 任意一次成功立即清零并恢复曼波引擎，改引擎地址/引擎也立即清零。
     #[test]
     fn test_manbo_backoff_and_success_recovery() {
         assert_eq!(TTSManager::manbo_backoff_secs(1), 5);
@@ -2755,25 +2446,6 @@ mod tests {
     }
 
     #[test]
-    fn test_manbo_voice_list_data() {
-        assert_eq!(
-            crate::manbo_voices::MANBO_VOICE_LIST.len(),
-            185,
-            "原工程音色列表共 185 项"
-        );
-        assert_eq!(crate::manbo_voices::MANBO_VOICE_LIST[0], "曼波");
-        let mut sorted = crate::manbo_voices::MANBO_VOICE_LIST.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            crate::manbo_voices::MANBO_VOICE_LIST.len(),
-            "音色列表不得有重复项"
-        );
-        println!("[PASS] test_manbo_voice_list_data passed");
-    }
-
-    #[test]
     fn test_special_sound_detection() {
         // 映射返回 zip 内路径（含 manbo/、mho/ 前缀）
         assert_eq!(
@@ -2801,13 +2473,5 @@ mod tests {
             "duang.mp3 should exist in sound paths"
         );
         println!("[PASS] test_special_sound_detection passed");
-    }
-
-    #[test]
-    fn test_url_encode() {
-        let raw = "测试文本 123 !";
-        let encoded = url_encode(raw);
-        assert!(encoded.contains("%E6%B5%8B%E8%AF%95"));
-        println!("[PASS] test_url_encode passed");
     }
 }
