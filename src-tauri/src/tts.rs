@@ -1,7 +1,10 @@
 ﻿//! 多引擎 TTS 语音域。
 //! 合成音源为**局域网曼波引擎**（GPT-SoVITS 图形客户端自带曼波模型，部署于局域网另一台
 //! 机器，部署包与接口契约见 `F:\ManboTTS\package\MamboTTS-Engine\README.md`
-//! 与 `对接契约变更-20261107.md`，zip 定稿 SHA256 见后者）；本地离线兜底为 Windows SAPI / macOS say。
+//! 与 `对接契约变更-20261107.md`，zip 定稿 SHA256 见后者）；**大肥鱼 TTS** 为云端备选
+//! （DeepSeek 官方语音 API，2026-11-13 开放：`POST https://api.deepseek.com/v1/tools/tts`，
+//! 与打卡 AI 共用 credentials.dat 中的同一把 DeepSeek Key，按字符计费、官方接口无语速参数）；
+//! 本地离线兜底为 Windows SAPI / macOS say。
 //! 对照原工程实现：`TextToSpeech.cpp` / `TTSCacheManager.cpp` / `LocalVoiceManager.cpp`。
 //! 迁移史：原云端 Manbo（api.milorapart.top）已于 2026-11-07 移除 —— 免 Key 试用端点
 //! `/apis/mbAIsc` 被服务方下架（API 404），通用音色端点 `/apis/AIvoice` 与付费端点
@@ -24,20 +27,24 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// 语音引擎类型
-/// `Auto` 对齐原工程 `TTSProviderFactory` 的 AUTO 模式：按 Manbo → SAPI 顺序取首个可用引擎
+/// `Auto` 对齐原工程 `TTSProviderFactory` 的 AUTO 模式：按 曼波 → 大肥鱼 → SAPI 顺序取首个可用引擎
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TTSEngineType {
     Auto,
     Manbo,
+    /// 大肥鱼（DeepSeek 云端 TTS，与 AI 对话共用 Key）
+    Feiyu,
     Sapi,
 }
 
 impl TTSEngineType {
-    /// 引擎名（对齐原工程 `TTSManager_GetCurrentProviderName` 的返回值：manbo / sapi）
+    /// 引擎名（对齐原工程 `TTSManager_GetCurrentProviderName` 的返回值：manbo / sapi；
+    /// 新增的大肥鱼沿用同一命名口径，返回 feiyu）
     pub fn provider_name(self) -> &'static str {
         match self {
             TTSEngineType::Auto => "auto",
             TTSEngineType::Manbo => "manbo",
+            TTSEngineType::Feiyu => "feiyu",
             TTSEngineType::Sapi => "sapi",
         }
     }
@@ -69,6 +76,10 @@ pub struct TTSConfig {
     /// 参考音频已引擎侧固化（2026-11-07 契约变更），工具侧无对应配置
     #[serde(default)]
     pub lan_engine_base_url: String,
+    /// 大肥鱼（DeepSeek TTS）音色 ID：`stella`（女声，官方默认）/ `tide`（男声）。
+    /// Key 与 AI 对话共用 credentials.dat 的 DeepSeek Key，不随配置持久化
+    #[serde(default)]
+    pub feiyu_voice_id: String,
 }
 
 impl Default for TTSConfig {
@@ -81,8 +92,14 @@ impl Default for TTSConfig {
             speech_volume: 50,
             speech_pitch: 0,
             lan_engine_base_url: String::new(),
+            feiyu_voice_id: Self::FEIYU_DEFAULT_VOICE.to_string(),
         }
     }
+}
+
+impl TTSConfig {
+    /// 大肥鱼默认音色：DeepSeek 官方默认女声 stella（男声为 tide）
+    pub const FEIYU_DEFAULT_VOICE: &'static str = "stella";
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +147,39 @@ pub(crate) fn fire_play_notice(notice: &BubbleNotice) {
 }
 
 // ---------------------------------------------------------------------------
+// 引擎降级提示（界面 toast）
+// ---------------------------------------------------------------------------
+
+/// 引擎降级提示：说明"为什么这次没用上首选引擎"，由主窗口以 toast 展示。
+///
+/// 背景：缺 Key / 未填地址 / 熔断冷却等降级过去只写运行日志，界面无任何提示，
+/// 主播点了试听只听到另一把声音，会误判为"功能坏了"（2026-11-25 实测反馈）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineNotice {
+    /// 发生降级的引擎
+    pub engine: TTSEngineType,
+    /// 面向主播的中文原因说明
+    pub message: String,
+}
+
+/// 引擎降级通知器：App 装配期注入（持有 AppHandle 发事件），单测可替换观测
+type EngineNoticeFn = Arc<dyn Fn(&EngineNotice) + Send + Sync>;
+static ENGINE_NOTICE_NOTIFIER: Mutex<Option<EngineNoticeFn>> = Mutex::new(None);
+
+/// 装配引擎降级通知器（App setup 时调用一次；重复调用以最后一次为准）
+pub fn set_engine_notice_notifier(f: EngineNoticeFn) {
+    *ENGINE_NOTICE_NOTIFIER.lock().unwrap() = Some(f);
+}
+
+/// 投递引擎降级提示；未装配通知器（单测/Lite）时为 no-op
+pub(crate) fn fire_engine_notice(notice: &EngineNotice) {
+    let f = ENGINE_NOTICE_NOTIFIER.lock().unwrap().clone();
+    if let Some(f) = f {
+        f(notice);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 串行音频播放队列（B3 防叠音）
 // ---------------------------------------------------------------------------
 
@@ -138,7 +188,7 @@ pub(crate) fn fire_play_notice(notice: &BubbleNotice) {
 enum AudioJob {
     /// 本地音效：增益 = volume_gain（不做语音响度校准）
     Bytes { bytes: Vec<u8>, volume: i32 },
-    /// 曼波引擎语音（局域网 GPT-SoVITS WAV）：增益 = volume_gain × MANBO_LOUDNESS_GAIN（响度与 SAPI 对齐）
+    /// 云端引擎语音（曼波局域网 GPT-SoVITS / 大肥鱼 DeepSeek WAV）：增益 = volume_gain × MANBO_LOUDNESS_GAIN（响度与 SAPI 对齐）
     TtsBytes {
         bytes: Vec<u8>,
         volume: i32,
@@ -287,7 +337,13 @@ impl AudioQueue {
                 }
             }
             AudioJob::Sapi { text, params, .. } => {
-                run_local_speech(text, params);
+                // 本地兜底失败过去完全静默（返回 bool 被忽略），出问题时日志里毫无线索；
+                // 这里显式留痕：PowerShell/System.Speech 无法启动、超时或被系统策略拦截都会走到
+                if !run_local_speech(text, params) {
+                    crate::log_warn!(
+                        "[TTS] 本地语音播报失败（SAPI/系统语音组件未正常完成：启动失败、超时或系统策略拦截）"
+                    );
+                }
             }
         }
     }
@@ -299,13 +355,13 @@ pub fn volume_gain(speech_volume: i32) -> f32 {
     (speech_volume.clamp(0, 100) as f32) / 100.0
 }
 
-/// 曼波引擎语音响度校准增益：按原云端 Manbo「佩奇猪」实测校准（中位数 0.74），
+/// 云端引擎语音响度校准增益：按原云端 Manbo「佩奇猪」实测校准（中位数 0.74），
 /// 局域网 GPT-SoVITS 引擎输出响度未单独标定，沿用同一系数避免切换后音量突跳；
-/// 如需精调可参照旧测量方法对引擎输出重新标定后回填。
-/// 仅应用于曼波引擎 TTS 流；本地音效保持各自原始响度，不受此系数影响。
+/// 大肥鱼（DeepSeek）输出同样未经实测标定，一并沿用（如需精调可对引擎输出重新标定后回填）。
+/// 仅应用于云端 TTS 流；本地音效保持各自原始响度，不受此系数影响。
 pub const MANBO_LOUDNESS_GAIN: f32 = 0.74;
 
-/// 曼波引擎 TTS 流的 rodio 增益 = 用户刻度增益 × 响度校准系数
+/// 云端 TTS 流（曼波/大肥鱼）的 rodio 增益 = 用户刻度增益 × 响度校准系数
 pub fn tts_stream_gain(speech_volume: i32) -> f32 {
     volume_gain(speech_volume) * MANBO_LOUDNESS_GAIN
 }
@@ -898,15 +954,85 @@ pub const MAX_SPEAK_QUEUE: usize = 200;
 /// 并发合成上限（对齐原工程 `MAX_CONCURRENT_TTS = 2`）
 pub const MAX_CONCURRENT_TTS: usize = 2;
 
+/// 单引擎熔断器（曼波/大肥鱼各一份）。
+///
+/// 计数与熔断状态**始终在同一把锁内更新**：两个并发播报一成一败时不会留下
+/// 「健康但计数未清」或「计数为 0 却仍在熔断」的错位。
+struct EngineBreaker {
+    health: Mutex<EngineHealth>,
+    /// 连续失败次数（成功即清零）：用于指数退避。
+    /// 冷却结束后仍保留，若探活再次失败则继续升档；成功时清零并恢复该引擎
+    failures: AtomicU32,
+}
+
+impl EngineBreaker {
+    const fn new() -> Self {
+        Self {
+            health: Mutex::new(EngineHealth::Healthy),
+            failures: AtomicU32::new(0),
+        }
+    }
+
+    /// 是否可用（冷却期结束视为可探活，允许下一次播报重试）
+    fn is_available(&self) -> bool {
+        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        match *h {
+            EngineHealth::Healthy => true,
+            EngineHealth::Degraded {
+                failed_at,
+                cooldown_secs,
+            } => {
+                if failed_at.elapsed() >= Duration::from_secs(cooldown_secs) {
+                    // 冷却结束，允许下一次播报探活。失败计数**不**清零：
+                    // 若探活仍失败，退避档位继续上升；成功时由 mark_success 清零并立即恢复
+                    *h = EngineHealth::Healthy;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// 标记失败：按退避函数升档并返回累计连续失败次数
+    fn mark_degraded(&self, backoff_secs: fn(u32) -> u64) -> u32 {
+        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        let failures = self.failures.fetch_add(1, Ordering::SeqCst) + 1;
+        *h = EngineHealth::Degraded {
+            failed_at: Instant::now(),
+            cooldown_secs: backoff_secs(failures),
+        };
+        failures
+    }
+
+    /// 标记成功：清零连续失败计数、立即恢复健康，返回此前的连续失败次数
+    fn mark_success(&self) -> u32 {
+        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_failures = self.failures.swap(0, Ordering::SeqCst);
+        *h = EngineHealth::Healthy;
+        previous_failures
+    }
+
+    /// 显式重置（切换引擎/改配置/换 Key 等主播的修复动作）
+    fn reset(&self) {
+        let mut h = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        self.failures.store(0, Ordering::SeqCst);
+        *h = EngineHealth::Healthy;
+    }
+}
+
 /// 多引擎 TTS 状态机与音频管理器
 pub struct TTSManager {
     config: Mutex<TTSConfig>,
-    manbo_health: Mutex<EngineHealth>,
-    /// Manbo 连续失败次数（成功即清零）：用于指数退避。
-    /// 冷却结束后仍保留，若探活再次失败则继续升档；成功时清零并恢复 Manbo。
-    /// **所有写入都在 `manbo_health` 锁内完成**，保证计数与熔断状态一致
-    /// （两个并发播报一成一败时不会留下"健康但计数未清"的错位）。
-    manbo_failures: AtomicU32,
+    /// 曼波（局域网 GPT-SoVITS）熔断器
+    manbo_breaker: EngineBreaker,
+    /// 大肥鱼（DeepSeek 云端）熔断器
+    feiyu_breaker: EngineBreaker,
+    /// 大肥鱼 API Key（与 AI 对话共用 credentials.dat 中的同一把 DeepSeek Key）。
+    /// 不进入 TTSConfig / JSON 配置，只在内存持有，凭据加载与配置保存时同步
+    feiyu_api_key: Mutex<String>,
+    /// 引擎降级提示节流表（键：引擎名）：播报链路同一引擎最多每 5 分钟提示一次
+    engine_notice_at: Mutex<HashMap<&'static str, Instant>>,
     gift_tracker: Mutex<GiftComboTracker>,
     /// 普通弹幕朗读队列（原工程 NormalMsgQueue）
     normal_queue: Mutex<VecDeque<SpeakTask>>,
@@ -929,28 +1055,30 @@ impl TTSManager {
     /// 局域网 GPT-SoVITS FP32 实测短句 0.6s / 中句 1.2s / 长句 2.0s（1080 Ti），
     /// 10s 足够覆盖偶发慢合成；就绪探测在 [`Self::LAN_PROBE_TIMEOUT`] 内单独收紧到 2s。
     pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-    /// Manbo 退避首档：引擎瞬断后 5s 就重试，避免长时间卡在本地语音
-    pub const MANBO_BACKOFF_BASE_SECS: u64 = 5;
-    /// 退避上限：持续故障时最多 30s 探活一次；网络恢复后下一次播报即回到 Manbo
-    pub const MANBO_BACKOFF_MAX_SECS: u64 = 30;
+    /// 云端引擎（曼波/大肥鱼）退避首档：瞬断后 5s 就重试，避免长时间卡在本地语音
+    pub const ENGINE_BACKOFF_BASE_SECS: u64 = 5;
+    /// 退避上限：持续故障时最多 30s 探活一次；网络恢复后下一次播报即回到云端引擎
+    pub const ENGINE_BACKOFF_MAX_SECS: u64 = 30;
 
     /// 连续失败 n 次后的冷却秒数：5 → 10 → 20 → 30（封顶）。
     /// 网络抖动通常是短时的，首档要快恢复；持续断网时拉长间隔，避免每条播报都
-    /// 白等 10s 生成超时。
-    pub fn manbo_backoff_secs(failures: u32) -> u64 {
+    /// 白等请求超时。
+    pub fn engine_backoff_secs(failures: u32) -> u64 {
         match failures {
-            0 | 1 => Self::MANBO_BACKOFF_BASE_SECS,
+            0 | 1 => Self::ENGINE_BACKOFF_BASE_SECS,
             2 => 10,
             3 => 20,
-            _ => Self::MANBO_BACKOFF_MAX_SECS,
+            _ => Self::ENGINE_BACKOFF_MAX_SECS,
         }
     }
 
     pub fn new(config: TTSConfig) -> Self {
         Self {
             config: Mutex::new(config),
-            manbo_health: Mutex::new(EngineHealth::Healthy),
-            manbo_failures: AtomicU32::new(0),
+            manbo_breaker: EngineBreaker::new(),
+            feiyu_breaker: EngineBreaker::new(),
+            feiyu_api_key: Mutex::new(String::new()),
+            engine_notice_at: Mutex::new(HashMap::new()),
             gift_tracker: Mutex::new(GiftComboTracker::new()),
             normal_queue: Mutex::new(VecDeque::new()),
             priority_queue: Mutex::new(VecDeque::new()),
@@ -1090,27 +1218,71 @@ impl TTSManager {
 
     /// 更新 TTS 配置。
     ///
-    /// 引擎或局域网引擎地址变化时**重置曼波熔断与退避**：这些都是主播的显式
-    /// 修复动作，不该被上一次故障留下的冷却期挡住 —— 否则改完配置还得等退避窗口才生效。
+    /// 引擎切换、局域网引擎地址或大肥鱼音色变化时**重置对应引擎的熔断与退避**：
+    /// 这些都是主播的显式修复动作，不该被上一次故障留下的冷却期挡住 ——
+    /// 否则改完配置还得等退避窗口才生效。切换引擎会同时清空两条云端链路。
     pub fn update_config(&self, new_cfg: TTSConfig) {
-        let changed = {
+        let (manbo_changed, feiyu_changed) = {
             let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
-            let changed = cfg.engine != new_cfg.engine
-                || cfg.lan_engine_base_url != new_cfg.lan_engine_base_url;
+            let engine_changed = cfg.engine != new_cfg.engine;
+            let manbo_changed =
+                engine_changed || cfg.lan_engine_base_url != new_cfg.lan_engine_base_url;
+            let feiyu_changed =
+                engine_changed || cfg.feiyu_voice_id != new_cfg.feiyu_voice_id;
             *cfg = new_cfg;
-            changed
+            (manbo_changed, feiyu_changed)
         };
-        if changed {
+        if manbo_changed {
             self.reset_manbo_health();
+        }
+        if feiyu_changed {
+            self.reset_feiyu_health();
         }
     }
 
-    /// 清除 Manbo 熔断与退避计数（保存新 Key / 切换引擎或音色后立即重试）
+    /// 清除曼波熔断与退避计数（切换引擎 / 改局域网地址 / 网络恢复后立即重试）
     pub fn reset_manbo_health(&self) {
-        // 与 mark_engine_degraded/success 同序：先拿状态锁，再改计数
-        let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
-        self.manbo_failures.store(0, Ordering::SeqCst);
-        *h = EngineHealth::Healthy;
+        self.manbo_breaker.reset();
+    }
+
+    /// 清除大肥鱼熔断与退避计数（切换引擎 / 改音色 / 换 Key 后立即重试）
+    pub fn reset_feiyu_health(&self) {
+        self.feiyu_breaker.reset();
+    }
+
+    /// 同步大肥鱼 API Key（与 AI 对话共用 credentials.dat 中的 DeepSeek Key）。
+    /// Key 变化视为显式修复动作：立即清空熔断与退避，下一条播报马上重试
+    pub fn set_feiyu_api_key(&self, key: String) {
+        let changed = {
+            let mut k = self
+                .feiyu_api_key
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let changed = *k != key;
+            *k = key;
+            changed
+        };
+        if changed {
+            self.reset_feiyu_health();
+        }
+    }
+
+    /// 是否已配置大肥鱼 Key（未配置时自动链路跳过该引擎，不视为服务故障）
+    pub fn has_feiyu_key(&self) -> bool {
+        !self
+            .feiyu_api_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim()
+            .is_empty()
+    }
+
+    /// 大肥鱼 Key 快照（仅合成请求瞬时使用，不得进入日志）
+    fn feiyu_api_key_snapshot(&self) -> String {
+        self.feiyu_api_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 当前 TTS 配置快照（用于局部字段更新，如保存 Manbo Key）
@@ -1118,31 +1290,14 @@ impl TTSManager {
         self.config.lock().unwrap().clone()
     }
 
-    /// 判定指定引擎是否可用（包含冷却期结束自动探活逻辑）
+    /// 判定指定引擎是否可用（包含冷却期结束自动探活逻辑）。
+    /// 大肥鱼额外要求已配置 Key：缺 Key 是配置问题而非服务故障，自动链路直接跳过。
     pub fn is_engine_available(&self, engine: TTSEngineType) -> bool {
         match engine {
             // 「自动」不参与降级判定（由 select_active_engine 级联解析为具体引擎）
             TTSEngineType::Auto => true,
-            TTSEngineType::Manbo => {
-                let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
-                match *h {
-                    EngineHealth::Healthy => true,
-                    EngineHealth::Degraded {
-                        failed_at,
-                        cooldown_secs,
-                    } => {
-                        if failed_at.elapsed() >= Duration::from_secs(cooldown_secs) {
-                            // 冷却结束，允许下一次播报探活。失败计数**不**清零：
-                            // 若探活仍失败，退避档位继续上升；成功时由
-                            // mark_engine_success 清零并立即恢复 Manbo。
-                            *h = EngineHealth::Healthy;
-                            true
-                        } else {
-                            false
-                        }
-                    }
-                }
-            }
+            TTSEngineType::Manbo => self.manbo_breaker.is_available(),
+            TTSEngineType::Feiyu => self.has_feiyu_key() && self.feiyu_breaker.is_available(),
             // 本地兜底恒常可用：Windows 走 System.Speech（SAPI），macOS 走内置 `say`
             TTSEngineType::Sapi => true,
         }
@@ -1150,43 +1305,40 @@ impl TTSManager {
 
     /// 标记引擎故障降级（连续失败按指数退避，封顶 30s）
     pub fn mark_engine_degraded(&self, engine: TTSEngineType) {
-        let now = Instant::now();
         match engine {
             // 「自动」无独立健康度，实际降级由其解析出的具体引擎承担
-            TTSEngineType::Auto => {}
+            TTSEngineType::Auto | TTSEngineType::Sapi => {}
             TTSEngineType::Manbo => {
                 // 状态与计数在同一把锁内更新：并发失败按到达顺序累计，后者写入更高档位
-                let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
-                let failures = self.manbo_failures.fetch_add(1, Ordering::SeqCst) + 1;
-                let cooldown_secs = Self::manbo_backoff_secs(failures);
-                *h = EngineHealth::Degraded {
-                    failed_at: now,
-                    cooldown_secs,
-                };
-                drop(h);
+                let failures = self
+                    .manbo_breaker
+                    .mark_degraded(Self::engine_backoff_secs);
                 crate::log_warn!(
-                    "[TTS] Manbo 熔断：连续失败 {} 次，{}s 后自动重试（期间使用本地 SAPI）",
+                    "[TTS] Manbo 熔断：连续失败 {} 次，{}s 后自动重试（期间降级下一引擎）",
                     failures,
-                    cooldown_secs
+                    Self::engine_backoff_secs(failures)
                 );
             }
-            TTSEngineType::Sapi => {}
+            TTSEngineType::Feiyu => {
+                let failures = self
+                    .feiyu_breaker
+                    .mark_degraded(Self::engine_backoff_secs);
+                crate::log_warn!(
+                    "[TTS] 大肥鱼（DeepSeek）熔断：连续失败 {} 次，{}s 后自动重试（期间降级下一引擎）",
+                    failures,
+                    Self::engine_backoff_secs(failures)
+                );
+            }
         }
     }
 
     /// 标记引擎请求成功：清零连续失败计数并立即恢复健康。
-    /// 引擎恢复后的第一次成功播报会走这里，后续播报马上回到曼波语音。
+    /// 引擎恢复后的第一次成功播报会走这里，后续播报马上回到该引擎。
     pub fn mark_engine_success(&self, engine: TTSEngineType) {
         match engine {
             TTSEngineType::Auto => {}
             TTSEngineType::Manbo => {
-                // 与失败路径同序：先拿状态锁，再清零计数并恢复健康。
-                // 若成功与失败并发，最终状态由后拿到锁的一方决定，不会出现
-                // "显示健康但计数未清"或"计数为 0 却仍在熔断"的错位。
-                let mut h = self.manbo_health.lock().unwrap_or_else(|e| e.into_inner());
-                let previous_failures = self.manbo_failures.swap(0, Ordering::SeqCst);
-                *h = EngineHealth::Healthy;
-                drop(h);
+                let previous_failures = self.manbo_breaker.mark_success();
                 self.mark_active_engine(TTSEngineType::Manbo);
                 if previous_failures > 0 {
                     crate::log_info!(
@@ -1195,24 +1347,47 @@ impl TTSManager {
                     );
                 }
             }
+            TTSEngineType::Feiyu => {
+                let previous_failures = self.feiyu_breaker.mark_success();
+                self.mark_active_engine(TTSEngineType::Feiyu);
+                if previous_failures > 0 {
+                    crate::log_info!(
+                        "[TTS] 大肥鱼语音已恢复（此前连续失败 {} 次），后续播报回到大肥鱼语音",
+                        previous_failures
+                    );
+                }
+            }
             TTSEngineType::Sapi => self.mark_active_engine(TTSEngineType::Sapi),
         }
     }
 
-    /// 选择当前最优可用引擎（首选引擎健康则用之；否则按 Manbo -> Sapi 降级）。
-    /// 配置为 `Auto`（对齐原工程 TTSProviderFactory 的 AUTO 模式）时直接走该降级链路。
-    pub fn select_active_engine(&self) -> TTSEngineType {
+    /// 引擎级联顺序（首选在前，末位恒为本地 SAPI 兜底）。
+    ///
+    /// - `Auto`（对齐原工程 TTSProviderFactory 的 AUTO 模式）：曼波（局域网）→ 大肥鱼（云端）→ 本地。
+    ///   大肥鱼按字符计费，故排在免费的局域网引擎之后；曼波未配置/不可用时才走付费云端。
+    /// - 显式引擎：只承诺该引擎，故障时直接落本地兜底，不擅自切换到另一个云端引擎。
+    pub fn engine_chain(&self) -> Vec<TTSEngineType> {
         let preferred = self.config.lock().unwrap().engine;
-        if preferred != TTSEngineType::Auto && self.is_engine_available(preferred) {
-            return preferred;
+        match preferred {
+            TTSEngineType::Auto => vec![
+                TTSEngineType::Manbo,
+                TTSEngineType::Feiyu,
+                TTSEngineType::Sapi,
+            ],
+            TTSEngineType::Manbo => vec![TTSEngineType::Manbo, TTSEngineType::Sapi],
+            TTSEngineType::Feiyu => vec![TTSEngineType::Feiyu, TTSEngineType::Sapi],
+            TTSEngineType::Sapi => vec![TTSEngineType::Sapi],
         }
+    }
 
-        // 故障降级链路
-        if self.is_engine_available(TTSEngineType::Manbo) {
-            TTSEngineType::Manbo
-        } else {
-            TTSEngineType::Sapi
+    /// 选择当前最优可用引擎（按 [`Self::engine_chain`] 取首个可用项）
+    pub fn select_active_engine(&self) -> TTSEngineType {
+        for engine in self.engine_chain() {
+            if self.is_engine_available(engine) {
+                return engine;
+            }
         }
+        TTSEngineType::Sapi
     }
 
     /// 记录本次实际使用的引擎（供「当前引擎」实时显示）
@@ -1222,8 +1397,8 @@ impl TTSManager {
         }
     }
 
-    /// 当前实际使用的引擎名（对齐原工程 `TTSManager_GetCurrentProviderName`：manbo / sapi）。
-    /// 尚未播报过时返回按配置解析出的引擎名
+    /// 当前实际使用的引擎名（对齐原工程 `TTSManager_GetCurrentProviderName`：manbo / sapi，
+    /// 大肥鱼为 feiyu）。尚未播报过时返回按配置解析出的引擎名
     pub fn current_engine_name(&self) -> String {
         let tracked = self.active_engine.lock().ok().and_then(|c| *c);
         tracked
@@ -1333,7 +1508,7 @@ impl TTSManager {
     }
 
     /// 局域网曼波引擎合成：先探测就绪（2s 快速失败），再 POST 合成返回 WAV 字节。
-    /// 任何失败都由调用方统一降级本地 SAPI 并计入熔断退避。
+    /// 任何失败都由调用方统一降级下一引擎并计入熔断退避。
     async fn synthesize_lan(
         client: &reqwest::Client,
         base_url: &str,
@@ -1382,7 +1557,7 @@ impl TTSManager {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok());
-        Self::validate_lan_content_type(content_type)?;
+        Self::validate_audio_content_type(content_type)?;
         let bytes = resp
             .bytes()
             .await
@@ -1394,11 +1569,11 @@ impl TTSManager {
         Ok(bytes.to_vec())
     }
 
-    /// 校验合成响应的 Content-Type（对齐实测契约 `audio/wav`，GPT-SoVITS api.py 固定
-    /// `StreamingResponse(media_type="audio/"+media_type)`）。
+    /// 校验合成响应的 Content-Type（曼波实测契约为 `audio/wav`，GPT-SoVITS api.py 固定
+    /// `StreamingResponse(media_type="audio/"+media_type)`；大肥鱼同为 `audio/wav`）。
     /// 只要求 `audio/*` 前缀（兼容 x-wav/wave 等变体）；头缺失视为不确定，交由
     /// 响应体 RIFF 头校验兜底，不在此拒判。
-    fn validate_lan_content_type(content_type: Option<&str>) -> Result<(), String> {
+    fn validate_audio_content_type(content_type: Option<&str>) -> Result<(), String> {
         let Some(ct) = content_type else {
             return Ok(());
         };
@@ -1408,6 +1583,85 @@ impl TTSManager {
         } else {
             Err(format!("引擎返回的不是音频（Content-Type: {ct}）"))
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 大肥鱼（DeepSeek TTS）——2026-11-13 官方开放语音 API
+    // -----------------------------------------------------------------------
+
+    /// 合成端点（HTTP，非流式）：`POST https://api.deepseek.com/v1/tools/tts`
+    pub const FEIYU_ENDPOINT: &'static str = "https://api.deepseek.com/v1/tools/tts";
+    /// 合成超时：官方短句通常 1~3s；30s 覆盖慢响应，超时即降级下一引擎。
+    /// 注意官方限制单请求最长 30 分钟音频、请求体 64 KiB、账单字符 10,000。
+    pub const FEIYU_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// 规范化音色 ID：官方仅 `stella`（女声，默认）/ `tide`（男声），
+    /// 未知值回落默认女声（配置脏数据不阻断播报）
+    pub fn normalize_feiyu_voice(voice: &str) -> &'static str {
+        match voice.trim().to_ascii_lowercase().as_str() {
+            "tide" => "tide",
+            _ => TTSConfig::FEIYU_DEFAULT_VOICE,
+        }
+    }
+
+    /// 构建大肥鱼请求体（官方契约字段）：
+    /// - `text` 必填；`format` 固定 `wav`，便于 rodio 解码与签到音频按 RIFF 头留档；
+    /// - `voice_id` 仅 stella/tide；`filter_markdown` 用官方默认 true（播报文本无 Markdown）；
+    /// - 官方**无语速/音调参数**，语速滑杆与音调对该引擎不生效（仅本地音量增益有效）。
+    pub fn build_feiyu_payload(text: &str, voice_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "text": text,
+            "voice_id": Self::normalize_feiyu_voice(voice_id),
+            "format": "wav",
+        })
+    }
+
+    /// 大肥鱼合成：`POST /v1/tools/tts`（Bearer Key，与 AI 对话共用）→ `audio/wav` 字节流。
+    /// 任何失败由调用方统一降级下一引擎并计入熔断退避。
+    async fn synthesize_feiyu(
+        client: &reqwest::Client,
+        api_key: &str,
+        text: &str,
+        voice_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        let key = api_key.trim();
+        if key.is_empty() {
+            return Err("DeepSeek API key is empty".into());
+        }
+        let resp = client
+            .post(Self::FEIYU_ENDPOINT)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", key))
+            .json(&Self::build_feiyu_payload(text, voice_id))
+            .timeout(Self::FEIYU_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| Self::describe_http_error(&e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            // 官方错误码：400 文本不可读/内容审核未过、429 并发超限、503 服务繁忙、504 合成超时；
+            // 带上响应体前段便于区分（不含 Key，可安全入日志）
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "HTTP {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        Self::validate_audio_content_type(content_type)?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("音频读取失败（{}）", Self::describe_http_error(&e)))?;
+        // RIFF 头校验：官方文档明确「合成中途失败会返回截断响应」，必须按失败处理；
+        // 同时拦截 Content-Type 合规但内容是 JSON/HTML 的异常响应
+        if bytes.len() < 12 || &bytes[..4] != b"RIFF" {
+            return Err("返回内容不是 WAV 音频（缺少 RIFF 头）".into());
+        }
+        Ok(bytes.to_vec())
     }
 
     /// 进程级共享 HTTP 客户端（对齐原工程 `Network.cpp` 的 `GetSharedSession` 共享
@@ -1472,7 +1726,8 @@ impl TTSManager {
             .await
     }
 
-    /// 多引擎智能文本语音播报（Manbo→本地 SAPI 两级降级、生成超时 10s 与故障熔断）。
+    /// 多引擎智能文本语音播报：按 [`Self::engine_chain`] 逐级尝试
+    /// （曼波/大肥鱼为云端引擎、各有独立熔断与退避，末位本地 SAPI 兜底）。
     /// 原特殊用户专属引擎已于 2026-11-07 随服务方下架试用端点 `/apis/mbAIsc` 一并移除，
     /// 特殊用户与普通用户走同一引擎链。
     async fn speak_text_inner(
@@ -1499,38 +1754,103 @@ impl TTSManager {
             return Ok(());
         }
 
-        // 共享 HTTP 客户端（构建失败几乎不会发生；此时跳过第 2 段，直接落第 3 段 SAPI 兜底）
+        // 共享 HTTP 客户端（构建失败几乎不会发生；此时跳过云端引擎，直接落本地兜底）
         if let Some(client) = Self::shared_http_client() {
-            // 2. 曼波引擎（局域网 GPT-SoVITS）：失败降级本地 SAPI
-            if self.select_active_engine() == TTSEngineType::Manbo {
-                if cfg.lan_engine_base_url.trim().is_empty() {
-                    // 缺引擎地址是配置问题，不是服务故障：不去请求，也不熔断
-                    crate::log_warn!(
-                        "[TTS] 未配置局域网曼波引擎地址：本次降级本地 SAPI（可在设置中填写引擎地址）"
-                    );
-                } else {
-                    match Self::synthesize_lan(
-                        client,
-                        &cfg.lan_engine_base_url,
-                        trimmed,
-                        cfg.speech_rate,
-                    )
-                    .await
-                    {
-                        Ok(bytes) => {
-                            self.mark_engine_success(TTSEngineType::Manbo);
-                            return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
+            for engine in self.engine_chain() {
+                if engine == TTSEngineType::Sapi {
+                    break;
+                }
+                if !self.is_engine_available(engine) {
+                    // 自动链路里「未配置」的可选引擎静默跳过（只写日志）；
+                    // 已配置却处于故障冷却、或主播显式选择了该引擎时才提示 ——
+                    // 否则主播只听到另一把声音却不知道原因（2026-11-25 实测反馈）
+                    let configured = match engine {
+                        TTSEngineType::Manbo => !cfg.lan_engine_base_url.trim().is_empty(),
+                        TTSEngineType::Feiyu => self.has_feiyu_key(),
+                        _ => false,
+                    };
+                    if configured || cfg.engine == engine {
+                        let reason = if configured {
+                            "故障冷却中"
+                        } else if engine == TTSEngineType::Feiyu {
+                            "未配置 DeepSeek Key"
+                        } else {
+                            "未配置引擎地址"
+                        };
+                        self.notify_engine_fallback(
+                            engine,
+                            format!(
+                                "{}引擎暂不可用（{}），本次播报已降级下一引擎",
+                                Self::engine_label(engine),
+                                reason
+                            ),
+                            false,
+                        );
+                    }
+                    continue;
+                }
+                let attempt = match engine {
+                    TTSEngineType::Manbo => {
+                        if cfg.lan_engine_base_url.trim().is_empty() {
+                            // 缺引擎地址是配置问题，不是服务故障：不去请求，也不熔断。
+                            // 仅显式选中曼波时提示界面；自动链路里属「可选引擎未配置」，只写日志
+                            crate::log_warn!(
+                                "[TTS] 未配置局域网曼波引擎地址：跳过曼波（可在设置中填写引擎地址）"
+                            );
+                            if cfg.engine == TTSEngineType::Manbo {
+                                self.notify_engine_fallback(
+                                    TTSEngineType::Manbo,
+                                    "未配置局域网曼波引擎地址，本次播报已降级本地语音".to_string(),
+                                    false,
+                                );
+                            }
+                            continue;
                         }
-                        Err(e) => {
-                            crate::log_warn!("[TTS] 曼波引擎请求失败：{}；降级本地 SAPI", e);
-                            self.mark_engine_degraded(TTSEngineType::Manbo);
+                        Self::synthesize_lan(
+                            client,
+                            &cfg.lan_engine_base_url,
+                            trimmed,
+                            cfg.speech_rate,
+                        )
+                        .await
+                    }
+                    TTSEngineType::Feiyu => {
+                        // is_engine_available 已要求 Key 非空，此处仅防御 Key 被并发清空
+                        let key = self.feiyu_api_key_snapshot();
+                        if key.trim().is_empty() {
+                            continue;
                         }
+                        Self::synthesize_feiyu(client, &key, trimmed, &cfg.feiyu_voice_id).await
+                    }
+                    TTSEngineType::Auto | TTSEngineType::Sapi => continue,
+                };
+                match attempt {
+                    Ok(bytes) => {
+                        self.mark_engine_success(engine);
+                        return self.play_audio_bytes(&bytes, checkin_username, notice.cloned());
+                    }
+                    Err(e) => {
+                        crate::log_warn!(
+                            "[TTS] {} 引擎请求失败：{}；降级下一引擎",
+                            Self::engine_label(engine),
+                            e
+                        );
+                        self.notify_engine_fallback(
+                            engine,
+                            format!(
+                                "{}引擎请求失败（{}），本次播报已降级下一引擎",
+                                Self::engine_label(engine),
+                                Self::truncate_notice(&e, 120)
+                            ),
+                            false,
+                        );
+                        self.mark_engine_degraded(engine);
                     }
                 }
             }
         }
 
-        // 3. 本地离线兜底（Windows SAPI / macOS say），全参数按平台映射
+        // 本地离线兜底（Windows SAPI / macOS say），全参数按平台映射
         self.mark_active_engine(TTSEngineType::Sapi);
         let params = SapiParams {
             rate: cfg.speech_rate,
@@ -1547,12 +1867,55 @@ impl TTSManager {
         queued
     }
 
+    /// 日志/提示用中文引擎名（UI 展示文案由前端维护，不在此处定义）
+    fn engine_label(engine: TTSEngineType) -> &'static str {
+        match engine {
+            TTSEngineType::Auto => "自动",
+            TTSEngineType::Manbo => "曼波",
+            TTSEngineType::Feiyu => "大肥鱼",
+            TTSEngineType::Sapi => "本地语音",
+        }
+    }
+
+    /// 播报链路降级提示的最小间隔（同一引擎）：持续故障时不必每条弹幕都弹 toast
+    pub const ENGINE_NOTICE_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// 提示文案截断（按字符截断，避免多字节 UTF-8 边界 panic）
+    fn truncate_notice(text: &str, max_chars: usize) -> String {
+        let mut out: String = text.chars().take(max_chars).collect();
+        if text.chars().count() > max_chars {
+            out.push('…');
+        }
+        out
+    }
+
+    /// 投递引擎降级提示：`force=true`（试听等显式动作）绕过节流；
+    /// 播报链路按引擎节流，避免持续故障时刷屏。
+    fn notify_engine_fallback(&self, engine: TTSEngineType, message: String, force: bool) {
+        if !force {
+            let mut last = self
+                .engine_notice_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if last
+                .get(engine.provider_name())
+                .is_some_and(|t| now.duration_since(*t) < Self::ENGINE_NOTICE_INTERVAL)
+            {
+                return;
+            }
+            last.insert(engine.provider_name(), now);
+        }
+        fire_engine_notice(&EngineNotice { engine, message });
+    }
+
     /// 试听指定参数的测试句（设置面板「试听」按钮）。
-    /// 引擎选择与实际播报一致（首选引擎健康则用之，Manbo 失败自动降级 SAPI）；
-    /// **试听是显式探活动作**：即使 Manbo 正处于退避窗口，也绕过冷却直接试一次 ——
-    /// 成功会立即恢复 Manbo，失败则按正常规则继续退避。
+    /// 引擎选择与实际播报的首选一致（Auto 等价于链路首位的曼波；大肥鱼失败同样降级本地 SAPI）；
+    /// **试听是显式探活动作**：即使首选引擎正处于退避窗口，也绕过冷却直接试一次 ——
+    /// 成功会立即恢复该引擎，失败则按正常规则继续退避。
     /// 音量/语速/音调用传入即时值（绕开配置自动保存防抖），
-    /// 不受语音总开关限制（试听语义 = 配置阶段听当前参数效果）
+    /// 不受语音总开关限制（试听语义 = 配置阶段听当前参数效果）。
+    /// 注意：大肥鱼（DeepSeek）官方接口无语速/音调参数，这两项对该引擎不生效。
     pub async fn speak_test_sample(
         &self,
         text: &str,
@@ -1566,7 +1929,7 @@ impl TTSManager {
         }
         let cfg = self.config.lock().unwrap().clone();
 
-        // 试听绕过熔断冷却：按配置偏好直接探活 Manbo（Auto 等价于首选 Manbo）。
+        // 试听绕过熔断冷却：按配置偏好直接探活首选引擎（Auto 等价于首选曼波）。
         // 网络修好后主播点一次试听即可确认恢复，不必等退避窗口结束。
         let preferred = match cfg.engine {
             TTSEngineType::Auto => TTSEngineType::Manbo,
@@ -1584,6 +1947,11 @@ impl TTSManager {
         if preferred == TTSEngineType::Manbo {
             if cfg.lan_engine_base_url.trim().is_empty() {
                 crate::log_warn!("[TTS] 试听：未配置局域网曼波引擎地址，降级本地 SAPI");
+                self.notify_engine_fallback(
+                    TTSEngineType::Manbo,
+                    "未配置局域网曼波引擎地址，试听已降级本地语音".to_string(),
+                    true,
+                );
             } else if let Some(client) = Self::shared_http_client() {
                 // 试听语速按即时滑杆值生效；音量在本地播放端应用，音调对局域网引擎无效
                 match Self::synthesize_lan(
@@ -1605,10 +1973,70 @@ impl TTSManager {
                     Err(e) => {
                         self.mark_engine_degraded(TTSEngineType::Manbo);
                         crate::log_warn!("[TTS] 试听曼波引擎请求失败({}),降级本地 SAPI", e);
+                        self.notify_engine_fallback(
+                            TTSEngineType::Manbo,
+                            format!(
+                                "曼波引擎请求失败（{}），试听已降级本地语音",
+                                Self::truncate_notice(&e, 120)
+                            ),
+                            true,
+                        );
                     }
                 }
             } else {
                 crate::log_warn!("[TTS] 共享 HTTP 客户端不可用，试听降级本地 SAPI");
+                self.notify_engine_fallback(
+                    TTSEngineType::Manbo,
+                    "网络客户端初始化失败，试听已降级本地语音".to_string(),
+                    true,
+                );
+            }
+        }
+
+        if preferred == TTSEngineType::Feiyu {
+            let key = self.feiyu_api_key_snapshot();
+            if key.trim().is_empty() {
+                crate::log_warn!(
+                    "[TTS] 试听：未配置 DeepSeek Key（大肥鱼与 AI 对话共用凭据），降级本地 SAPI"
+                );
+                self.notify_engine_fallback(
+                    TTSEngineType::Feiyu,
+                    "未配置 DeepSeek Key（大肥鱼与打卡 AI 共用凭据），试听已降级本地语音"
+                        .to_string(),
+                    true,
+                );
+            } else if let Some(client) = Self::shared_http_client() {
+                // 官方接口无语速/音调参数；音量在本地播放端应用
+                match Self::synthesize_feiyu(client, &key, trimmed, &cfg.feiyu_voice_id).await {
+                    Ok(bytes) => {
+                        self.mark_engine_success(TTSEngineType::Feiyu);
+                        crate::log_info!(
+                            "[TTS] 试听走大肥鱼引擎（音色 {}，音量 {} 由本地播放端增益应用；官方接口无语速参数）",
+                            Self::normalize_feiyu_voice(&cfg.feiyu_voice_id),
+                            volume
+                        );
+                        return AudioQueue::global().play_tts_bytes(bytes, volume);
+                    }
+                    Err(e) => {
+                        self.mark_engine_degraded(TTSEngineType::Feiyu);
+                        crate::log_warn!("[TTS] 试听大肥鱼引擎请求失败({}),降级本地 SAPI", e);
+                        self.notify_engine_fallback(
+                            TTSEngineType::Feiyu,
+                            format!(
+                                "大肥鱼引擎请求失败（{}），试听已降级本地语音",
+                                Self::truncate_notice(&e, 120)
+                            ),
+                            true,
+                        );
+                    }
+                }
+            } else {
+                crate::log_warn!("[TTS] 共享 HTTP 客户端不可用，试听降级本地 SAPI");
+                self.notify_engine_fallback(
+                    TTSEngineType::Feiyu,
+                    "网络客户端初始化失败，试听已降级本地语音".to_string(),
+                    true,
+                );
             }
         }
 
@@ -1635,7 +2063,9 @@ mod tests {
 
     #[test]
     fn test_auto_engine_cascade_and_current_engine_name() {
-        // D1：引擎「自动」对齐原工程 TTSProviderFactory 的 AUTO 模式（manbo -> sapi）
+        // D1：引擎「自动」对齐原工程 TTSProviderFactory 的 AUTO 模式，
+        // 链路为 曼波（局域网）→ 大肥鱼（云端）→ 本地 SAPI：
+        // 大肥鱼按字符计费，故排在免费局域网引擎之后，仅作云端备选
         let mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Auto,
             ..Default::default()
@@ -1643,24 +2073,50 @@ mod tests {
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Manbo);
         assert_eq!(mgr.current_engine_name(), "manbo");
 
-        // Manbo 熔断后自动降级 SAPI
+        // 未配置大肥鱼 Key：曼波熔断后直接落本地 SAPI（缺 Key 是配置问题，不算服务故障）
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
         assert_eq!(mgr.current_engine_name(), "sapi");
 
-        // 显式指定引擎时以其为准（故障时才降级），「自动」自身不参与降级判定
+        // 配好 Key 后：曼波熔断 → 大肥鱼接棒（set_feiyu_api_key 只清大肥鱼熔断）
+        mgr.set_feiyu_api_key("sk-test".into());
+        assert!(mgr.is_engine_available(TTSEngineType::Feiyu));
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Feiyu);
+        mgr.mark_engine_success(TTSEngineType::Feiyu);
+        assert_eq!(mgr.current_engine_name(), "feiyu");
+
+        // 两条云端链路都熔断 → 本地兜底
+        mgr.mark_engine_degraded(TTSEngineType::Feiyu);
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
+
+        // 显式指定引擎时以其为准；故障时只落本地，不擅自切到另一个云端引擎
         let explicit = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Feiyu,
+            ..Default::default()
+        });
+        assert_eq!(
+            explicit.engine_chain(),
+            vec![TTSEngineType::Feiyu, TTSEngineType::Sapi]
+        );
+        // 未配置 Key：显式选择也不可用，直接本地
+        assert!(!explicit.is_engine_available(TTSEngineType::Feiyu));
+        assert_eq!(explicit.select_active_engine(), TTSEngineType::Sapi);
+
+        let explicit_sapi = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Sapi,
             ..Default::default()
         });
-        assert_eq!(explicit.select_active_engine(), TTSEngineType::Sapi);
-        assert_eq!(explicit.current_engine_name(), "sapi");
-        assert!(explicit.is_engine_available(TTSEngineType::Auto));
-        explicit.mark_engine_degraded(TTSEngineType::Auto);
-        assert_eq!(explicit.select_active_engine(), TTSEngineType::Sapi);
+        assert_eq!(
+            explicit_sapi.engine_chain(),
+            vec![TTSEngineType::Sapi],
+            "显式选本地语音时无需任何云端尝试"
+        );
+        assert!(explicit_sapi.is_engine_available(TTSEngineType::Auto));
+        explicit_sapi.mark_engine_degraded(TTSEngineType::Auto);
 
         // 引擎名映射（对齐原工程 TTSManager_GetCurrentProviderName 返回值）
         assert_eq!(TTSEngineType::Manbo.provider_name(), "manbo");
+        assert_eq!(TTSEngineType::Feiyu.provider_name(), "feiyu");
         assert_eq!(TTSEngineType::Sapi.provider_name(), "sapi");
         println!("[PASS] test_auto_engine_cascade_and_current_engine_name passed");
     }
@@ -1798,6 +2254,109 @@ mod tests {
 
     /// 通知器是进程级全局：涉及播放通知的测试共用一把锁串行执行，避免互相覆盖
     static PLAY_NOTICE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 引擎降级通知器同样是进程级全局：单独一把锁串行执行
+    static ENGINE_NOTICE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 引擎降级提示：缺 Key 时必须给出面向主播的原因（试听强制提示），
+    /// 播报链路按引擎节流（同一引擎 5 分钟内只提示一次）。
+    #[test]
+    fn test_engine_fallback_notice_and_throttle() {
+        let _guard = ENGINE_NOTICE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let fired = Arc::new(Mutex::new(Vec::<EngineNotice>::new()));
+        {
+            let fired = fired.clone();
+            set_engine_notice_notifier(Arc::new(move |n: &EngineNotice| {
+                fired.lock().unwrap().push(n.clone());
+            }));
+        }
+
+        let rt = tokio::runtime::Runtime::new().expect("创建 tokio 运行时失败");
+
+        // 1) 显式选大肥鱼但缺 Key：试听必须提示原因（force，绕过节流）
+        let feiyu = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Feiyu,
+            ..Default::default()
+        });
+        rt.block_on(async {
+            feiyu.speak_test_sample("试听", 50, 0, 0).await.unwrap();
+            feiyu.speak_test_sample("试听", 50, 0, 0).await.unwrap();
+        });
+        {
+            let notices = fired.lock().unwrap();
+            assert_eq!(notices.len(), 2, "试听为显式动作，每次都应提示: {:?}", *notices);
+            assert_eq!(notices[0].engine, TTSEngineType::Feiyu);
+            assert!(
+                notices[0].message.contains("DeepSeek Key"),
+                "提示应说明缺 Key: {}",
+                notices[0].message
+            );
+        }
+
+        // 2) 播报链路（显式曼波、地址为空）：首次提示、第二次被节流
+        let manbo = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Manbo,
+            ..Default::default()
+        });
+        let task = SpeakTask {
+            text: "测试播报".into(),
+            user_id: "u1".into(),
+            is_checkin: false,
+            checkin_username: String::new(),
+            priority: false,
+            bubble: None,
+        };
+        rt.block_on(async {
+            manbo.speak_task(&task).await.unwrap();
+            manbo.speak_task(&task).await.unwrap();
+        });
+        {
+            let notices = fired.lock().unwrap();
+            let manbo_notices: Vec<_> = notices
+                .iter()
+                .filter(|n| n.engine == TTSEngineType::Manbo)
+                .collect();
+            assert_eq!(
+                manbo_notices.len(),
+                1,
+                "同一引擎播报提示必须节流: {:?}",
+                *notices
+            );
+            assert!(
+                manbo_notices[0].message.contains("曼波"),
+                "提示应说明曼波地址缺失: {}",
+                manbo_notices[0].message
+            );
+        }
+
+        // 3) 自动链路里「未配置的可选引擎」只写日志，不打扰界面
+        let auto = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Auto,
+            ..Default::default()
+        });
+        let before = fired.lock().unwrap().len();
+        rt.block_on(async {
+            auto.speak_task(&task).await.unwrap();
+        });
+        assert_eq!(
+            fired.lock().unwrap().len(),
+            before,
+            "自动链路缺配置不应弹提示"
+        );
+
+        // 4) 提示文案按字符截断（多字节安全）
+        let long = "异".repeat(200);
+        let cut = TTSManager::truncate_notice(&long, 120);
+        assert_eq!(cut.chars().count(), 121, "120 字符 + 省略号");
+        assert!(cut.ends_with('…'));
+        assert_eq!(TTSManager::truncate_notice("短文本", 120), "短文本");
+
+        println!("[PASS] test_engine_fallback_notice_and_throttle passed");
+    }
+
 
     #[test]
     fn test_checkin_speak_with_notice_attaches_bubble() {
@@ -2278,16 +2837,138 @@ mod tests {
     /// 合成响应 Content-Type 校验：实测契约为 audio/wav（api.py 固定 media_type）。
     /// audio/* 变体放行、非音频给出明确错误、头缺失不拒判（交 RIFF 头兜底）。
     #[test]
-    fn test_lan_content_type_validation() {
-        assert!(TTSManager::validate_lan_content_type(Some("audio/wav")).is_ok());
-        assert!(TTSManager::validate_lan_content_type(Some("audio/x-wav")).is_ok());
-        assert!(TTSManager::validate_lan_content_type(Some("Audio/WAV; charset=binary")).is_ok());
-        assert!(TTSManager::validate_lan_content_type(None).is_ok(), "头缺失交 RIFF 兜底");
+    fn test_audio_content_type_validation() {
+        assert!(TTSManager::validate_audio_content_type(Some("audio/wav")).is_ok());
+        assert!(TTSManager::validate_audio_content_type(Some("audio/x-wav")).is_ok());
+        assert!(TTSManager::validate_audio_content_type(Some("Audio/WAV; charset=binary")).is_ok());
+        assert!(TTSManager::validate_audio_content_type(None).is_ok(), "头缺失交 RIFF 兜底");
 
-        let err = TTSManager::validate_lan_content_type(Some("application/json")).unwrap_err();
+        let err = TTSManager::validate_audio_content_type(Some("application/json")).unwrap_err();
         assert!(err.contains("application/json"), "错误需带实际 Content-Type: {}", err);
-        assert!(TTSManager::validate_lan_content_type(Some("text/html; charset=utf-8")).is_err());
-        println!("[PASS] test_lan_content_type_validation passed");
+        assert!(TTSManager::validate_audio_content_type(Some("text/html; charset=utf-8")).is_err());
+        println!("[PASS] test_audio_content_type_validation passed");
+    }
+
+    /// 大肥鱼（DeepSeek TTS）请求契约：端点、请求体字段、音色规范化与超时预算。
+    /// 官方契约（2026-11-13 开放语音 API）：`POST /v1/tools/tts`，Bearer Key 与 AI 对话共用，
+    /// 请求体仅 text/voice_id/format，响应为 audio/wav 字节流；**无语速/音调参数**。
+    #[test]
+    fn test_feiyu_endpoint_payload_and_voice() {
+        assert_eq!(
+            TTSManager::FEIYU_ENDPOINT,
+            "https://api.deepseek.com/v1/tools/tts"
+        );
+
+        let payload = TTSManager::build_feiyu_payload("你好", "tide");
+        assert_eq!(payload["text"], "你好");
+        assert_eq!(payload["voice_id"], "tide");
+        assert_eq!(payload["format"], "wav", "固定 WAV 便于 rodio 解码与签到留档");
+        // 官方接口无语速/音调参数：请求体不得出现（避免依赖未定义字段）
+        assert!(payload.get("speed").is_none(), "payload: {}", payload);
+
+        // 音色仅两种（大小写/空白宽松），脏值回落默认女声 stella
+        assert_eq!(TTSManager::normalize_feiyu_voice("stella"), "stella");
+        assert_eq!(TTSManager::normalize_feiyu_voice(" TIDE "), "tide");
+        assert_eq!(TTSManager::normalize_feiyu_voice(""), "stella");
+        assert_eq!(TTSManager::normalize_feiyu_voice("unknown"), "stella");
+        assert_eq!(TTSConfig::default().feiyu_voice_id, "stella");
+        assert_eq!(TTSManager::build_feiyu_payload("x", "")["voice_id"], "stella");
+
+        // 超时预算：云端短句合成不得低于 10s、也不应无限等待
+        assert!(TTSManager::FEIYU_REQUEST_TIMEOUT >= Duration::from_secs(10));
+        assert!(TTSManager::FEIYU_REQUEST_TIMEOUT <= Duration::from_secs(60));
+        println!("[PASS] test_feiyu_endpoint_payload_and_voice passed");
+    }
+
+    /// 大肥鱼 Key 同步与熔断：缺 Key 时该引擎退出链路（不算故障），
+    /// 换 Key 立即清熔断，成功清零退避。
+    #[test]
+    fn test_feiyu_key_sync_breaker_and_backoff() {
+        let mgr = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Feiyu,
+            ..Default::default()
+        });
+        assert!(!mgr.has_feiyu_key());
+        assert!(!mgr.is_engine_available(TTSEngineType::Feiyu), "缺 Key 视为不可用");
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
+
+        mgr.set_feiyu_api_key(" sk-test ".into());
+        assert!(mgr.has_feiyu_key());
+        assert!(mgr.is_engine_available(TTSEngineType::Feiyu));
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Feiyu);
+
+        // 连续失败计数与统一退避档位（5 → 10 → 20 → 30 封顶）
+        mgr.mark_engine_degraded(TTSEngineType::Feiyu);
+        assert_eq!(mgr.feiyu_breaker.failures.load(Ordering::SeqCst), 1);
+        assert!(!mgr.is_engine_available(TTSEngineType::Feiyu));
+        mgr.mark_engine_degraded(TTSEngineType::Feiyu);
+        assert_eq!(mgr.feiyu_breaker.failures.load(Ordering::SeqCst), 2);
+        {
+            let h = mgr.feiyu_breaker.health.lock().unwrap();
+            match *h {
+                EngineHealth::Degraded { cooldown_secs, .. } => {
+                    assert_eq!(cooldown_secs, 10, "第二次失败应进入 10s 档")
+                }
+                _ => panic!("连续失败后应处于熔断状态"),
+            }
+        }
+
+        // 换 Key（凭据重新导入）立即清熔断与退避
+        mgr.set_feiyu_api_key("sk-new".into());
+        assert_eq!(mgr.feiyu_breaker.failures.load(Ordering::SeqCst), 0);
+        assert!(mgr.is_engine_available(TTSEngineType::Feiyu));
+
+        // 一次成功清零退避
+        mgr.mark_engine_degraded(TTSEngineType::Feiyu);
+        mgr.mark_engine_success(TTSEngineType::Feiyu);
+        assert_eq!(mgr.feiyu_breaker.failures.load(Ordering::SeqCst), 0);
+        assert_eq!(mgr.current_engine_name(), "feiyu");
+
+        // Key 被撤回（凭据清空）：显式选择同样退回本地，不留失效云端请求
+        mgr.set_feiyu_api_key(String::new());
+        assert!(!mgr.is_engine_available(TTSEngineType::Feiyu));
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
+        println!("[PASS] test_feiyu_key_sync_breaker_and_backoff passed");
+    }
+
+    /// 切换引擎 / 大肥鱼音色必须重置大肥鱼熔断与退避；无关配置变更不得重置
+    #[test]
+    fn test_update_config_resets_feiyu_health_on_engine_or_voice_change() {
+        let mgr = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Feiyu,
+            ..Default::default()
+        });
+        mgr.set_feiyu_api_key("sk-test".into());
+        mgr.mark_engine_degraded(TTSEngineType::Feiyu);
+        assert!(!mgr.is_engine_available(TTSEngineType::Feiyu));
+
+        // 音量变化与大肥鱼链路无关：熔断保持
+        let mut cfg = mgr.config_snapshot();
+        cfg.speech_volume = 55;
+        mgr.update_config(cfg);
+        assert!(
+            !mgr.is_engine_available(TTSEngineType::Feiyu),
+            "无关配置变更不应清熔断"
+        );
+
+        // 改音色 → 立即恢复重试
+        let mut cfg = mgr.config_snapshot();
+        cfg.feiyu_voice_id = "tide".into();
+        mgr.update_config(cfg);
+        assert!(mgr.is_engine_available(TTSEngineType::Feiyu), "改音色应清熔断");
+
+        // 再熔断后切换播报引擎 → 同样立即恢复，并清零退避计数
+        mgr.mark_engine_degraded(TTSEngineType::Feiyu);
+        assert_eq!(mgr.feiyu_breaker.failures.load(Ordering::SeqCst), 1);
+        let mut cfg = mgr.config_snapshot();
+        cfg.engine = TTSEngineType::Auto;
+        mgr.update_config(cfg);
+        assert!(
+            mgr.is_engine_available(TTSEngineType::Feiyu),
+            "切换播报引擎应清熔断"
+        );
+        assert_eq!(mgr.feiyu_breaker.failures.load(Ordering::SeqCst), 0);
+        println!("[PASS] test_update_config_resets_feiyu_health_on_engine_or_voice_change passed");
     }
 
     /// 切换引擎 / 局域网引擎地址必须重置曼波熔断与退避；无关配置变更不得重置
@@ -2318,7 +2999,7 @@ mod tests {
 
         // 再熔断后切换播报引擎 → 同样立即恢复，并清零退避计数
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
-        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 1);
+        assert_eq!(mgr.manbo_breaker.failures.load(Ordering::SeqCst), 1);
         let mut cfg = mgr.config_snapshot();
         cfg.engine = TTSEngineType::Auto;
         mgr.update_config(cfg);
@@ -2326,7 +3007,7 @@ mod tests {
             mgr.is_engine_available(TTSEngineType::Manbo),
             "切换播报引擎应清熔断"
         );
-        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(mgr.manbo_breaker.failures.load(Ordering::SeqCst), 0);
 
         println!("[PASS] test_update_config_resets_manbo_health_on_engine_or_lan_change passed");
     }
@@ -2354,21 +3035,21 @@ mod tests {
     /// 任意一次成功立即清零并恢复曼波引擎，改引擎地址/引擎也立即清零。
     #[test]
     fn test_manbo_backoff_and_success_recovery() {
-        assert_eq!(TTSManager::manbo_backoff_secs(1), 5);
-        assert_eq!(TTSManager::manbo_backoff_secs(2), 10);
-        assert_eq!(TTSManager::manbo_backoff_secs(3), 20);
-        assert_eq!(TTSManager::manbo_backoff_secs(4), 30);
-        assert_eq!(TTSManager::manbo_backoff_secs(99), 30, "退避必须封顶");
+        assert_eq!(TTSManager::engine_backoff_secs(1), 5);
+        assert_eq!(TTSManager::engine_backoff_secs(2), 10);
+        assert_eq!(TTSManager::engine_backoff_secs(3), 20);
+        assert_eq!(TTSManager::engine_backoff_secs(4), 30);
+        assert_eq!(TTSManager::engine_backoff_secs(99), 30, "退避必须封顶");
 
         let mgr = TTSManager::new(TTSConfig {
             engine: TTSEngineType::Manbo,
             ..Default::default()
         });
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
-        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 1);
+        assert_eq!(mgr.manbo_breaker.failures.load(Ordering::SeqCst), 1);
         assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
         {
-            let h = mgr.manbo_health.lock().unwrap();
+            let h = mgr.manbo_breaker.health.lock().unwrap();
             match *h {
                 EngineHealth::Degraded { cooldown_secs, .. } => {
                     assert_eq!(cooldown_secs, 5, "首次失败应只冷却 5s 以便快速恢复")
@@ -2379,21 +3060,21 @@ mod tests {
 
         // 连续失败：退避升档
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
-        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 2);
+        assert_eq!(mgr.manbo_breaker.failures.load(Ordering::SeqCst), 2);
         assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
 
         // 网络恢复：一次成功立即清零退避并回到 Manbo（不等冷却走完）
         mgr.mark_engine_success(TTSEngineType::Manbo);
-        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(mgr.manbo_breaker.failures.load(Ordering::SeqCst), 0);
         assert!(mgr.is_engine_available(TTSEngineType::Manbo));
         assert_eq!(mgr.select_active_engine(), TTSEngineType::Manbo);
 
         // 显式重置（换 Key/音色/引擎）同样清零
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
         mgr.mark_engine_degraded(TTSEngineType::Manbo);
-        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 2);
+        assert_eq!(mgr.manbo_breaker.failures.load(Ordering::SeqCst), 2);
         mgr.reset_manbo_health();
-        assert_eq!(mgr.manbo_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(mgr.manbo_breaker.failures.load(Ordering::SeqCst), 0);
         assert!(mgr.is_engine_available(TTSEngineType::Manbo));
 
         println!("[PASS] test_manbo_backoff_and_success_recovery passed");

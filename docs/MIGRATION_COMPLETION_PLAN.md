@@ -421,15 +421,28 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
 > 对照实现：`ConfigWindow.xaml(.cs)`、`OrderedMonsterWindow.xaml(.cs)`、`AIBubbleControl.xaml`、`DanmuManager.cs:48-63`、`BliveManager.h/.cpp`（连接状态机）、`WriteLog.cpp`（日志）
 
 ### D1 语音设置区补全 ✅
-- **引擎「自动」**：`TTSEngineType::Auto`（`tts.rs`）+ `select_active_engine` 级联 曼波引擎（局域网） → SAPI，对齐原工程 `TTSProviderFactory::Create` 的 AUTO 模式；`parse_tts_engine` 统一字符串映射（未知值按原工程默认 Manbo）。
-- **当前实际引擎实时显示**：`TTSManager.active_engine` 在每次播报成功路径记录；命令 `get_current_tts_engine` 返回 `manbo/sapi`（对齐 `TTSManager_GetCurrentProviderName` 命名），前端每 2.5s 刷新并映射为 `曼波（局域网） / Windows 本地语音 / 未知`。
+- **引擎「自动」**：`TTSEngineType::Auto`（`tts.rs`）+ `select_active_engine` 级联 曼波引擎（局域网） → 大肥鱼（DeepSeek 云端） → SAPI，对齐原工程 `TTSProviderFactory::Create` 的 AUTO 模式；`parse_tts_engine` 统一字符串映射（未知值按「自动」级联处理）。
+- **当前实际引擎实时显示**：`TTSManager.active_engine` 在每次播报成功路径记录；命令 `get_current_tts_engine` 返回 `manbo/feiyu/sapi`（对齐 `TTSManager_GetCurrentProviderName` 命名），前端每 2.5s 刷新并映射为 `曼波（局域网） / 大肥鱼（DeepSeek 云端） / Windows 本地语音 / 未知`。
+- **大肥鱼 TTS**（2026-11-25，DeepSeek 官方 2026-11-13 开放语音 API）：`TTSEngineType::Feiyu` +
+  `POST https://api.deepseek.com/v1/tools/tts`（`text/voice_id/format=wav`，响应 WAV 字节流）。
+  音色设置项 `deepseek_tts_voice`（`stella` 女声默认 / `tide` 男声）；API Key **与打卡 AI 共用**
+  credentials.dat 中的 DeepSeek Key（`TTSManager.set_feiyu_api_key` 在启动、保存配置、凭据导入三处同步）。
+  官方接口无语速/音调参数（语速与音调滑杆对该引擎不生效，音量仍由本地 rodio 增益控制）；
+  按字符计费，故「自动」链路排在免费局域网引擎之后。独立熔断退避（5→10→20→30s），
+  换 Key/改音色/切引擎/网络恢复均清空。Lite 形态不涉及（TTS 整体停用）。
+  降级原因（缺 Key / 未填地址 / 熔断冷却 / 请求失败）经 `tts-engine-notice` 同步主窗口 toast：
+  试听为显式动作强制提示，播报链路按引擎 5 分钟节流；自动链路里「未配置的可选引擎」只写日志。
+  本地 SAPI 播报失败亦写 warning（此前返回值被忽略、完全静默）。
+  验收：`test_feiyu_endpoint_payload_and_voice`、`test_feiyu_key_sync_breaker_and_backoff`、
+  `test_update_config_resets_feiyu_health_on_engine_or_voice_change`、`test_parse_tts_engine_aliases`、
+  `test_engine_fallback_notice_and_throttle`。
 - **局域网引擎设置**（2026-11-07 起，替代原 Manbo API Key 密码框与 184 音色下拉）：引擎地址
   `lan_engine_base_url`（如 `http://引擎机IP:9880`，空 = 曼波降级本地语音）与参考音频路径
   `lan_engine_refer_path`（引擎机侧 `models\refer.wav` 绝对路径），均为普通配置项随 configs.json 持久化。
 - **语速/音量/音高**：语音音量终案 **`0~100` 直通**（100 = SAPI 满档 / rodio 满量增益；SAPI 侧经 `sapi_volume_from` 对数曲线反补偿，与 Manbo 任意档位响度对齐。历史沿革：原工程为 0~200 滑块 + SAPI `Volume 减半`，V2 曾短暂改回 0~200 两倍刻度随 0.1.10 发布，后收口为 0~100 并对旧值减半迁移）；音高、语速 ±10。
 - **MiMo 角色/风格**：`mimo_voice`（默认/中文/英文）、`mimo_style`（默认 + 5 种）下拉，与原工程 `MimoVoiceComboBox / MimoStyleComboBox` 选项逐项一致。
 - **缓存天数 / 过滤开关 / 总开关**：`tts_cache_days_to_keep`（1~365 钳制）、`enable_voice` 总开关、`only_speek_wearing_medal`、`only_speek_paid_gift`、`only_speek_guard_level`（所有人/舰长/提督/总督）、舰长打卡 AI 开关与触发词。
-- **验收**：`test_auto_engine_cascade_and_current_engine_name`（Auto 级联 + 引擎名映射）、`test_parse_tts_engine_mapping`。
+- **验收**：`test_auto_engine_cascade_and_current_engine_name`（Auto 级联 + 引擎名映射）、`test_parse_tts_engine_aliases`。
 
 ### D2 点怪设置与窗口控制 ✅
 - **仅粉丝牌可点怪入口**：设置面板复选框（→ `only_medal_order`，运行期由 `DanmuProcessor.update_filters` 热生效）。

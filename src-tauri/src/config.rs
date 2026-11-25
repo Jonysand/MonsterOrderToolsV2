@@ -34,6 +34,10 @@ pub struct AppConfig {
     /// 参考音频已引擎侧固化（2026-11-07 契约变更），工具侧无对应配置
     #[serde(default)]
     pub lan_engine_base_url: String,
+    /// 大肥鱼（DeepSeek TTS）音色：`stella`（女声，默认）/ `tide`（男声）。
+    /// API Key 与 AI 对话共用 credentials.dat，不落 JSON 配置。
+    /// 不写字段级 default：缺键时取 `AppConfig::default()` 的 stella（字段级 default 会给空串）
+    pub deepseek_tts_voice: String,
     pub tts_cache_days_to_keep: i32,
 
     // 3. 弹幕与播报过滤配置
@@ -77,6 +81,7 @@ impl Default for AppConfig {
             volume_scale: 2,
             speech_pitch: 0,
             lan_engine_base_url: String::new(),
+            deepseek_tts_voice: "stella".into(),
             tts_cache_days_to_keep: 7,
 
             only_medal_order: true,
@@ -379,6 +384,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         // 默认值逐项对齐原工程 ConfigData（MonsterOrderWilds/ConfigManager.h:12-45）
         assert_eq!(cfg.tts_engine, "auto");
+        assert_eq!(cfg.deepseek_tts_voice, "stella", "大肥鱼默认女声 Stella");
         assert!(!cfg.enable_voice);
         assert!(cfg.only_medal_order);
         assert_eq!(cfg.opacity, 100);
@@ -389,12 +395,16 @@ mod tests {
         // id_code 不再经 JSON 往返（仅注册表持久化），此处只验证常规字段
         cfg.default_marquee_text = "自定义跑马灯通告".into();
         cfg.opacity = 80;
+        cfg.tts_engine = "feiyu".into();
+        cfg.deepseek_tts_voice = "tide".into();
 
         assert!(cfg.save(Some(&path)).is_ok());
 
         let loaded = AppConfig::load(Some(&path));
         assert_eq!(loaded.default_marquee_text, "自定义跑马灯通告");
         assert_eq!(loaded.opacity, 80);
+        assert_eq!(loaded.tts_engine, "feiyu");
+        assert_eq!(loaded.deepseek_tts_voice, "tide");
 
         // sanitized()：凭据清空、常规字段保持
         let s = cfg.sanitized();

@@ -162,12 +162,19 @@
           speak_task(task)       ├─► 本地语音包命中（zip 优先）→ 直接播放
                                  ├─► 曼波引擎（局域网 GPT-SoVITS：GET /control 探测 → POST / UTF-8 JSON → WAV，
                                  │   speed=1+rate×5%；部署包见 MamboTTS-Engine/README-部署说明.md）
+                                 ├─► 大肥鱼（DeepSeek 云端 TTS：POST /v1/tools/tts → WAV；Key 与打卡 AI 共用，
+                                 │   音色 stella/tide，官方接口无语速/音调参数；按字符计费）
                                  └─► Windows SAPI（中文音色 + SSML rate/volume/pitch）
                                    ▼
               AudioQueue（单播放线程 + mpsc，全部音频串行，防叠音）
                                    ▼
         rodio 播放（60s 超时保护） / SAPI 子进程（30s 超时强杀）
 ```
+
+* **引擎级联**：「自动」= 曼波（局域网，免费）→ 大肥鱼（DeepSeek 云端，按字符计费）→ 本地 SAPI；
+  显式选定引擎时只承诺该引擎，故障直接落本地兜底，不擅自切换到另一个付费云端引擎。
+  曼波/大肥鱼各自独立熔断退避（连续失败 5→10→20→30s 封顶），配置变更与网络恢复时清空。
+  降级原因经 `tts-engine-notice` 事件同步主窗口 toast（试听强制提示，播报按引擎 5 分钟节流）。
 
 * **Lite 模式**：管道层拦截，不产生任何 TTS 队列任务与前端事件。
 

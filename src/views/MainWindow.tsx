@@ -58,6 +58,7 @@ const DEFAULT_CONNECTION: ConnectionStatusPayload = {
 /** 引擎名 → 展示文案（对齐原工程 UpdateCurrentTTSEngineLabel） */
 const ENGINE_LABELS: Record<string, string> = {
   manbo: "曼波（局域网）",
+  feiyu: "大肥鱼（DeepSeek 云端）",
   sapi: "Windows 本地语音",
 };
 
@@ -305,6 +306,14 @@ export const MainWindow: React.FC = () => {
           setRecentCheckins((prev) => [event.payload, ...prev].slice(0, 10));
         });
 
+    // TTS 引擎降级提示（缺 Key / 未填地址 / 熔断冷却）：后端已按引擎节流，直接 toast；
+    // 避免"点了试听只听到另一把声音"被误认为功能坏了（2026-11-25 实测反馈）
+    const unlistenTtsNotice = __IS_LITE__
+      ? Promise.resolve(() => {})
+      : listen<{ engine: string; message: string }>("tts-engine-notice", (event) => {
+          showToast(event.payload.message);
+        });
+
     // D2 锁定状态同步（命令 / Alt+, 热键）
     const unlistenLock = listen<boolean>("overlay-lock-changed", (event) => {
       setOverlayLocked(event.payload);
@@ -348,6 +357,7 @@ export const MainWindow: React.FC = () => {
       unlistenQueue.then((f) => f());
       unlistenPersist.then((f) => f());
       unlistenCheckinDown.then((f) => f());
+      unlistenTtsNotice.then((f) => f());
       unlistenConn.then((f) => f());
       unlistenCheckin.then((f) => f());
       unlistenLock.then((f) => f());
@@ -1485,16 +1495,18 @@ export const MainWindow: React.FC = () => {
                   {!isLite && (
                     <>
                       <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
-                        <span className="text-[10px] text-neutral-500 block">AI 模型凭据</span>
+                        <span className="text-[10px] text-neutral-500 block">AI / 大肥鱼凭据</span>
                         <span className={`text-xs font-bold ${credStatus?.has_chat_key ? "text-emerald-300" : "text-neutral-500"}`}>
                           {credStatus?.has_chat_key ? `已绑定 (${credStatus.chat_provider})` : "未绑定"}
                         </span>
                       </div>
 
                       <div className="bg-neutral-950/70 p-2.5 rounded-lg border border-neutral-800">
-                        <span className="text-[10px] text-neutral-500 block">曼波语音</span>
-                        <span className={`text-xs font-bold ${config.lan_engine_base_url ? "text-emerald-300" : "text-neutral-500"}`}>
-                          {config.lan_engine_base_url ? "局域网引擎已配置" : "本地语音"}
+                        <span className="text-[10px] text-neutral-500 block">播报引擎</span>
+                        <span className={`text-xs font-bold ${config.tts_engine === "sapi" ? "text-neutral-500" : "text-emerald-300"}`}>
+                          {config.tts_engine === "auto"
+                            ? "自动（曼波优先）"
+                            : ENGINE_LABELS[config.tts_engine] || "未知"}
                         </span>
                       </div>
                     </>
@@ -1568,8 +1580,9 @@ export const MainWindow: React.FC = () => {
                       onChange={(e) => applyConfigPatch({ tts_engine: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
-                      <option value="auto">自动（按优先级依次尝试）</option>
+                      <option value="auto">自动（曼波 → 大肥鱼 → 本地）</option>
                       <option value="manbo">曼波（局域网引擎）</option>
+                      <option value="feiyu">大肥鱼（DeepSeek 云端）</option>
                       <option value="sapi">Windows 本地语音</option>
                     </select>
                   </div>
@@ -1596,9 +1609,9 @@ export const MainWindow: React.FC = () => {
                 </div>
 
                 {/* 局域网曼波引擎（GPT-SoVITS 部署包，部署见包内 README.md 与对接契约变更-20261107）：
-                    地址为空时曼波播报自动降级本地语音；选 Windows 本地语音时无需配置。
+                    地址为空时曼波播报自动降级下一引擎；选 Windows 本地语音或仅用大肥鱼时无需配置。
                     参考音频已引擎侧固化，无需（也无法）在工具侧配置 */}
-                {config.tts_engine !== "sapi" && (
+                {(config.tts_engine || "auto") !== "sapi" && config.tts_engine !== "feiyu" && (
                   <div className="pt-3 border-t border-neutral-800">
                     <label className="block text-[11px] text-neutral-400 mb-1">
                       曼波引擎地址（局域网 GPT-SoVITS）
@@ -1610,6 +1623,28 @@ export const MainWindow: React.FC = () => {
                       onChange={(e) => applyConfigPatch({ lan_engine_base_url: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     />
+                  </div>
+                )}
+
+                {/* 大肥鱼（DeepSeek TTS，2026-11-13 官方开放语音 API）：
+                    与 AI 对话共用凭据文件中的同一把 DeepSeek Key，按字符计费；
+                    官方接口不支持语速/音调，速率与音调滑杆对该引擎不生效（音量仍由本地增益控制） */}
+                {(config.tts_engine || "auto") !== "sapi" && config.tts_engine !== "manbo" && (
+                  <div className="pt-3 border-t border-neutral-800">
+                    <label className="block text-[11px] text-neutral-400 mb-1">
+                      大肥鱼音色（DeepSeek 云端，与打卡 AI 共用 Key）
+                    </label>
+                    <select
+                      value={config.deepseek_tts_voice || "stella"}
+                      onChange={(e) => applyConfigPatch({ deepseek_tts_voice: e.target.value })}
+                      className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
+                    >
+                      <option value="stella">女声 Stella（默认）</option>
+                      <option value="tide">男声 Tide</option>
+                    </select>
+                    <p className="mt-1 text-[10px] text-neutral-500 leading-relaxed">
+                      大肥鱼按字符计费，官方接口不支持语速/音调：速率与音调滑杆仅对曼波/本地语音生效。
+                    </p>
                   </div>
                 )}
 

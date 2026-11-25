@@ -90,6 +90,9 @@ export interface AppConfig {
   /** 局域网曼波引擎（GPT-SoVITS）基础地址，如 http://192.168.1.50:9880；空 = 未配置。
    *  参考音频已引擎侧固化（2026-11-07 契约变更），工具侧无对应配置 */
   lan_engine_base_url: string;
+  /** 大肥鱼（DeepSeek TTS）音色：stella（女声，默认）/ tide（男声）。
+   *  Key 与 AI 对话共用 credentials.dat，前端不持有 */
+  deepseek_tts_voice: string;
   tts_cache_days_to_keep: number;
 
   only_medal_order: boolean;

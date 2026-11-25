@@ -208,7 +208,8 @@ impl Default for AppState {
 
         // 4. 初始化 TTS 管理器
         // 曼波引擎为局域网 GPT-SoVITS（部署包见 F:\ManboTTS\package\MamboTTS-Engine），
-        // 无需任何 Key；参考音频已引擎侧固化，配置仅引擎地址一项
+        // 无需任何 Key；参考音频已引擎侧固化，配置仅引擎地址一项。
+        // 大肥鱼（DeepSeek TTS）与 AI 对话共用同一把 DeepSeek Key，装配后另行注入
         let tts_mgr = TTSManager::new(TTSConfig {
             engine: parse_tts_engine(&app_cfg.tts_engine),
             enable_voice: app_cfg.enable_voice,
@@ -216,6 +217,7 @@ impl Default for AppState {
             speech_volume: app_cfg.speech_volume,
             speech_pitch: app_cfg.speech_pitch,
             lan_engine_base_url: app_cfg.lan_engine_base_url.clone(),
+            feiyu_voice_id: app_cfg.deepseek_tts_voice.clone(),
         });
 
         // 5. 初始化 AI 思考模块 (优先注入加密凭证中的 API Key)
@@ -224,7 +226,9 @@ impl Default for AppState {
         } else {
             app_cfg.deepseek_api_key.clone()
         };
-        let ai_provider = DeepSeekAIChatProvider::new(chat_key);
+        let ai_provider = DeepSeekAIChatProvider::new(chat_key.clone());
+        // 大肥鱼语音复用同一把 DeepSeek Key（2026-11-25）
+        tts_mgr.set_feiyu_api_key(chat_key);
 
         // 6. 初始化弹幕处理器（过滤开关运行时热更新）
         let danmu_processor = bilibili::DanmuProcessor::new();
@@ -1179,6 +1183,8 @@ fn apply_config_to_state(
     // 播报过滤（仅粉丝牌/舰长等级）由 handle_incoming_danmu 直接读 config 快照，无需另行同步
     state.danmu_processor.update_filters(new_cfg.only_medal_order);
     state.ai_provider.set_api_key(new_cfg.deepseek_api_key.clone());
+    // 大肥鱼语音复用 AI 对话的 DeepSeek Key（同一凭据，换 Key 立即恢复该引擎）
+    state.tts_mgr.set_feiyu_api_key(new_cfg.deepseek_api_key.clone());
     state.tts_mgr.update_config(TTSConfig {
         engine: parse_tts_engine(&new_cfg.tts_engine),
         enable_voice: new_cfg.enable_voice,
@@ -1186,6 +1192,7 @@ fn apply_config_to_state(
         speech_volume: new_cfg.speech_volume,
         speech_pitch: new_cfg.speech_pitch,
         lan_engine_base_url: new_cfg.lan_engine_base_url,
+        feiyu_voice_id: new_cfg.deepseek_tts_voice,
     });
     Ok(sanitized)
 }
@@ -1263,11 +1270,13 @@ fn apply_connection_status(
             format!("{:?}", next.reason),
             next.attempt
         );
-        // 网络恢复信号：B 站长连重新建立说明链路大概率已恢复，清掉 Manbo 退避，
-        // 让下一条播报立刻重试云端音色，而不是继续等最多 30s 的退避窗口。
-        // 若 Manbo 服务本身仍不可用，这次探活失败会重新进入退避，不会造成风暴。
+        // 网络恢复信号：B 站长连重新建立说明链路大概率已恢复，清掉云端引擎
+        // （曼波/大肥鱼）的退避，让下一条播报立刻重试云端音色，而不是继续等
+        // 最多 30s 的退避窗口。若服务本身仍不可用，这次探活失败会重新进入退避，
+        // 不会造成风暴。
         if next.state == bilibili::ConnectionState::Connected {
             state.tts_mgr.reset_manbo_health();
+            state.tts_mgr.reset_feiyu_health();
         }
     }
 
@@ -2748,12 +2757,14 @@ fn apply_credentials_live(state: &AppState, creds: &credentials::Credentials) ->
     sync_credential_consumers(state)
 }
 
-/// 把当前凭据快照同步到 AI Provider。
+/// 把当前凭据快照同步到 AI Provider 与大肥鱼语音（两者共用同一把 DeepSeek Key）。
 /// 单独成函数是为了让"磁盘已提交 B、内存发布失败"这一中间态可被显式检测与补偿。
-/// （TTS 已于 2026-11-07 改用局域网曼波引擎，不再消费任何凭据，无需在此同步）
 fn sync_credential_consumers(state: &AppState) -> Result<(), String> {
     let snap = state.credentials_snapshot();
     state.ai_provider.set_api_key(snap.creds.chat_api_key.clone());
+    state
+        .tts_mgr
+        .set_feiyu_api_key(snap.creds.chat_api_key.clone());
     Ok(())
 }
 
@@ -2951,12 +2962,13 @@ fn gm_export_checkin_records(
 fn parse_tts_engine(s: &str) -> TTSEngineType {
     match s.trim().to_ascii_lowercase().as_str() {
         "manbo" | "曼波" => TTSEngineType::Manbo,
+        "feiyu" | "deepseek" | "大肥鱼" => TTSEngineType::Feiyu,
         "sapi" => TTSEngineType::Sapi,
         _ => TTSEngineType::Auto,
     }
 }
 
-/// 当前实际使用的 TTS 引擎名（manbo / sapi），供设置面板实时显示
+/// 当前实际使用的 TTS 引擎名（manbo / feiyu / sapi），供设置面板实时显示
 #[tauri::command]
 fn get_current_tts_engine(state: State<'_, AppState>) -> String {
     state.tts_mgr.current_engine_name()
@@ -2964,9 +2976,10 @@ fn get_current_tts_engine(state: State<'_, AppState>) -> String {
 
 /// 试听当前语音参数（设置面板音量滑块旁按钮）：
 /// 按当前所选 TTS 引擎播报，引擎选择与实际播报一致
-/// （首选引擎健康则用之，Manbo 失败自动降级 SAPI）；
+/// （首选引擎健康则用之；曼波/大肥鱼失败自动降级本地 SAPI）；
 /// 音量/语速/音调用前端传入滑块即时值（绕开 800ms 自动保存防抖），
-/// 不受语音总开关限制（试听语义 = 配置阶段听当前参数效果）
+/// 不受语音总开关限制（试听语义 = 配置阶段听当前参数效果）。
+/// 注意：大肥鱼（DeepSeek）官方接口无语速/音调参数，这两项对该引擎不生效。
 #[tauri::command]
 async fn test_speech_volume(
     state: State<'_, AppState>,
@@ -3364,6 +3377,22 @@ pub fn run() {
                 }));
             }
 
+            // 引擎降级提示：缺 Key / 未填地址 / 熔断冷却等降级原因同步到主窗口 toast，
+            // 避免主播只听到另一把声音却误以为功能坏了（2026-11-25 实测反馈）。
+            // 播报链路已在 TTS 侧按引擎节流（5 分钟），试听为强制提示
+            {
+                let handle = app.handle().clone();
+                tts::set_engine_notice_notifier(std::sync::Arc::new(move |notice| {
+                    let _ = handle.emit(
+                        "tts-engine-notice",
+                        serde_json::json!({
+                            "engine": notice.engine.provider_name(),
+                            "message": notice.message,
+                        }),
+                    );
+                }));
+            }
+
             // 播报泵：每 100ms（对齐原工程 TIMER_INTERVAL=100）各出队一条优先/普通任务并结算超时连击；
             // 并发合成上限 MAX_CONCURRENT_TTS=2（对齐原工程 activeRequestCount_ 闸门）
             let state = app.state::<AppState>().inner().clone();
@@ -3665,6 +3694,21 @@ mod tests {
         // 显示器信息缺失 → 不夹紧（不能凭猜测挪窗口）
         assert_eq!(clamp_overlay_position(1976.0, 574.0, w, h, &[]), (1976.0, 574.0));
         println!("[PASS] test_clamp_overlay_position_keeps_window_reachable passed");
+    }
+
+    /// TTS 引擎名解析：新增「大肥鱼」（DeepSeek）别名；未知值仍按自动级联处理
+    #[test]
+    fn test_parse_tts_engine_aliases() {
+        assert_eq!(parse_tts_engine("manbo"), TTSEngineType::Manbo);
+        assert_eq!(parse_tts_engine(" 曼波 "), TTSEngineType::Manbo);
+        assert_eq!(parse_tts_engine("feiyu"), TTSEngineType::Feiyu);
+        assert_eq!(parse_tts_engine("DeepSeek"), TTSEngineType::Feiyu);
+        assert_eq!(parse_tts_engine("大肥鱼"), TTSEngineType::Feiyu);
+        assert_eq!(parse_tts_engine("sapi"), TTSEngineType::Sapi);
+        assert_eq!(parse_tts_engine("auto"), TTSEngineType::Auto);
+        // 未知值按「自动」处理（对齐原工程 TTSProviderFactory::Create 的 default 分支）
+        assert_eq!(parse_tts_engine("unknown"), TTSEngineType::Auto);
+        println!("[PASS] test_parse_tts_engine_aliases passed");
     }
 
     #[test]
