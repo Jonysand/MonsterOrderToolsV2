@@ -430,12 +430,15 @@ INSERT INTO retroactive_cards (..., weekly_first_claimed) → table ... has no c
   官方接口无语速/音调参数（语速与音调滑杆对该引擎不生效，音量仍由本地 rodio 增益控制）；
   按字符计费，故「自动」链路排在免费局域网引擎之后。独立熔断退避（5→10→20→30s），
   换 Key/改音色/切引擎/网络恢复均清空。Lite 形态不涉及（TTS 整体停用）。
+  **自动模式引擎开关**：`auto_enable_manbo_tts` / `auto_enable_feiyu_tts`（默认都开）——
+  关闭后自动链路整段跳过该引擎（大肥鱼可借此避免云端计费），本地语音为最终兜底恒常启用；
+  开关只约束「自动」，手动选择引擎不受影响；试听首选同样取自动链路中第一个已启用的云端引擎。
   降级原因（缺 Key / 未填地址 / 熔断冷却 / 请求失败）经 `tts-engine-notice` 同步主窗口 toast：
   试听为显式动作强制提示，播报链路按引擎 5 分钟节流；自动链路里「未配置的可选引擎」只写日志。
   本地 SAPI 播报失败亦写 warning（此前返回值被忽略、完全静默）。
   验收：`test_feiyu_endpoint_payload_and_voice`、`test_feiyu_key_sync_breaker_and_backoff`、
   `test_update_config_resets_feiyu_health_on_engine_or_voice_change`、`test_parse_tts_engine_aliases`、
-  `test_engine_fallback_notice_and_throttle`。
+  `test_engine_fallback_notice_and_throttle`、`test_auto_chain_respects_engine_switches`。
 - **局域网引擎设置**（2026-11-07 起，替代原 Manbo API Key 密码框与 184 音色下拉）：引擎地址
   `lan_engine_base_url`（如 `http://引擎机IP:9880`，空 = 曼波降级本地语音）与参考音频路径
   `lan_engine_refer_path`（引擎机侧 `models\refer.wav` 绝对路径），均为普通配置项随 configs.json 持久化。

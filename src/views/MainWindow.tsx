@@ -73,6 +73,15 @@ export const MainWindow: React.FC = () => {
   // 编译期形态常量（vite --mode lite 注入）：完整版 false / Lite 版 true，运行期不可切换
   const isLite = __IS_LITE__;
   const [config, setConfig] = useState<AppConfig | null>(null);
+  /**
+   * 自动链路展示（与后端 engine_chain 对齐：自动模式的开关只过滤云端引擎，
+   * 本地语音为最终兜底恒在；字段缺失（旧配置）按启用处理）
+   */
+  const autoChainLabels: string[] = [
+    config?.auto_enable_manbo_tts !== false ? "曼波" : null,
+    config?.auto_enable_feiyu_tts !== false ? "大肥鱼" : null,
+    "本地语音",
+  ].filter((x): x is string => x !== null);
   /** 拖拽起点：记 user_id 而不是下标 —— 拖动期间队列可能被弹幕改动，下标会漂移 */
   const [draggedUserId, setDraggedUserId] = useState<string | null>(null);
   /** 最近应用的权威快照（版本 + 落盘状态），所有队列写入都必须经由 applyQueueSnapshot */
@@ -1505,7 +1514,7 @@ export const MainWindow: React.FC = () => {
                         <span className="text-[10px] text-neutral-500 block">播报引擎</span>
                         <span className={`text-xs font-bold ${config.tts_engine === "sapi" ? "text-neutral-500" : "text-emerald-300"}`}>
                           {config.tts_engine === "auto"
-                            ? "自动（曼波优先）"
+                            ? `自动（${autoChainLabels.join(" → ")}）`
                             : ENGINE_LABELS[config.tts_engine] || "未知"}
                         </span>
                       </div>
@@ -1580,7 +1589,7 @@ export const MainWindow: React.FC = () => {
                       onChange={(e) => applyConfigPatch({ tts_engine: e.target.value })}
                       className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-1.5 text-xs text-neutral-200 disabled:opacity-40"
                     >
-                      <option value="auto">自动（曼波 → 大肥鱼 → 本地）</option>
+                      <option value="auto">自动（按引擎开关依次尝试）</option>
                       <option value="manbo">曼波（局域网引擎）</option>
                       <option value="feiyu">大肥鱼（DeepSeek 云端）</option>
                       <option value="sapi">Windows 本地语音</option>
@@ -1608,10 +1617,39 @@ export const MainWindow: React.FC = () => {
                   </div>
                 </div>
 
+                {/* 自动模式引擎开关：关闭后自动链路整段跳过该引擎；
+                    本地语音是最终兜底恒常启用（关光了也只是全走本地语音），开关不影响手动选择引擎 */}
+                {config.tts_engine === "auto" && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-3 border-t border-neutral-800">
+                    <label className="flex items-center gap-2 text-xs text-neutral-300 font-bold cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={config.auto_enable_manbo_tts !== false}
+                        onChange={(e) => applyConfigPatch({ auto_enable_manbo_tts: e.target.checked })}
+                        className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
+                      />
+                      <span>自动模式下启用曼波（局域网）</span>
+                    </label>
+                    <label className="flex items-center gap-2 text-xs text-neutral-300 font-bold cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={config.auto_enable_feiyu_tts !== false}
+                        onChange={(e) => applyConfigPatch({ auto_enable_feiyu_tts: e.target.checked })}
+                        className="rounded bg-neutral-950 border-neutral-800 text-amber-500 focus:ring-0"
+                      />
+                      <span>自动模式下启用大肥鱼（DeepSeek，按字符计费）</span>
+                    </label>
+                    <p className="md:col-span-2 text-[10px] text-neutral-500 leading-relaxed">
+                      自动链路：{autoChainLabels.join(" → ")}（本地语音为最终兜底，始终启用）
+                    </p>
+                  </div>
+                )}
+
                 {/* 局域网曼波引擎（GPT-SoVITS 部署包，部署见包内 README.md 与对接契约变更-20261107）：
                     地址为空时曼波播报自动降级下一引擎；选 Windows 本地语音或仅用大肥鱼时无需配置。
                     参考音频已引擎侧固化，无需（也无法）在工具侧配置 */}
-                {(config.tts_engine || "auto") !== "sapi" && config.tts_engine !== "feiyu" && (
+                {(config.tts_engine === "manbo"
+                  || (config.tts_engine === "auto" && config.auto_enable_manbo_tts !== false)) && (
                   <div className="pt-3 border-t border-neutral-800">
                     <label className="block text-[11px] text-neutral-400 mb-1">
                       曼波引擎地址（局域网 GPT-SoVITS）
@@ -1629,7 +1667,8 @@ export const MainWindow: React.FC = () => {
                 {/* 大肥鱼（DeepSeek TTS，2026-11-13 官方开放语音 API）：
                     与 AI 对话共用凭据文件中的同一把 DeepSeek Key，按字符计费；
                     官方接口不支持语速/音调，速率与音调滑杆对该引擎不生效（音量仍由本地增益控制） */}
-                {(config.tts_engine || "auto") !== "sapi" && config.tts_engine !== "manbo" && (
+                {(config.tts_engine === "feiyu"
+                  || (config.tts_engine === "auto" && config.auto_enable_feiyu_tts !== false)) && (
                   <div className="pt-3 border-t border-neutral-800">
                     <label className="block text-[11px] text-neutral-400 mb-1">
                       大肥鱼音色（DeepSeek 云端，与打卡 AI 共用 Key）

@@ -63,10 +63,23 @@ pub enum EngineHealth {
     Degraded { failed_at: Instant, cooldown_secs: u64 },
 }
 
+/// serde 缺省：自动模式引擎开关默认启用（旧配置/旧快照缺键时保持原有级联行为）
+fn default_true() -> bool {
+    true
+}
+
 /// TTS 智能语音配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TTSConfig {
     pub engine: TTSEngineType,
+    /// 自动模式下是否启用曼波（局域网）引擎：关闭后自动链路跳过曼波。
+    /// 仅约束「自动」；显式选中曼波不受影响；本地语音为最终兜底恒常启用
+    #[serde(default = "default_true")]
+    pub auto_enable_manbo_tts: bool,
+    /// 自动模式下是否启用大肥鱼（DeepSeek 云端）引擎：关闭后自动链路跳过该引擎
+    /// （用于避免曼波故障时静默产生云端计费）
+    #[serde(default = "default_true")]
+    pub auto_enable_feiyu_tts: bool,
     pub enable_voice: bool,
     pub speech_rate: i32,
     pub speech_volume: i32,
@@ -86,6 +99,8 @@ impl Default for TTSConfig {
     fn default() -> Self {
         Self {
             engine: TTSEngineType::Manbo,
+            auto_enable_manbo_tts: true,
+            auto_enable_feiyu_tts: true,
             enable_voice: true,
             speech_rate: 0,
             // 50 = 原工程默认 100（旧满量 200 的一半）的等效响度
@@ -1218,17 +1233,19 @@ impl TTSManager {
 
     /// 更新 TTS 配置。
     ///
-    /// 引擎切换、局域网引擎地址或大肥鱼音色变化时**重置对应引擎的熔断与退避**：
+    /// 引擎切换、局域网引擎地址、大肥鱼音色或自动模式引擎开关变化时**重置对应引擎的熔断与退避**：
     /// 这些都是主播的显式修复动作，不该被上一次故障留下的冷却期挡住 ——
     /// 否则改完配置还得等退避窗口才生效。切换引擎会同时清空两条云端链路。
     pub fn update_config(&self, new_cfg: TTSConfig) {
         let (manbo_changed, feiyu_changed) = {
             let mut cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
             let engine_changed = cfg.engine != new_cfg.engine;
-            let manbo_changed =
-                engine_changed || cfg.lan_engine_base_url != new_cfg.lan_engine_base_url;
-            let feiyu_changed =
-                engine_changed || cfg.feiyu_voice_id != new_cfg.feiyu_voice_id;
+            let manbo_changed = engine_changed
+                || cfg.lan_engine_base_url != new_cfg.lan_engine_base_url
+                || cfg.auto_enable_manbo_tts != new_cfg.auto_enable_manbo_tts;
+            let feiyu_changed = engine_changed
+                || cfg.feiyu_voice_id != new_cfg.feiyu_voice_id
+                || cfg.auto_enable_feiyu_tts != new_cfg.auto_enable_feiyu_tts;
             *cfg = new_cfg;
             (manbo_changed, feiyu_changed)
         };
@@ -1365,15 +1382,23 @@ impl TTSManager {
     ///
     /// - `Auto`（对齐原工程 TTSProviderFactory 的 AUTO 模式）：曼波（局域网）→ 大肥鱼（云端）→ 本地。
     ///   大肥鱼按字符计费，故排在免费的局域网引擎之后；曼波未配置/不可用时才走付费云端。
+    ///   自动模式的引擎开关（`auto_enable_*`）只在这条链路里生效：关掉的引擎整段跳过，
+    ///   本地兜底不受开关影响（关光了也只是全走本地语音）。
     /// - 显式引擎：只承诺该引擎，故障时直接落本地兜底，不擅自切换到另一个云端引擎。
     pub fn engine_chain(&self) -> Vec<TTSEngineType> {
-        let preferred = self.config.lock().unwrap().engine;
-        match preferred {
-            TTSEngineType::Auto => vec![
-                TTSEngineType::Manbo,
-                TTSEngineType::Feiyu,
-                TTSEngineType::Sapi,
-            ],
+        let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner());
+        match cfg.engine {
+            TTSEngineType::Auto => {
+                let mut chain = Vec::new();
+                if cfg.auto_enable_manbo_tts {
+                    chain.push(TTSEngineType::Manbo);
+                }
+                if cfg.auto_enable_feiyu_tts {
+                    chain.push(TTSEngineType::Feiyu);
+                }
+                chain.push(TTSEngineType::Sapi);
+                chain
+            }
             TTSEngineType::Manbo => vec![TTSEngineType::Manbo, TTSEngineType::Sapi],
             TTSEngineType::Feiyu => vec![TTSEngineType::Feiyu, TTSEngineType::Sapi],
             TTSEngineType::Sapi => vec![TTSEngineType::Sapi],
@@ -1910,7 +1935,8 @@ impl TTSManager {
     }
 
     /// 试听指定参数的测试句（设置面板「试听」按钮）。
-    /// 引擎选择与实际播报的首选一致（Auto 等价于链路首位的曼波；大肥鱼失败同样降级本地 SAPI）；
+    /// 引擎选择与实际播报的首选一致（自动模式取链路中第一个已启用的云端引擎；
+    /// 大肥鱼失败同样降级本地 SAPI）；
     /// **试听是显式探活动作**：即使首选引擎正处于退避窗口，也绕过冷却直接试一次 ——
     /// 成功会立即恢复该引擎，失败则按正常规则继续退避。
     /// 音量/语速/音调用传入即时值（绕开配置自动保存防抖），
@@ -1929,10 +1955,15 @@ impl TTSManager {
         }
         let cfg = self.config.lock().unwrap().clone();
 
-        // 试听绕过熔断冷却：按配置偏好直接探活首选引擎（Auto 等价于首选曼波）。
-        // 网络修好后主播点一次试听即可确认恢复，不必等退避窗口结束。
+        // 试听绕过熔断冷却：按配置偏好直接探活首选引擎。
+        // 「自动」取自动链路里第一个**已启用**的云端引擎（曼波→大肥鱼，开关全关时直接本地），
+        // 与真实播报的链路一致；网络修好后主播点一次试听即可确认恢复，不必等退避窗口结束。
         let preferred = match cfg.engine {
-            TTSEngineType::Auto => TTSEngineType::Manbo,
+            TTSEngineType::Auto => self
+                .engine_chain()
+                .into_iter()
+                .find(|e| *e != TTSEngineType::Sapi)
+                .unwrap_or(TTSEngineType::Sapi),
             explicit => explicit,
         };
         crate::log_info!(
@@ -2878,6 +2909,73 @@ mod tests {
         assert!(TTSManager::FEIYU_REQUEST_TIMEOUT >= Duration::from_secs(10));
         assert!(TTSManager::FEIYU_REQUEST_TIMEOUT <= Duration::from_secs(60));
         println!("[PASS] test_feiyu_endpoint_payload_and_voice passed");
+    }
+
+    /// 自动模式引擎开关：关闭后自动链路跳过对应引擎（本地兜底恒在）；
+    /// 显式选择引擎时开关不生效。
+    #[test]
+    fn test_auto_chain_respects_engine_switches() {
+        let mgr = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Auto,
+            ..Default::default()
+        });
+        assert_eq!(
+            mgr.engine_chain(),
+            vec![
+                TTSEngineType::Manbo,
+                TTSEngineType::Feiyu,
+                TTSEngineType::Sapi
+            ],
+            "默认两个开关都开"
+        );
+
+        // 关闭曼波 + 大肥鱼有 Key → 自动链路直接走大肥鱼
+        mgr.set_feiyu_api_key("sk-test".into());
+        mgr.mark_engine_degraded(TTSEngineType::Manbo);
+        assert!(!mgr.is_engine_available(TTSEngineType::Manbo));
+        let mut cfg = mgr.config_snapshot();
+        cfg.auto_enable_manbo_tts = false;
+        mgr.update_config(cfg);
+        assert!(
+            mgr.is_engine_available(TTSEngineType::Manbo),
+            "拨动自动开关属显式修复动作，应清对应引擎的熔断"
+        );
+        assert_eq!(
+            mgr.engine_chain(),
+            vec![TTSEngineType::Feiyu, TTSEngineType::Sapi]
+        );
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Feiyu);
+
+        // 恢复曼波、关闭大肥鱼 → 曼波 → 本地（不再产生云端计费）
+        let mut cfg = mgr.config_snapshot();
+        cfg.auto_enable_manbo_tts = true;
+        cfg.auto_enable_feiyu_tts = false;
+        mgr.update_config(cfg);
+        assert_eq!(
+            mgr.engine_chain(),
+            vec![TTSEngineType::Manbo, TTSEngineType::Sapi]
+        );
+
+        // 两个都关 → 只剩本地兜底
+        let mut cfg = mgr.config_snapshot();
+        cfg.auto_enable_manbo_tts = false;
+        mgr.update_config(cfg);
+        assert_eq!(mgr.engine_chain(), vec![TTSEngineType::Sapi]);
+        assert_eq!(mgr.select_active_engine(), TTSEngineType::Sapi);
+
+        // 显式选择引擎不受自动开关约束（开关只描述「自动」链路）
+        let explicit = TTSManager::new(TTSConfig {
+            engine: TTSEngineType::Manbo,
+            auto_enable_manbo_tts: false,
+            auto_enable_feiyu_tts: false,
+            ..Default::default()
+        });
+        assert_eq!(
+            explicit.engine_chain(),
+            vec![TTSEngineType::Manbo, TTSEngineType::Sapi]
+        );
+        assert_eq!(explicit.select_active_engine(), TTSEngineType::Manbo);
+        println!("[PASS] test_auto_chain_respects_engine_switches passed");
     }
 
     /// 大肥鱼 Key 同步与熔断：缺 Key 时该引擎退出链路（不算故障），

@@ -20,6 +20,12 @@ pub struct AppConfig {
 
     // 2. TTS 语音引擎配置
     pub tts_engine: String,
+    /// 自动模式下是否启用曼波（局域网）引擎：关闭后自动链路跳过曼波。
+    /// 仅影响「自动」；显式选中曼波时不受此开关约束；本地语音为最终兜底恒常启用
+    pub auto_enable_manbo_tts: bool,
+    /// 自动模式下是否启用大肥鱼（DeepSeek 云端）引擎：关闭后自动链路跳过该引擎
+    /// （用于避免曼波故障时静默产生云端计费）
+    pub auto_enable_feiyu_tts: bool,
     pub enable_voice: bool,
     pub speech_rate: i32,
     /// 语音音量（刻度 0~100 直通：100 = SAPI 满档 / rodio 满量增益 1.0）。
@@ -73,6 +79,8 @@ impl Default for AppConfig {
             access_key_secret: String::new(),
 
             tts_engine: "auto".into(),
+            auto_enable_manbo_tts: true,
+            auto_enable_feiyu_tts: true,
             enable_voice: false,
             speech_rate: 0,
             // 新刻度 50 = 旧刻度 100（原工程默认）的等效响度：增益路径（Manbo/音效）听感不变；
@@ -384,6 +392,8 @@ mod tests {
         let mut cfg = AppConfig::default();
         // 默认值逐项对齐原工程 ConfigData（MonsterOrderWilds/ConfigManager.h:12-45）
         assert_eq!(cfg.tts_engine, "auto");
+        assert!(cfg.auto_enable_manbo_tts, "自动模式默认启用曼波");
+        assert!(cfg.auto_enable_feiyu_tts, "自动模式默认启用大肥鱼");
         assert_eq!(cfg.deepseek_tts_voice, "stella", "大肥鱼默认女声 Stella");
         assert!(!cfg.enable_voice);
         assert!(cfg.only_medal_order);
@@ -397,6 +407,7 @@ mod tests {
         cfg.opacity = 80;
         cfg.tts_engine = "feiyu".into();
         cfg.deepseek_tts_voice = "tide".into();
+        cfg.auto_enable_feiyu_tts = false;
 
         assert!(cfg.save(Some(&path)).is_ok());
 
@@ -405,6 +416,8 @@ mod tests {
         assert_eq!(loaded.opacity, 80);
         assert_eq!(loaded.tts_engine, "feiyu");
         assert_eq!(loaded.deepseek_tts_voice, "tide");
+        assert!(loaded.auto_enable_manbo_tts);
+        assert!(!loaded.auto_enable_feiyu_tts, "自动模式引擎开关需持久化");
 
         // sanitized()：凭据清空、常规字段保持
         let s = cfg.sanitized();

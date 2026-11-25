@@ -212,6 +212,8 @@ impl Default for AppState {
         // 大肥鱼（DeepSeek TTS）与 AI 对话共用同一把 DeepSeek Key，装配后另行注入
         let tts_mgr = TTSManager::new(TTSConfig {
             engine: parse_tts_engine(&app_cfg.tts_engine),
+            auto_enable_manbo_tts: app_cfg.auto_enable_manbo_tts,
+            auto_enable_feiyu_tts: app_cfg.auto_enable_feiyu_tts,
             enable_voice: app_cfg.enable_voice,
             speech_rate: app_cfg.speech_rate,
             speech_volume: app_cfg.speech_volume,
@@ -1187,6 +1189,8 @@ fn apply_config_to_state(
     state.tts_mgr.set_feiyu_api_key(new_cfg.deepseek_api_key.clone());
     state.tts_mgr.update_config(TTSConfig {
         engine: parse_tts_engine(&new_cfg.tts_engine),
+        auto_enable_manbo_tts: new_cfg.auto_enable_manbo_tts,
+        auto_enable_feiyu_tts: new_cfg.auto_enable_feiyu_tts,
         enable_voice: new_cfg.enable_voice,
         speech_rate: new_cfg.speech_rate,
         speech_volume: new_cfg.speech_volume,

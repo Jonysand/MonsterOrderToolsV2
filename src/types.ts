@@ -80,6 +80,10 @@ export interface AppConfig {
   access_key_secret: string;
 
   tts_engine: string;
+  /** 自动模式下是否启用曼波（局域网）引擎；仅约束「自动」，本地语音兜底恒开 */
+  auto_enable_manbo_tts: boolean;
+  /** 自动模式下是否启用大肥鱼（DeepSeek 云端）引擎（关闭可避免云端计费） */
+  auto_enable_feiyu_tts: boolean;
   enable_voice: boolean;
   speech_rate: number;
   /** 语音音量（刻度 0~100 直通：100 = SAPI 满档 / 满量增益），由后端完成旧刻度减半迁移 */
